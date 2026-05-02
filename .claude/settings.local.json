@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git checkout *)",
+      "Bash(python3 -c \"import ast, sys; ast.parse\\(open\\('mercari_sync.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('mercari_sync.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(git -C /Users/pengyansen/mercari_inventory_app log --oneline)",
+      "Bash(python3 -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(chmod +x /Users/pengyansen/mercari_inventory_app/build_mac.sh)",
+      "Bash(python3 -c ' *)",
+      "Bash(git -C /Users/pengyansen/mercari_inventory_app status)",
+      "Bash(brew info *)"
+    ]
+  }
+}

@@ -12,7 +12,7 @@ import threading
 import time
 import webbrowser
 
-PORT = 5000
+PORT = 5050
 
 
 def get_data_dir() -> str:
