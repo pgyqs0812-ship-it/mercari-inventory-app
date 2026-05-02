@@ -37,7 +37,20 @@ jobs:
         run: |
           zip -r dist.zip dist/
 
-      - name: Upload release asset
+      - name: Generate QR code for release download URL
+        run: |
+          pip install "qrcode[pil]"
+          python - <<'PYEOF'
+          import qrcode
+          url = "https://github.com/pgyqs0812-ship-it/mercari-inventory-app/releases/download/${{ github.ref_name }}/dist.zip"
+          img = qrcode.make(url)
+          img.save("download-qr.png")
+          print(f"QR code generated for: {url}")
+          PYEOF
+
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist.zip
+          files: |
+            dist.zip
+            download-qr.png
