@@ -1,8 +1,10 @@
 import re
+import queue
 import time
 import webbrowser
 import sqlite3
 import html as html_module
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, redirect
 from selenium import webdriver
@@ -12,6 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 DB_NAME = "products.db"
+MAX_WORKERS = 4
 
 app = Flask(__name__)
 
@@ -353,7 +356,7 @@ def touch_synced_at(item_url):
 
 
 # ---------------------------------------------------------------------------
-# Detail-page scraping (only used when listing-page data is insufficient)
+# Detail-page scraping
 # ---------------------------------------------------------------------------
 
 def scrape_item_detail(driver, url):
@@ -382,6 +385,108 @@ def scrape_item_detail(driver, url):
     return title, price, raw_text
 
 
+# ---------------------------------------------------------------------------
+# Parallel detail fetching
+# ---------------------------------------------------------------------------
+
+def _make_chrome_driver(headless=False):
+    """Create a configured Chrome driver. Workers use headless mode."""
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+        opts.add_argument("--window-size=1280,900")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+    else:
+        opts.add_argument("--start-maximized")
+    opts.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2
+    })
+    return webdriver.Chrome(options=opts)
+
+
+def build_driver_pool(n, seed_cookies=None):
+    """
+    Create a pool of n headless Chrome drivers.
+
+    If seed_cookies is provided (grabbed from the logged-in main driver),
+    each worker navigates to the Mercari domain once to apply them so the
+    session is shared across workers.
+    """
+    pool = queue.Queue()
+    for i in range(n):
+        driver = _make_chrome_driver(headless=True)
+        if seed_cookies:
+            driver.get("https://jp.mercari.com")
+            for cookie in seed_cookies:
+                try:
+                    driver.add_cookie(cookie)
+                except Exception:
+                    pass
+        pool.put(driver)
+        print(f"  worker {i + 1}/{n} 初始化完成", flush=True)
+    return pool
+
+
+def make_pool_fetcher(driver_pool):
+    """
+    Return fetch_item_detail(url) — a closure that checks out a driver
+    from the pool, scrapes the detail page, then returns the driver.
+
+    Safe for concurrent use: each call holds exactly one driver at a time.
+    """
+    def fetch_item_detail(url):
+        driver = driver_pool.get()
+        try:
+            title, price, raw_text = scrape_item_detail(driver, url)
+            return {"url": url, "title": title, "price": price,
+                    "raw_text": raw_text, "error": None}
+        except Exception as exc:
+            return {"url": url, "title": "", "price": "",
+                    "raw_text": "", "error": str(exc)}
+        finally:
+            driver_pool.put(driver)
+
+    return fetch_item_detail
+
+
+# ---------------------------------------------------------------------------
+# Item classification
+# ---------------------------------------------------------------------------
+
+def classify_items(items, existing_map):
+    """
+    Split items into three buckets:
+
+    to_skip        — DB has a valid title and created_at matches; no fetch needed.
+    to_save_direct — Listing page already provides valid title + price; no detail page needed.
+    to_fetch_detail — Data is incomplete; must open the detail page.
+    """
+    to_skip = []
+    to_save_direct = []
+    to_fetch_detail = []
+
+    for item in items:
+        existing = existing_map.get(item["url"])
+        if existing:
+            old_title = existing["title"] or ""
+            old_created_at = existing["created_at"] or ""
+            if is_valid_title(old_title) and old_created_at == item["created_at"]:
+                to_skip.append(item)
+                continue
+
+        if is_valid_title(item["title"]) and item["price"]:
+            to_save_direct.append(item)
+        else:
+            to_fetch_detail.append(item)
+
+    return to_skip, to_save_direct, to_fetch_detail
+
+
+# ---------------------------------------------------------------------------
+# Login helper
+# ---------------------------------------------------------------------------
+
 def click_login_button_if_exists(driver):
     time.sleep(2)
     for el in driver.find_elements(By.TAG_NAME, "button") + driver.find_elements(By.TAG_NAME, "a"):
@@ -404,83 +509,111 @@ def click_login_button_if_exists(driver):
 def run_scraper():
     sync_start = time.time()
 
-    options = Options()
-    options.add_argument("--start-maximized")
-    options.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2
-    })
-
-    driver = webdriver.Chrome(options=options)
-    driver.get("https://jp.mercari.com/login")
-    click_login_button_if_exists(driver)
+    # ------------------------------------------------------------------
+    # Phase 1: login with the main (visible) driver, collect all listings
+    # ------------------------------------------------------------------
+    main_driver = _make_chrome_driver(headless=False)
+    main_driver.get("https://jp.mercari.com/login")
+    click_login_button_if_exists(main_driver)
     input("请在Mercari登录完成后，回到Terminal按回车开始同步...")
 
-    # Step 1: collect all listing URLs + metadata without opening detail pages
-    items = load_all_listings(driver)
+    phase1_start = time.time()
+    items = load_all_listings(main_driver)
     total_count = len(items)
     print(f"\n共检测到商品：{total_count} 件")
 
-    # Step 2: batch-fetch DB state for all URLs in one query
     existing_map = fetch_existing_batch([item["url"] for item in items])
+    to_skip, to_save_direct, to_fetch_detail = classify_items(items, existing_map)
 
-    inserted_count = 0
-    updated_count = 0
-    skipped_count = 0
-    detail_fetches = 0
+    print(f"  跳过（未变化）：{len(to_skip)} 件 | "
+          f"列表页直接保存：{len(to_save_direct)} 件 | "
+          f"需打开详情页：{len(to_fetch_detail)} 件")
 
-    for idx, item in enumerate(items, start=1):
-        url = item["url"]
-        listing_title = item["title"]
-        listing_price = item["price"]
-        listing_created_at = item["created_at"]
-        listing_raw = item["raw_text"]
+    # Capture session before quitting the main driver
+    seed_cookies = main_driver.get_cookies()
+    main_driver.quit()
 
-        existing = existing_map.get(url)
+    phase1_elapsed = time.time() - phase1_start
 
-        # --- Skip: item unchanged (valid title in DB, created_at matches) ---
-        if existing:
-            old_title = existing["title"] or ""
-            old_created_at = existing["created_at"] or ""
-            if is_valid_title(old_title) and old_created_at == listing_created_at:
-                skipped_count += 1
-                touch_synced_at(url)
-                print(f"[{idx}/{total_count}] 跳过（未变化）：{old_title}")
+    # Apply skip (just touch synced_at) and direct saves
+    for item in to_skip:
+        touch_synced_at(item["url"])
+
+    direct_inserted = direct_updated = 0
+    for item in to_save_direct:
+        r = save_or_update_product(
+            item["url"], item["title"], item["price"],
+            item["created_at"], item["raw_text"]
+        )
+        if r == "inserted":
+            direct_inserted += 1
+        else:
+            direct_updated += 1
+
+    # ------------------------------------------------------------------
+    # Phase 2: parallel detail fetches for items with incomplete data
+    # ------------------------------------------------------------------
+    detail_inserted = detail_updated = detail_errors = 0
+    phase2_elapsed = 0.0
+
+    if to_fetch_detail:
+        phase2_start = time.time()
+        print(f"\n初始化 {MAX_WORKERS} 个并行 worker...")
+        pool = build_driver_pool(MAX_WORKERS, seed_cookies)
+
+        fetch_item_detail = make_pool_fetcher(pool)
+        urls_to_fetch = [item["url"] for item in to_fetch_detail]
+        created_at_map = {item["url"]: item["created_at"] for item in to_fetch_detail}
+
+        print(f"开始并行抓取 {len(urls_to_fetch)} 个详情页（{MAX_WORKERS} workers）...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            results = list(executor.map(fetch_item_detail, urls_to_fetch))
+
+        # Drain and quit worker drivers
+        while not pool.empty():
+            pool.get().quit()
+
+        # Write results to DB sequentially (SQLite is not thread-safe for writes)
+        for r in results:
+            if r["error"]:
+                detail_errors += 1
+                print(f"  [ERROR] {r['url']}: {r['error']}")
                 continue
-
-        # --- Use listing-page data directly when title + price are available ---
-        if is_valid_title(listing_title) and listing_price:
             result = save_or_update_product(
-                url, listing_title, listing_price, listing_created_at, listing_raw
+                r["url"], r["title"], r["price"],
+                created_at_map[r["url"]], r["raw_text"]
             )
-            print(f"[{idx}/{total_count}] {'新增' if result == 'inserted' else '更新'}（列表页）："
-                  f"{listing_title} / {listing_price}")
-        else:
-            # Fall back to detail page when listing-page data is incomplete
-            detail_fetches += 1
-            print(f"[{idx}/{total_count}] 打开详情页：{url}")
-            title, price, raw_text = scrape_item_detail(driver, url)
-            result = save_or_update_product(
-                url, title, price, listing_created_at, raw_text
-            )
-            print(f"  → {'新增' if result == 'inserted' else '更新'}：{title} / {price}")
+            if result == "inserted":
+                detail_inserted += 1
+            else:
+                detail_updated += 1
+            print(f"  {'新增' if result == 'inserted' else '更新'}：{r['title']} / {r['price']}")
 
-        if result == "inserted":
-            inserted_count += 1
-        else:
-            updated_count += 1
+        phase2_elapsed = time.time() - phase2_start
 
-    driver.quit()
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    total_inserted = direct_inserted + detail_inserted
+    total_updated = direct_updated + detail_updated
+    total_elapsed = time.time() - sync_start
 
-    elapsed = time.time() - sync_start
-    print(f"\n{'=' * 52}")
+    print(f"\n{'=' * 56}")
     print(f"  同步完成")
-    print(f"  共检测到：{total_count:>4} 件")
-    print(f"  新增：    {inserted_count:>4} 件")
-    print(f"  更新：    {updated_count:>4} 件")
-    print(f"  跳过：    {skipped_count:>4} 件（未变化）")
-    print(f"  详情页：  {detail_fetches:>4} 次（数据不足时打开）")
-    print(f"  总耗时：  {elapsed:.1f} 秒")
-    print(f"{'=' * 52}")
+    print(f"  共检测到：        {total_count:>4} 件")
+    print(f"  新增：            {total_inserted:>4} 件")
+    print(f"  更新：            {total_updated:>4} 件")
+    print(f"  跳过（未変化）：  {len(to_skip):>4} 件")
+    print(f"  详情页打开：      {len(to_fetch_detail):>4} 件  "
+          f"（{MAX_WORKERS} 个并行 worker）")
+    if detail_errors:
+        print(f"  抓取失败：        {detail_errors:>4} 件")
+    print(f"  阶段1耗时（列表）：{phase1_elapsed:>6.1f} 秒")
+    if to_fetch_detail:
+        print(f"  阶段2耗时（详情）：{phase2_elapsed:>6.1f} 秒  "
+              f"（顺序预计 {phase2_elapsed * MAX_WORKERS:.1f} 秒）")
+    print(f"  总耗时：           {total_elapsed:>6.1f} 秒")
+    print(f"{'=' * 56}")
 
     webbrowser.open("http://127.0.0.1:5000")
 
