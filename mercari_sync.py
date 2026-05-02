@@ -8,7 +8,11 @@ import html as html_module
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, redirect, request
+import io
+import csv
+
+from flask import Flask, redirect, request, Response
+import openpyxl
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -67,149 +71,296 @@ def init_db():
     conn.close()
 
 
+# Badge style per status: (bg_color, text_color)
+STATUS_BADGE = {
+    "出品中":    ("#dcfce7", "#166534"),
+    "取引中":    ("#fef9c3", "#854d0e"),
+    "売却済み":  ("#f3f4f6", "#374151"),
+    "公開停止中": ("#fee2e2", "#991b1b"),
+}
+
+
+def _query_products(q="", statuses=None):
+    """Query mercari_products filtered by keyword and status list."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    sql = ("SELECT title, price, item_url, created_at, synced_at, status "
+           "FROM mercari_products WHERE 1=1")
+    params = []
+    if q:
+        sql += " AND title LIKE ?"
+        params.append(f"%{q}%")
+    if statuses:
+        ph = ",".join("?" * len(statuses))
+        sql += f" AND status IN ({ph})"
+        params.extend(statuses)
+    sql += " ORDER BY id DESC"
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Flask UI
 # ---------------------------------------------------------------------------
 
+_CSS = """
+:root {
+  --bg: #f0f2f5;
+  --surface: #ffffff;
+  --border: #e5e7eb;
+  --text: #111827;
+  --muted: #6b7280;
+  --primary: #2563eb;
+  --primary-h: #1d4ed8;
+  --radius: 12px;
+  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
+  --shadow-md: 0 4px 6px rgba(0,0,0,.07), 0 2px 4px rgba(0,0,0,.05);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       background: var(--bg); color: var(--text); min-height: 100vh; }
+header { background: #111827; color: #fff; padding: 0; }
+.header-inner { max-width: 1160px; margin: 0 auto;
+                padding: 20px 24px; display: flex;
+                justify-content: space-between; align-items: center; }
+.header-inner h1 { font-size: 22px; font-weight: 700; letter-spacing: -.3px; }
+.header-inner p  { font-size: 13px; color: #9ca3af; margin-top: 2px; }
+.db-pill { background: rgba(255,255,255,.12); border-radius: 20px;
+           padding: 5px 14px; font-size: 13px; color: #d1d5db; white-space: nowrap; }
+main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
+       flex-direction: column; gap: 20px; }
+.card { background: var(--surface); border-radius: var(--radius);
+        box-shadow: var(--shadow-md); overflow: hidden; }
+.card-header { display: flex; justify-content: space-between; align-items: center;
+               padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.card-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.card-body  { padding: 20px; }
+.field-label { font-size: 12px; font-weight: 600; color: var(--muted);
+               text-transform: uppercase; letter-spacing: .05em; margin-bottom: 10px; }
+.cb-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.cb-label { display: flex; align-items: center; gap: 7px; font-size: 14px;
+            cursor: pointer; user-select: none;
+            background: #f9fafb; border: 1px solid var(--border);
+            border-radius: 8px; padding: 7px 14px; transition: border-color .15s; }
+.cb-label:hover { border-color: var(--primary); }
+.cb-label input { width: 15px; height: 15px; cursor: pointer; accent-color: var(--primary); }
+.search-row { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
+.text-input { flex: 1; border: 1px solid var(--border); border-radius: 8px;
+              padding: 9px 14px; font-size: 14px; outline: none;
+              transition: border-color .15s; }
+.text-input:focus { border-color: var(--primary);
+                    box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+.btn { display: inline-flex; align-items: center; gap: 6px; border: none;
+       border-radius: 8px; padding: 9px 18px; font-size: 14px;
+       font-weight: 500; cursor: pointer; text-decoration: none;
+       transition: background .15s, opacity .15s; white-space: nowrap; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-h); }
+.btn-outline { background: #fff; color: var(--text);
+               border: 1px solid var(--border); }
+.btn-outline:hover { background: #f9fafb; }
+.btn:disabled, .btn[disabled] { opacity: .4; cursor: not-allowed; pointer-events: none; }
+.export-row { display: flex; gap: 8px; align-items: center; }
+.count-badge { display: inline-block; background: #eff6ff; color: #1d4ed8;
+               border-radius: 20px; padding: 2px 10px; font-size: 12px;
+               font-weight: 600; margin-left: 8px; }
+table { width: 100%; border-collapse: collapse; }
+thead th { background: #f9fafb; color: var(--muted); font-size: 12px;
+           font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+           padding: 10px 14px; text-align: left;
+           border-bottom: 2px solid var(--border); }
+tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border);
+           font-size: 14px; vertical-align: middle; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #f9fafb; }
+.price { font-weight: 600; color: #dc2626; white-space: nowrap; }
+.badge { display: inline-block; border-radius: 20px;
+         padding: 3px 10px; font-size: 12px; font-weight: 600;
+         white-space: nowrap; }
+.link-btn { color: var(--primary); font-weight: 600; text-decoration: none;
+            font-size: 13px; }
+.link-btn:hover { text-decoration: underline; }
+.empty-state { text-align: center; padding: 56px 20px; color: var(--muted); }
+.empty-state .es-icon { font-size: 40px; margin-bottom: 12px; }
+.empty-state p { font-size: 15px; }
+"""
+
+
+def _badge_html(status):
+    bg, fg = STATUS_BADGE.get(status, ("#f3f4f6", "#374151"))
+    s = html_module.escape(status or "—")
+    return f'<span class="badge" style="background:{bg};color:{fg}">{s}</span>'
+
+
+def _build_result_rows(products):
+    rows = ""
+    for i, p in enumerate(products, start=1):
+        title     = html_module.escape(p[0] or "名称未取得")
+        price     = html_module.escape(p[1] or "—")
+        url       = html_module.escape(p[2] or "")
+        created   = html_module.escape(p[3] or "—")
+        synced    = html_module.escape(p[4] or "—")
+        badge     = _badge_html(p[5] or "")
+        rows += f"""
+        <tr>
+          <td style="color:var(--muted);font-size:12px">{i}</td>
+          <td>{title}</td>
+          <td class="price">{price}</td>
+          <td>{badge}</td>
+          <td style="color:var(--muted)">{created}</td>
+          <td style="color:var(--muted)">{synced}</td>
+          <td><a class="link-btn" href="{url}" target="_blank">開く ↗</a></td>
+        </tr>"""
+    return rows
+
+
 @app.route("/")
 def home():
+    searched      = request.args.get("searched") == "1"
+    q             = request.args.get("q", "").strip()
+    sel_statuses  = request.args.getlist("statuses") or list(STATUSES)
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT title, price, item_url, created_at, synced_at, status
-        FROM mercari_products
-        ORDER BY id DESC
-    """)
-    products = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) FROM mercari_products")
+    total_db = cursor.fetchone()[0]
     conn.close()
 
-    # Group products by status for tab display
-    grouped = {s: [] for s in STATUSES}
-    grouped[""] = []  # products with no detected status
-    for p in products:
-        s = p[5] or ""
-        grouped.setdefault(s, []).append(p)
+    products = _query_products(q, sel_statuses) if searched else []
+    count    = len(products)
 
-    # Build rows HTML for each status tab
-    def build_rows(rows_list):
-        html = ""
-        for i, p in enumerate(rows_list, start=1):
-            title = html_module.escape(p[0] or "名称未取得")
-            price = html_module.escape(p[1] or "-")
-            url = html_module.escape(p[2] or "")
-            created_at = html_module.escape(p[3] or "-")
-            synced_at = html_module.escape(p[4] or "-")
-            status = html_module.escape(p[5] or "-")
-            html += f"""
-            <tr>
-                <td>{i}</td>
-                <td>{title}</td>
-                <td class="price">{price}</td>
-                <td class="status-cell">{status}</td>
-                <td>{created_at}</td>
-                <td>{synced_at}</td>
-                <td><a href="{url}" target="_blank">打开</a></td>
-            </tr>"""
-        return html
-
-    # Build tab buttons and panels
-    visible_tabs = [s for s in STATUSES if grouped.get(s)]
-    if not visible_tabs:
-        visible_tabs = STATUSES  # show all tabs even if empty
-
-    tab_buttons = ""
-    tab_panels = ""
-    first = True
+    # ── sync card checkboxes ──────────────────────────────────────────────
+    sync_cbs = ""
     for s in STATUSES:
-        count = len(grouped.get(s, []))
-        active_btn = " active" if first else ""
-        active_panel = " active" if first else ""
-        tab_buttons += f'<button class="tab-btn{active_btn}" onclick="showTab(\'{s}\')" id="btn-{s}">{s}（{count}件）</button>\n'
-        rows_html = build_rows(grouped.get(s, []))
-        tab_panels += f"""
-        <div id="tab-{s}" class="tab-panel{active_panel}">
+        sync_cbs += (f'<label class="cb-label">'
+                     f'<input type="checkbox" name="statuses" value="{s}" checked> {s}'
+                     f'</label>\n')
+
+    # ── search filter checkboxes (reflect current selection) ─────────────
+    search_cbs = ""
+    for s in STATUSES:
+        chk = "checked" if s in sel_statuses else ""
+        search_cbs += (f'<label class="cb-label">'
+                       f'<input type="checkbox" name="statuses" value="{s}" {chk}> {s}'
+                       f'</label>\n')
+
+    # ── results section ───────────────────────────────────────────────────
+    if not searched:
+        results_html = ""
+    else:
+        rows_html = _build_result_rows(products)
+        disabled  = 'disabled' if count == 0 else ''
+        empty_row = ("""<tr><td colspan="7">
+            <div class="empty-state">
+              <div class="es-icon">🔍</div>
+              <p>該当する商品が見つかりませんでした</p>
+            </div></td></tr>""" if count == 0 else "")
+
+        results_html = f"""
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">
+              検索結果
+              <span class="count-badge">{count} 件</span>
+            </span>
+            <div class="export-row">
+              <a class="btn btn-outline" id="export-csv" href="#" {disabled}>
+                ⬇ CSV
+              </a>
+              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>
+                ⬇ Excel
+              </a>
+            </div>
+          </div>
+          <div class="card-body" style="padding:0">
             <table>
+              <thead>
                 <tr>
-                    <th>No.</th><th>商品名</th><th>价格</th><th>ステータス</th>
-                    <th>商品登录时间</th><th>抓取时间</th><th>链接</th>
+                  <th style="width:40px">#</th>
+                  <th>商品名</th>
+                  <th>価格</th>
+                  <th>状態</th>
+                  <th>商品登録時間</th>
+                  <th>抓取時間</th>
+                  <th>リンク</th>
                 </tr>
-                {rows_html}
+              </thead>
+              <tbody>{rows_html}{empty_row}</tbody>
             </table>
+          </div>
         </div>"""
-        first = False
 
-    # Status checkboxes for sync form
-    checkboxes = ""
-    for s in STATUSES:
-        checkboxes += f'<label class="cb-label"><input type="checkbox" name="statuses" value="{s}" checked> {s}</label>\n'
+    export_js = """
+        const sp = new URLSearchParams(window.location.search);
+        const csv_el  = document.getElementById('export-csv');
+        const xlsx_el = document.getElementById('export-xlsx');
+        if (csv_el  && !csv_el.hasAttribute('disabled'))
+            csv_el.href  = '/export/csv?'  + sp.toString();
+        if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
+            xlsx_el.href = '/export/xlsx?' + sp.toString();
+    """ if searched else ""
 
-    return f"""
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>Mercari库存管理</title>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                   background: #f5f6f8; padding: 30px; color: #222; }}
-            h1 {{ font-size: 28px; margin-bottom: 16px; }}
-            .sync-box {{ background: white; border-radius: 12px; padding: 20px 24px;
-                         box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin-bottom: 24px; }}
-            .sync-box h2 {{ font-size: 15px; margin: 0 0 12px; color: #444; }}
-            .cb-row {{ display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 14px; }}
-            .cb-label {{ display: flex; align-items: center; gap: 6px; font-size: 14px;
-                         cursor: pointer; user-select: none; }}
-            .cb-label input {{ width: 16px; height: 16px; cursor: pointer; }}
-            button.sync-btn {{ background: #222; color: white; border: none; border-radius: 8px;
-                      padding: 10px 22px; font-size: 14px; cursor: pointer; }}
-            button.sync-btn:hover {{ background: #444; }}
-            .summary {{ color: #666; font-size: 13px; margin-bottom: 16px; }}
-            .tabs {{ display: flex; gap: 4px; margin-bottom: 0; flex-wrap: wrap; }}
-            .tab-btn {{ background: #e0e0e0; color: #555; border: none; border-radius: 8px 8px 0 0;
-                        padding: 9px 18px; font-size: 13px; cursor: pointer; transition: background 0.15s; }}
-            .tab-btn:hover {{ background: #ccc; }}
-            .tab-btn.active {{ background: #222; color: white; }}
-            .tab-panel {{ display: none; }}
-            .tab-panel.active {{ display: block; }}
-            table {{ width: 100%; border-collapse: collapse; background: white;
-                     border-radius: 0 8px 8px 8px; overflow: hidden;
-                     box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
-            th {{ background: #222; color: white; text-align: left;
-                  padding: 11px 12px; font-size: 13px; }}
-            td {{ padding: 11px 12px; border-bottom: 1px solid #eee;
-                  font-size: 13px; vertical-align: top; }}
-            tr:hover {{ background: #f9f9f9; }}
-            .price {{ font-weight: bold; color: #d32f2f; white-space: nowrap; }}
-            .status-cell {{ white-space: nowrap; }}
-            a {{ color: #0066cc; font-weight: 600; text-decoration: none; }}
-        </style>
-    </head>
-    <body>
-        <h1>Mercari库存管理</h1>
-        <div class="sync-box">
-            <h2>同期するステータスを選択</h2>
-            <form method="POST" action="/sync">
-                <div class="cb-row">
-                    {checkboxes}
-                </div>
-                <button class="sync-btn" type="submit">同步Mercari商品</button>
-            </form>
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mercari 在庫管理</title>
+  <style>{_CSS}</style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div>
+      <h1>Mercari 在庫管理</h1>
+      <p>商品データの同期・検索・エクスポート</p>
+    </div>
+    <span class="db-pill">DB: {total_db} 件</span>
+  </div>
+</header>
+<main>
+
+  <!-- Sync card -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">同期設定</span>
+    </div>
+    <div class="card-body">
+      <form method="POST" action="/sync">
+        <p class="field-label">同期するステータス</p>
+        <div class="cb-row">{sync_cbs}</div>
+        <button class="btn btn-primary" type="submit">&#x21BB; 同期を開始</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Search card -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">商品を検索</span>
+    </div>
+    <div class="card-body">
+      <form method="GET" action="/">
+        <input type="hidden" name="searched" value="1">
+        <div class="search-row">
+          <input class="text-input" type="text" name="q"
+                 placeholder="商品名で検索…" value="{html_module.escape(q)}">
+          <button class="btn btn-primary" type="submit">検索</button>
         </div>
-        <div class="summary">DB 合計：{len(products)} 件</div>
-        <div class="tabs">
-            {tab_buttons}
-        </div>
-        {tab_panels}
-        <script>
-            function showTab(name) {{
-                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.getElementById('tab-' + name).classList.add('active');
-                document.getElementById('btn-' + name).classList.add('active');
-            }}
-        </script>
-    </body>
-    </html>
-    """
+        <p class="field-label">ステータスで絞り込み</p>
+        <div class="cb-row">{search_cbs}</div>
+      </form>
+    </div>
+  </div>
+
+  {results_html}
+
+</main>
+<script>{export_js}</script>
+</body>
+</html>"""
 
 
 @app.route("/sync", methods=["POST"])
@@ -219,6 +370,52 @@ def sync():
         selected = list(STATUSES)
     run_scraper(selected_statuses=selected)
     return redirect("/")
+
+
+@app.route("/export/csv")
+def export_csv():
+    q            = request.args.get("q", "").strip()
+    sel_statuses = request.args.getlist("statuses") or list(STATUSES)
+    products     = _query_products(q, sel_statuses)
+
+    buf = io.StringIO()
+    buf.write("﻿")  # UTF-8 BOM — ensures Excel opens without garbled text
+    writer = csv.writer(buf)
+    writer.writerow(["状態", "商品名", "価格", "商品登録時間", "抓取時間", "リンク"])
+    for p in products:
+        writer.writerow([p[5] or "", p[0] or "", p[1] or "",
+                         p[3] or "", p[4] or "", p[2] or ""])
+
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv; charset=utf-8-sig",
+        headers={"Content-Disposition": "attachment; filename=mercari_export.csv"},
+    )
+
+
+@app.route("/export/xlsx")
+def export_xlsx():
+    q            = request.args.get("q", "").strip()
+    sel_statuses = request.args.getlist("statuses") or list(STATUSES)
+    products     = _query_products(q, sel_statuses)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Mercari商品"
+    ws.append(["状態", "商品名", "価格", "商品登録時間", "抓取時間", "リンク"])
+    for p in products:
+        ws.append([p[5] or "", p[0] or "", p[1] or "",
+                   p[3] or "", p[4] or "", p[2] or ""])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return Response(
+        buf.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=mercari_export.xlsx"},
+    )
 
 
 # ---------------------------------------------------------------------------
