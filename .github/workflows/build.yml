@@ -1,5 +1,8 @@
 name: Build Mercari App
 
+permissions:
+  contents: write
+
 on:
   push:
     tags:
