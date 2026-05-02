@@ -15,6 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 DB_NAME = "products.db"
 MAX_WORKERS = 4
+MAX_RETRY = 3
 
 app = Flask(__name__)
 
@@ -360,27 +361,48 @@ def touch_synced_at(item_url):
 # ---------------------------------------------------------------------------
 
 def scrape_item_detail(driver, url):
-    """Open a product detail page and extract title, price, raw_text."""
-    driver.get(url)
-    try:
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.TAG_NAME, "h1"))
-        )
-    except Exception:
-        pass
+    """Open a product detail page and extract title, price, raw_text.
 
-    raw_text = driver.find_element(By.TAG_NAME, "body").text
+    Retries up to MAX_RETRY times (with a 2-second pause between attempts)
+    when price is missing. Logs each retry and a final warning if price
+    cannot be found after all attempts.
+    """
+    item_id = url.rstrip("/").split("/")[-1]
     title = ""
     price = ""
+    raw_text = ""
 
-    h1s = driver.find_elements(By.TAG_NAME, "h1")
-    if h1s:
-        title = h1s[0].text.strip()
+    for attempt in range(MAX_RETRY + 1):
+        if attempt > 0:
+            print(f"Retry {attempt} for item {item_id}")
+            time.sleep(2)
 
-    for line in (l.strip() for l in raw_text.split("\n") if l.strip()):
-        if line.startswith("¥"):
-            price = line
+        driver.get(url)
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.TAG_NAME, "h1"))
+            )
+        except Exception:
+            pass
+
+        raw_text = driver.find_element(By.TAG_NAME, "body").text
+        title = ""
+        price = ""
+
+        h1s = driver.find_elements(By.TAG_NAME, "h1")
+        if h1s:
+            title = h1s[0].text.strip()
+
+        for line in (l.strip() for l in raw_text.split("\n") if l.strip()):
+            if line.startswith("¥"):
+                price = line
+                break
+
+        if price:
             break
+
+    if not price:
+        print(f"WARNING: Price missing after retries for item {item_id}")
 
     return title, price, raw_text
 
