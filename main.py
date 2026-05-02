@@ -6,7 +6,6 @@ browser automatically. The terminal stays open so that Selenium sync
 steps (login prompt, input() calls) are visible and interactive.
 """
 import os
-import shutil
 import socket
 import sys
 import threading
@@ -34,25 +33,32 @@ def is_port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def check_chromedriver() -> None:
-    """Exit with a clear install message if chromedriver is not on PATH."""
-    if shutil.which("chromedriver") is None:
+# macOS paths where Google Chrome may be installed
+_CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+]
+
+
+def check_chrome_browser() -> None:
+    """Exit with a clear message if Google Chrome is not installed.
+
+    Selenium Manager (bundled with Selenium 4.6+) handles ChromeDriver
+    automatically, so only the Chrome browser itself is required.
+    Works for both local Python runs and PyInstaller packaged builds.
+    """
+    if not any(os.path.exists(p) for p in _CHROME_CANDIDATES):
         print("----------------------------------------")
-        print("ChromeDriver not found.")
+        print("Chrome browser not found.")
+        print("Please install Google Chrome.")
         print("")
-        print("Please install it using:")
-        print("")
-        print("  brew install chromedriver")
-        print("")
-        print("Then allow it in:")
-        print("")
-        print("  System Settings → Privacy & Security")
+        print("  https://www.google.com/chrome/")
         print("----------------------------------------")
         sys.exit(1)
 
 
 def main() -> None:
-    check_chromedriver()
+    check_chrome_browser()
 
     data_dir = get_data_dir()
 
