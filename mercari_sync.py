@@ -6,6 +6,7 @@ import webbrowser
 import sqlite3
 import html as html_module
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, redirect
 from selenium import webdriver
@@ -17,6 +18,13 @@ from selenium.webdriver.support import expected_conditions as EC
 DB_NAME = "products.db"
 MAX_WORKERS = 4
 MAX_RETRY = 3
+
+_JST = timezone(timedelta(hours=9))
+
+
+def jst_now() -> str:
+    """Return the current time in JST as 'YYYY-MM-DD HH:MM:SS'."""
+    return datetime.now(tz=_JST).strftime("%Y-%m-%d %H:%M:%S")
 
 app = Flask(__name__)
 
@@ -330,17 +338,17 @@ def save_or_update_product(item_url, title, price, created_at, raw_text):
         cursor.execute("""
             UPDATE mercari_products
             SET title = ?, price = ?, created_at = ?, raw_text = ?,
-                synced_at = CURRENT_TIMESTAMP
+                synced_at = ?
             WHERE item_url = ?
-        """, (title, price, created_at, raw_text, item_url))
+        """, (title, price, created_at, raw_text, jst_now(), item_url))
         conn.commit()
         conn.close()
         return "updated"
 
     cursor.execute("""
         INSERT INTO mercari_products (item_url, title, price, created_at, raw_text, synced_at)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (item_url, title, price, created_at, raw_text))
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (item_url, title, price, created_at, raw_text, jst_now()))
     conn.commit()
     conn.close()
     return "inserted"
@@ -350,8 +358,8 @@ def touch_synced_at(item_url):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE mercari_products SET synced_at = CURRENT_TIMESTAMP WHERE item_url = ?",
-        (item_url,),
+        "UPDATE mercari_products SET synced_at = ? WHERE item_url = ?",
+        (jst_now(), item_url),
     )
     conn.commit()
     conn.close()
