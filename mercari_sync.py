@@ -8,7 +8,7 @@ import html as html_module
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, redirect
+from flask import Flask, redirect, request
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -34,7 +34,9 @@ TIME_KEYWORDS = [
     "半年前", "半年以上前",
 ]
 
-INVALID_TITLES = {"公開停止中", "出品停止中", "売却済み", "出品中", "名称未取得"}
+INVALID_TITLES = {"公開停止中", "出品停止中", "売却済み", "出品中", "取引中", "名称未取得"}
+
+STATUSES = ["出品中", "取引中", "売却済み", "公開停止中"]
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +61,8 @@ def init_db():
     columns = [col[1] for col in cursor.fetchall()]
     if "created_at" not in columns:
         cursor.execute("ALTER TABLE mercari_products ADD COLUMN created_at TEXT")
+    if "status" not in columns:
+        cursor.execute("ALTER TABLE mercari_products ADD COLUMN status TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -72,30 +76,72 @@ def home():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT title, price, item_url, created_at, synced_at
+        SELECT title, price, item_url, created_at, synced_at, status
         FROM mercari_products
         ORDER BY id DESC
     """)
     products = cursor.fetchall()
     conn.close()
 
-    rows = ""
-    for i, p in enumerate(products, start=1):
-        title = html_module.escape(p[0] or "名称未取得")
-        price = html_module.escape(p[1] or "-")
-        url = html_module.escape(p[2] or "")
-        created_at = html_module.escape(p[3] or "-")
-        synced_at = html_module.escape(p[4] or "-")
-        rows += f"""
-        <tr>
-            <td>{i}</td>
-            <td>{title}</td>
-            <td class="price">{price}</td>
-            <td>{created_at}</td>
-            <td>{synced_at}</td>
-            <td><a href="{url}" target="_blank">打开</a></td>
-        </tr>
-        """
+    # Group products by status for tab display
+    grouped = {s: [] for s in STATUSES}
+    grouped[""] = []  # products with no detected status
+    for p in products:
+        s = p[5] or ""
+        grouped.setdefault(s, []).append(p)
+
+    # Build rows HTML for each status tab
+    def build_rows(rows_list):
+        html = ""
+        for i, p in enumerate(rows_list, start=1):
+            title = html_module.escape(p[0] or "名称未取得")
+            price = html_module.escape(p[1] or "-")
+            url = html_module.escape(p[2] or "")
+            created_at = html_module.escape(p[3] or "-")
+            synced_at = html_module.escape(p[4] or "-")
+            status = html_module.escape(p[5] or "-")
+            html += f"""
+            <tr>
+                <td>{i}</td>
+                <td>{title}</td>
+                <td class="price">{price}</td>
+                <td class="status-cell">{status}</td>
+                <td>{created_at}</td>
+                <td>{synced_at}</td>
+                <td><a href="{url}" target="_blank">打开</a></td>
+            </tr>"""
+        return html
+
+    # Build tab buttons and panels
+    visible_tabs = [s for s in STATUSES if grouped.get(s)]
+    if not visible_tabs:
+        visible_tabs = STATUSES  # show all tabs even if empty
+
+    tab_buttons = ""
+    tab_panels = ""
+    first = True
+    for s in STATUSES:
+        count = len(grouped.get(s, []))
+        active_btn = " active" if first else ""
+        active_panel = " active" if first else ""
+        tab_buttons += f'<button class="tab-btn{active_btn}" onclick="showTab(\'{s}\')" id="btn-{s}">{s}（{count}件）</button>\n'
+        rows_html = build_rows(grouped.get(s, []))
+        tab_panels += f"""
+        <div id="tab-{s}" class="tab-panel{active_panel}">
+            <table>
+                <tr>
+                    <th>No.</th><th>商品名</th><th>价格</th><th>ステータス</th>
+                    <th>商品登录时间</th><th>抓取时间</th><th>链接</th>
+                </tr>
+                {rows_html}
+            </table>
+        </div>"""
+        first = False
+
+    # Status checkboxes for sync form
+    checkboxes = ""
+    for s in STATUSES:
+        checkboxes += f'<label class="cb-label"><input type="checkbox" name="statuses" value="{s}" checked> {s}</label>\n'
 
     return f"""
     <html>
@@ -105,39 +151,62 @@ def home():
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
                    background: #f5f6f8; padding: 30px; color: #222; }}
-            h1 {{ font-size: 32px; margin-bottom: 8px; }}
-            .top {{ display: flex; justify-content: space-between; align-items: center;
-                    margin-bottom: 20px; }}
-            .summary {{ color: #666; }}
-            button {{ background: #222; color: white; border: none; border-radius: 8px;
-                      padding: 10px 18px; font-size: 14px; cursor: pointer; }}
+            h1 {{ font-size: 28px; margin-bottom: 16px; }}
+            .sync-box {{ background: white; border-radius: 12px; padding: 20px 24px;
+                         box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin-bottom: 24px; }}
+            .sync-box h2 {{ font-size: 15px; margin: 0 0 12px; color: #444; }}
+            .cb-row {{ display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 14px; }}
+            .cb-label {{ display: flex; align-items: center; gap: 6px; font-size: 14px;
+                         cursor: pointer; user-select: none; }}
+            .cb-label input {{ width: 16px; height: 16px; cursor: pointer; }}
+            button.sync-btn {{ background: #222; color: white; border: none; border-radius: 8px;
+                      padding: 10px 22px; font-size: 14px; cursor: pointer; }}
+            button.sync-btn:hover {{ background: #444; }}
+            .summary {{ color: #666; font-size: 13px; margin-bottom: 16px; }}
+            .tabs {{ display: flex; gap: 4px; margin-bottom: 0; flex-wrap: wrap; }}
+            .tab-btn {{ background: #e0e0e0; color: #555; border: none; border-radius: 8px 8px 0 0;
+                        padding: 9px 18px; font-size: 13px; cursor: pointer; transition: background 0.15s; }}
+            .tab-btn:hover {{ background: #ccc; }}
+            .tab-btn.active {{ background: #222; color: white; }}
+            .tab-panel {{ display: none; }}
+            .tab-panel.active {{ display: block; }}
             table {{ width: 100%; border-collapse: collapse; background: white;
-                     border-radius: 12px; overflow: hidden;
+                     border-radius: 0 8px 8px 8px; overflow: hidden;
                      box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
             th {{ background: #222; color: white; text-align: left;
-                  padding: 12px; font-size: 14px; }}
-            td {{ padding: 12px; border-bottom: 1px solid #eee;
-                  font-size: 14px; vertical-align: top; }}
+                  padding: 11px 12px; font-size: 13px; }}
+            td {{ padding: 11px 12px; border-bottom: 1px solid #eee;
+                  font-size: 13px; vertical-align: top; }}
             tr:hover {{ background: #f9f9f9; }}
             .price {{ font-weight: bold; color: #d32f2f; white-space: nowrap; }}
+            .status-cell {{ white-space: nowrap; }}
             a {{ color: #0066cc; font-weight: 600; text-decoration: none; }}
         </style>
     </head>
     <body>
         <h1>Mercari库存管理</h1>
-        <div class="top">
-            <div class="summary">商品总数：{len(products)} 件</div>
+        <div class="sync-box">
+            <h2>同期するステータスを選択</h2>
             <form method="POST" action="/sync">
-                <button type="submit">同步Mercari商品</button>
+                <div class="cb-row">
+                    {checkboxes}
+                </div>
+                <button class="sync-btn" type="submit">同步Mercari商品</button>
             </form>
         </div>
-        <table>
-            <tr>
-                <th>No.</th><th>商品名</th><th>价格</th>
-                <th>商品登录时间</th><th>抓取时间</th><th>链接</th>
-            </tr>
-            {rows}
-        </table>
+        <div class="summary">DB 合計：{len(products)} 件</div>
+        <div class="tabs">
+            {tab_buttons}
+        </div>
+        {tab_panels}
+        <script>
+            function showTab(name) {{
+                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.getElementById('tab-' + name).classList.add('active');
+                document.getElementById('btn-' + name).classList.add('active');
+            }}
+        </script>
     </body>
     </html>
     """
@@ -145,7 +214,10 @@ def home():
 
 @app.route("/sync", methods=["POST"])
 def sync():
-    run_scraper()
+    selected = request.form.getlist("statuses")
+    if not selected:
+        selected = list(STATUSES)
+    run_scraper(selected_statuses=selected)
     return redirect("/")
 
 
@@ -154,17 +226,23 @@ def sync():
 # ---------------------------------------------------------------------------
 
 def parse_listing_text(text):
-    """Extract title, price, created_at from a listing-page link's visible text.
+    """Extract title, price, created_at, status from a listing-page link's visible text.
 
     Mercari renders each listing card as a single <a> element whose .text
     contains all visible fields separated by newlines.
+    Returns a 4-tuple: (title, price, created_at, status).
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     price = ""
     title = ""
     created_at = ""
+    status = ""
 
     for i, line in enumerate(lines):
+        # Status label (appears as a badge on the card)
+        if line in STATUSES and not status:
+            status = line
+
         # Price: either "¥1,234" on one line, or "¥" followed by digits
         if line == "¥" and i + 1 < len(lines) and lines[i + 1].replace(",", "").isdigit():
             price = "¥" + lines[i + 1]
@@ -179,7 +257,7 @@ def parse_listing_text(text):
                     created_at = line
                 break
 
-    ignore = {"¥", "公開停止中", "出品中", "売却済み", "出品停止中"}
+    ignore = {"¥", "公開停止中", "出品中", "取引中", "売却済み", "出品停止中"}
     for line in reversed(lines):
         if line in ignore:
             continue
@@ -192,7 +270,7 @@ def parse_listing_text(text):
         title = line
         break
 
-    return title, price, created_at
+    return title, price, created_at, status
 
 
 def is_valid_title(title):
@@ -246,13 +324,14 @@ def collect_items_from_page(driver):
             continue
 
         text = a.text.strip()
-        title, price, created_at = parse_listing_text(text) if text else ("", "", "")
+        title, price, created_at, status = parse_listing_text(text) if text else ("", "", "", "")
 
         items.append({
             "url": href,
             "title": title,
             "price": price,
             "created_at": created_at,
+            "status": status,
             "raw_text": text,
         })
         seen_urls.add(href)
@@ -318,17 +397,17 @@ def fetch_existing_batch(urls):
     cursor = conn.cursor()
     placeholders = ",".join("?" * len(urls))
     cursor.execute(
-        f"SELECT item_url, title, price, created_at FROM mercari_products "
+        f"SELECT item_url, title, price, created_at, status FROM mercari_products "
         f"WHERE item_url IN ({placeholders})",
         urls,
     )
-    result = {row[0]: {"title": row[1], "price": row[2], "created_at": row[3]}
+    result = {row[0]: {"title": row[1], "price": row[2], "created_at": row[3], "status": row[4] or ""}
               for row in cursor.fetchall()}
     conn.close()
     return result
 
 
-def save_or_update_product(item_url, title, price, created_at, raw_text):
+def save_or_update_product(item_url, title, price, status, created_at, raw_text):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM mercari_products WHERE item_url = ?", (item_url,))
@@ -337,18 +416,18 @@ def save_or_update_product(item_url, title, price, created_at, raw_text):
     if exists:
         cursor.execute("""
             UPDATE mercari_products
-            SET title = ?, price = ?, created_at = ?, raw_text = ?,
+            SET title = ?, price = ?, status = ?, created_at = ?, raw_text = ?,
                 synced_at = ?
             WHERE item_url = ?
-        """, (title, price, created_at, raw_text, jst_now(), item_url))
+        """, (title, price, status, created_at, raw_text, jst_now(), item_url))
         conn.commit()
         conn.close()
         return "updated"
 
     cursor.execute("""
-        INSERT INTO mercari_products (item_url, title, price, created_at, raw_text, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (item_url, title, price, created_at, raw_text, jst_now()))
+        INSERT INTO mercari_products (item_url, title, price, status, created_at, raw_text, synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (item_url, title, price, status, created_at, raw_text, jst_now()))
     conn.commit()
     conn.close()
     return "inserted"
@@ -523,7 +602,9 @@ def classify_items(items, existing_map):
         if existing:
             old_title = existing["title"] or ""
             old_created_at = existing["created_at"] or ""
-            if is_valid_title(old_title) and old_created_at == item["created_at"]:
+            old_status = existing.get("status") or ""
+            new_status = item.get("status") or ""
+            if is_valid_title(old_title) and old_created_at == item["created_at"] and old_status == new_status:
                 to_skip.append(item)
                 continue
 
@@ -554,11 +635,35 @@ def click_login_button_if_exists(driver):
     print("没有找到可自动点击的ログイン按钮，请手动点击。")
 
 
+def wait_for_login(driver, timeout=300):
+    """Poll until the browser URL leaves the login page (user completed login).
+
+    Replaces the old input() prompt — no Enter key needed. Times out after
+    `timeout` seconds (default 5 minutes).
+    """
+    print("ブラウザで Mercari にログインしてください。")
+    print("ログイン完了後、自動的に同期を開始します（最大 5 分待機）...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if "login" not in driver.current_url:
+                time.sleep(1)  # let post-login redirect settle
+                print("ログイン確認完了。同期を開始します...")
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError("ログインがタイムアウトしました（5 分）。アプリを再起動してください。")
+
+
 # ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
 
-def run_scraper():
+def run_scraper(selected_statuses=None):
+    if selected_statuses is None:
+        selected_statuses = list(STATUSES)
+
     sync_start = time.time()
 
     # ------------------------------------------------------------------
@@ -567,12 +672,20 @@ def run_scraper():
     main_driver = _make_chrome_driver(headless=False)
     main_driver.get("https://jp.mercari.com/login")
     click_login_button_if_exists(main_driver)
-    input("请在Mercari登录完成后，回到Terminal按回车开始同步...")
+    wait_for_login(main_driver)
 
     phase1_start = time.time()
     items = load_all_listings(main_driver)
+    print(f"\n共检测到商品：{len(items)} 件（全ステータス）")
+
+    # Filter to only the statuses the user selected.
+    # Items without a detected status are kept to avoid silently dropping them.
+    items = [
+        item for item in items
+        if not item.get("status") or item["status"] in selected_statuses
+    ]
     total_count = len(items)
-    print(f"\n共检测到商品：{total_count} 件")
+    print(f"フィルタ後：{total_count} 件（選択ステータス: {', '.join(selected_statuses)}）")
 
     existing_map = fetch_existing_batch([item["url"] for item in items])
     to_skip, to_save_direct, to_fetch_detail = classify_items(items, existing_map)
@@ -595,7 +708,7 @@ def run_scraper():
     for item in to_save_direct:
         r = save_or_update_product(
             item["url"], item["title"], item["price"],
-            item["created_at"], item["raw_text"]
+            item.get("status", ""), item["created_at"], item["raw_text"]
         )
         if r == "inserted":
             direct_inserted += 1
@@ -616,6 +729,7 @@ def run_scraper():
         fetch_item_detail = make_pool_fetcher(pool)
         urls_to_fetch = [item["url"] for item in to_fetch_detail]
         created_at_map = {item["url"]: item["created_at"] for item in to_fetch_detail}
+        status_map = {item["url"]: item.get("status", "") for item in to_fetch_detail}
 
         print(f"开始并行抓取 {len(urls_to_fetch)} 个详情页（{MAX_WORKERS} workers）...")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -633,7 +747,7 @@ def run_scraper():
                 continue
             result = save_or_update_product(
                 r["url"], r["title"], r["price"],
-                created_at_map[r["url"]], r["raw_text"]
+                status_map[r["url"]], created_at_map[r["url"]], r["raw_text"]
             )
             if result == "inserted":
                 detail_inserted += 1
