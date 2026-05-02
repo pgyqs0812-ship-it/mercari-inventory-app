@@ -1,6 +1,7 @@
 import os
 import re
 import queue
+import threading
 import time
 import webbrowser
 import sqlite3
@@ -25,6 +26,12 @@ MAX_RETRY = 3
 
 _JST = timezone(timedelta(hours=9))
 
+# Statuses with larger listing counts that need a longer pagination timeout
+_LONG_TIMEOUT_STATUSES = {"売却済み", "販売履歴"}
+
+# Populated at the end of each sync run; read by home() to show the popup
+_last_sync_summary: dict = {}
+
 
 def jst_now() -> str:
     """Return the current time in JST as 'YYYY-MM-DD HH:MM:SS'."""
@@ -38,16 +45,16 @@ TIME_KEYWORDS = [
     "半年前", "半年以上前",
 ]
 
-INVALID_TITLES = {"公開停止中", "出品停止中", "売却済み", "出品中", "取引中", "名称未取得"}
+INVALID_TITLES = {"公開停止中", "出品停止中", "売却済み", "出品中", "取引中", "名称未取得", "販売履歴"}
 
-STATUSES = ["出品中", "取引中", "売却済み", "公開停止中"]
+STATUSES = ["出品中", "取引中", "売却済み", "販売履歴"]
 
 # Mercari mypage URL for each status
 STATUS_URLS = {
-    "出品中":    "https://jp.mercari.com/mypage/listings",
-    "取引中":    "https://jp.mercari.com/mypage/listings/in_progress",
-    "売却済み":  "https://jp.mercari.com/mypage/listings/sold",
-    "公開停止中": "https://jp.mercari.com/mypage/listings/completed",
+    "出品中":   "https://jp.mercari.com/mypage/listings",
+    "取引中":   "https://jp.mercari.com/mypage/listings/in_progress",
+    "売却済み": "https://jp.mercari.com/mypage/listings/completed",
+    "販売履歴": "https://jp.mercari.com/mypage/listings/sold",
 }
 
 
@@ -80,6 +87,15 @@ def init_db():
     cursor.execute(
         "UPDATE mercari_products SET status = '出品中' WHERE status IS NULL OR status = ''"
     )
+    # KAN-10: correct status names to match updated URL mapping.
+    # ORDER MATTERS: rename 売却済み→販売履歴 first so the second rename
+    # (公開停止中→売却済み) does not collide with records just renamed.
+    cursor.execute(
+        "UPDATE mercari_products SET status = '販売履歴' WHERE status = '売却済み'"
+    )
+    cursor.execute(
+        "UPDATE mercari_products SET status = '売却済み' WHERE status = '公開停止中'"
+    )
     conn.commit()
     conn.close()
 
@@ -89,7 +105,8 @@ STATUS_BADGE = {
     "出品中":    ("#dcfce7", "#166534"),
     "取引中":    ("#fef9c3", "#854d0e"),
     "売却済み":  ("#f3f4f6", "#374151"),
-    "公開停止中": ("#fee2e2", "#991b1b"),
+    "公開停止中": ("#fee2e2", "#991b1b"),  # legacy — kept for display of old records
+    "販売履歴":  ("#dbeafe", "#1e40af"),
 }
 
 
@@ -142,6 +159,10 @@ header { background: #111827; color: #fff; padding: 0; }
 .header-inner p  { font-size: 13px; color: #9ca3af; margin-top: 2px; }
 .db-pill { background: rgba(255,255,255,.12); border-radius: 20px;
            padding: 5px 14px; font-size: 13px; color: #d1d5db; white-space: nowrap; }
+.btn-exit { background: #ef4444; color: #fff; border: none; border-radius: 8px;
+            padding: 7px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+            transition: background .15s; white-space: nowrap; }
+.btn-exit:hover { background: #dc2626; }
 main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
        flex-direction: column; gap: 20px; }
 .card { background: var(--surface); border-radius: var(--radius);
@@ -198,6 +219,21 @@ tbody tr:hover { background: #f9fafb; }
 .empty-state { text-align: center; padding: 56px 20px; color: var(--muted); }
 .empty-state .es-icon { font-size: 40px; margin-bottom: 12px; }
 .empty-state p { font-size: 15px; }
+/* Sync summary modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5);
+                 display: flex; align-items: center; justify-content: center;
+                 z-index: 1000; }
+.modal-box { background: #fff; border-radius: 16px; padding: 32px 36px;
+             min-width: 340px; max-width: 480px; box-shadow: 0 20px 40px rgba(0,0,0,.2); }
+.modal-box h2 { font-size: 18px; font-weight: 700; margin-bottom: 20px; color: #111827; }
+.modal-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+.modal-table td { padding: 6px 0; font-size: 14px; border-bottom: 1px solid #f3f4f6; }
+.modal-table td:first-child { color: #6b7280; width: 55%; }
+.modal-table td:last-child { font-weight: 600; text-align: right; }
+.modal-close { width: 100%; padding: 10px; background: #2563eb; color: #fff;
+               border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
+               cursor: pointer; transition: background .15s; }
+.modal-close:hover { background: #1d4ed8; }
 """
 
 
@@ -234,6 +270,7 @@ def home():
     searched      = request.args.get("searched") == "1"
     q             = request.args.get("q", "").strip()
     sel_statuses  = request.args.getlist("statuses") or list(STATUSES)
+    show_summary  = request.args.get("summary") == "1" and bool(_last_sync_summary)
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -324,6 +361,32 @@ def home():
             xlsx_el.href = '/export/xlsx?' + sp.toString();
     """ if searched else ""
 
+    # ── sync summary modal ────────────────────────────────────────────────
+    if show_summary:
+        s = _last_sync_summary
+        status_rows = ""
+        for st, cnt in s.get("per_status", {}).items():
+            status_rows += f"<tr><td>{html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
+        summary_modal = f"""
+        <div class="modal-overlay" id="summary-modal">
+          <div class="modal-box">
+            <h2>同期完了</h2>
+            <table class="modal-table">
+              <tr><td>開始時刻</td><td>{html_module.escape(s.get('start_jst',''))}</td></tr>
+              <tr><td>終了時刻</td><td>{html_module.escape(s.get('end_jst',''))}</td></tr>
+              <tr><td>所要時間</td><td>{s.get('elapsed', 0)} 秒</td></tr>
+              <tr><td>検出合計</td><td>{s.get('total', 0)} 件</td></tr>
+              <tr><td>新増</td><td>{s.get('inserted', 0)} 件</td></tr>
+              <tr><td>更新</td><td>{s.get('updated', 0)} 件</td></tr>
+              <tr><td>跳過</td><td>{s.get('skipped', 0)} 件</td></tr>
+              {status_rows}
+            </table>
+            <button class="modal-close" onclick="document.getElementById('summary-modal').remove()">閉じる</button>
+          </div>
+        </div>"""
+    else:
+        summary_modal = ""
+
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -339,7 +402,11 @@ def home():
       <h1>Mercari 在庫管理</h1>
       <p>商品データの同期・検索・エクスポート</p>
     </div>
-    <span class="db-pill">DB: {total_db} 件</span>
+    <div style="display:flex;gap:10px;align-items:center">
+      <span class="db-pill">DB: {total_db} 件</span>
+      <button class="btn-exit"
+              onclick="if(confirm('アプリを終了しますか？')){{fetch('/shutdown',{{method:'POST'}}).then(()=>{{document.body.innerHTML='<p style=\\'padding:40px;font-family:sans-serif\\'>アプリを終了しました。このウィンドウを閉じてください。</p>'}})}}}}">[終了]</button>
+    </div>
   </div>
 </header>
 <main>
@@ -380,6 +447,7 @@ def home():
   {results_html}
 
 </main>
+{summary_modal}
 <script>{export_js}</script>
 </body>
 </html>"""
@@ -391,7 +459,16 @@ def sync():
     if not selected:
         selected = list(STATUSES)
     run_scraper(selected_statuses=selected)
-    return redirect("/")
+    return redirect("/?summary=1")
+
+
+@app.route("/shutdown", methods=["POST"])
+def shutdown():
+    threading.Thread(
+        target=lambda: (time.sleep(0.4), os._exit(0)),
+        daemon=True,
+    ).start()
+    return Response("shutting down", status=200)
 
 
 @app.route("/export/csv")
@@ -476,7 +553,7 @@ def parse_listing_text(text):
                     created_at = line
                 break
 
-    ignore = {"¥", "公開停止中", "出品中", "取引中", "売却済み", "出品停止中"}
+    ignore = {"¥", "公開停止中", "出品中", "取引中", "売却済み", "出品停止中", "販売履歴"}
     for line in reversed(lines):
         if line in ignore:
             continue
@@ -565,7 +642,7 @@ def find_more_button(driver):
     return None
 
 
-def load_listings_for_status(driver, status_label):
+def load_listings_for_status(driver, status_label, pagination_timeout=6):
     """Load all items from the Mercari page for one status, paginating fully.
 
     All returned items have their 'status' field set to status_label,
@@ -587,7 +664,7 @@ def load_listings_for_status(driver, status_label):
         print(f"[{status_label}] 商品が見つかりませんでした")
         return []
 
-    for click_num in range(100):
+    for click_num in range(200):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(0.8)
 
@@ -602,7 +679,7 @@ def load_listings_for_status(driver, status_label):
         prev_count = len(current_items)
         driver.execute_script("arguments[0].click();", more_btn)
         print(f"\n[{status_label}] 「もっと見る」クリック {click_num + 1} 回目...", flush=True)
-        wait_for_count_increase(driver, prev_count, timeout=6)
+        wait_for_count_increase(driver, prev_count, timeout=pagination_timeout)
 
     final = collect_items_from_page(driver)
     # Force the status to the URL-based label — card text may not have a badge
@@ -620,7 +697,8 @@ def load_all_listings(driver, selected_statuses):
     counts = {}
 
     for status in selected_statuses:
-        items = load_listings_for_status(driver, status)
+        timeout = 10 if status in _LONG_TIMEOUT_STATUSES else 6
+        items = load_listings_for_status(driver, status, pagination_timeout=timeout)
         new_items = [i for i in items if i["url"] not in seen_urls]
         seen_urls.update(i["url"] for i in new_items)
         all_items.extend(new_items)
@@ -630,7 +708,7 @@ def load_all_listings(driver, selected_statuses):
     for s in selected_statuses:
         print(f"  {s}: {counts.get(s, 0)}")
     print(f"  合計: {len(all_items)} 件")
-    return all_items
+    return all_items, counts
 
 
 # ---------------------------------------------------------------------------
@@ -909,9 +987,12 @@ def wait_for_login(driver, timeout=300):
 # ---------------------------------------------------------------------------
 
 def run_scraper(selected_statuses=None):
+    global _last_sync_summary
+
     if selected_statuses is None:
         selected_statuses = list(STATUSES)
 
+    start_jst = jst_now()
     sync_start = time.time()
 
     # ------------------------------------------------------------------
@@ -923,13 +1004,13 @@ def run_scraper(selected_statuses=None):
     wait_for_login(main_driver)
 
     phase1_start = time.time()
-    items = load_all_listings(main_driver, selected_statuses)
+    items, per_status_counts = load_all_listings(main_driver, selected_statuses)
     total_count = len(items)
 
     existing_map = fetch_existing_batch([item["url"] for item in items])
     to_skip, to_save_direct, to_fetch_detail = classify_items(items, existing_map)
 
-    print(f"  跳过（未变化）：{len(to_skip)} 件 | "
+    print(f"  跳过（未変化）：{len(to_skip)} 件 | "
           f"列表页直接保存：{len(to_save_direct)} 件 | "
           f"需打开详情页：{len(to_fetch_detail)} 件")
 
@@ -992,7 +1073,7 @@ def run_scraper(selected_statuses=None):
                 detail_inserted += 1
             else:
                 detail_updated += 1
-            print(f"  {'新增' if result == 'inserted' else '更新'}：{r['title']} / {r['price']}")
+            print(f"  {'新増' if result == 'inserted' else '更新'}：{r['title']} / {r['price']}")
 
         phase2_elapsed = time.time() - phase2_start
 
@@ -1020,10 +1101,21 @@ def run_scraper(selected_statuses=None):
     print(f"  总耗时：           {total_elapsed:>6.1f} 秒")
     print(f"{'=' * 56}")
 
-    webbrowser.open("http://127.0.0.1:5000")
+    _last_sync_summary = {
+        "start_jst": start_jst,
+        "end_jst": jst_now(),
+        "elapsed": round(total_elapsed, 1),
+        "per_status": per_status_counts,
+        "inserted": total_inserted,
+        "updated": total_updated,
+        "skipped": len(to_skip),
+        "total": total_count,
+    }
+
+    webbrowser.open("http://127.0.0.1:5050")
 
 
 if __name__ == "__main__":
     init_db()
-    webbrowser.open("http://127.0.0.1:5000")
+    webbrowser.open("http://127.0.0.1:5050")
     app.run(debug=False)
