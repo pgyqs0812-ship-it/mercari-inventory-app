@@ -185,7 +185,7 @@ header { background: #111827; color: #fff; padding: 0; }
 main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
        flex-direction: column; gap: 20px; }
 .card { background: var(--surface); border-radius: var(--radius);
-        box-shadow: var(--shadow-md); overflow: hidden; }
+        box-shadow: var(--shadow-md); overflow: clip; }
 .card-header { display: flex; justify-content: space-between; align-items: center;
                padding: 16px 20px; border-bottom: 1px solid var(--border); }
 .card-title { font-size: 14px; font-weight: 600; color: var(--text); }
@@ -219,7 +219,7 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
 .count-badge { display: inline-block; background: #eff6ff; color: #1d4ed8;
                border-radius: 20px; padding: 2px 10px; font-size: 12px;
                font-weight: 600; margin-left: 8px; }
-table { width: 100%; border-collapse: collapse; }
+table { width: 100%; border-collapse: separate; border-spacing: 0; }
 /* Sticky search/filter card */
 #search-card { position: sticky; top: 8px; z-index: 10; }
 /* Sticky table header — JS sets correct top offset to sit below #search-card */
