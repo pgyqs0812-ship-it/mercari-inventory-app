@@ -5,14 +5,27 @@
 #   dist/MercariInventory/           PyInstaller bundle (all binaries + deps)
 #   dist/MercariInventory.command    Double-clickable launcher (opens in Terminal)
 #
+# Optional signing (set env vars before running):
+#   SIGN_IDENTITY  — "Developer ID Application: Your Name (TEAMID)"
+#                    If unset, ad-hoc signing is applied (fixes Killed:9 locally).
+#   NOTARIZE       — set to "1" to submit to Apple notarization service
+#   NOTARIZE_PROFILE — keychain profile name created via:
+#                       xcrun notarytool store-credentials ...
+#                      (only needed when NOTARIZE=1)
+#
 # Usage:
 #   chmod +x build_mac.sh
 #   ./build_mac.sh
+#
+# See SIGNING.md for full Developer ID signing + notarization setup.
 
 set -euo pipefail
 
 APP_NAME="MercariInventory"
 ENTRY="main.py"
+SIGN_IDENTITY="${SIGN_IDENTITY:-}"
+NOTARIZE="${NOTARIZE:-0}"
+NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-notarytool-profile}"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo ""
@@ -108,6 +121,13 @@ pyinstaller \
 # ── Double-clickable launcher ─────────────────────────────────────────────────
 # When a .command file is double-clicked in Finder, macOS opens it in
 # Terminal.app — giving the user a visible window for Mercari login prompts.
+#
+# The launcher also strips com.apple.quarantine on first run.
+# macOS sets this xattr on every file inside a downloaded zip, which causes
+# unsigned PyInstaller binaries to be killed with SIGKILL (Killed: 9) on
+# Apple Silicon. The .command itself passes the one-time Gatekeeper dialog,
+# so after the user clicks "Open", this script is allowed to clean up the
+# quarantine from the entire bundle.
 
 LAUNCHER="dist/${APP_NAME}.command"
 
@@ -115,12 +135,70 @@ cat > "${LAUNCHER}" << LAUNCHER_SCRIPT
 #!/bin/bash
 # Mercari Inventory — double-click to launch.
 # macOS opens .command files in Terminal.app automatically.
+
 SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+
+# Strip quarantine xattr set by macOS on downloaded files.
+# Prevents "Killed: 9" on Apple Silicon for unsigned PyInstaller binaries.
+# Safe here because the user already approved this .command via Gatekeeper.
+if xattr -p com.apple.quarantine "\${SCRIPT_DIR}/${APP_NAME}/${APP_NAME}" 2>/dev/null | grep -q .; then
+    echo "[setup] Removing macOS download quarantine (first run only)..."
+    xattr -dr com.apple.quarantine "\${SCRIPT_DIR}" 2>/dev/null || true
+fi
+
 cd "\${SCRIPT_DIR}/${APP_NAME}"
 ./MercariInventory
 LAUNCHER_SCRIPT
 
 chmod +x "${LAUNCHER}"
+
+# ── Code signing ──────────────────────────────────────────────────────────────
+# Always apply at least ad-hoc signing to the main executable.
+# Ad-hoc signing (-) fixes Killed:9 when the binary is run on the SAME machine.
+# For distributed builds, set SIGN_IDENTITY to your Developer ID certificate.
+
+BINARY="dist/${APP_NAME}/${APP_NAME}"
+
+if [ -n "${SIGN_IDENTITY}" ]; then
+    echo ""
+    echo "Signing with Developer ID: ${SIGN_IDENTITY}"
+
+    # Sign all bundled dylibs and .so files first (leaf nodes before the root).
+    find "dist/${APP_NAME}" \( -name "*.dylib" -o -name "*.so" \) -print0 \
+        | xargs -0 -I{} codesign --sign "${SIGN_IDENTITY}" --force --options runtime "{}" 2>/dev/null || true
+
+    # Sign the main executable with entitlements (required for hardened runtime).
+    ENTITLEMENTS="entitlements.plist"
+    if [ ! -f "${ENTITLEMENTS}" ]; then
+        echo "  ⚠  entitlements.plist not found — signing without entitlements"
+        codesign --sign "${SIGN_IDENTITY}" --force --options runtime "${BINARY}"
+    else
+        codesign --sign "${SIGN_IDENTITY}" --force --options runtime \
+            --entitlements "${ENTITLEMENTS}" "${BINARY}"
+    fi
+
+    echo "✓ Signed (Developer ID)"
+
+    # ── Notarization ─────────────────────────────────────────────────────────
+    if [ "${NOTARIZE}" = "1" ]; then
+        echo "Submitting to Apple notarization service (this takes a few minutes)..."
+        NOTARIZE_ZIP="notarize_submit.zip"
+        zip -qr "${NOTARIZE_ZIP}" "dist/${APP_NAME}/"
+        xcrun notarytool submit "${NOTARIZE_ZIP}" \
+            --keychain-profile "${NOTARIZE_PROFILE}" \
+            --wait
+        rm -f "${NOTARIZE_ZIP}"
+        xcrun stapler staple "${BINARY}"
+        echo "✓ Notarized and stapled"
+    fi
+
+else
+    # Ad-hoc sign the main binary only.
+    # This alone does NOT satisfy Gatekeeper for downloaded builds, but it
+    # prevents Killed:9 when running on the same machine (e.g., local dev builds).
+    codesign --sign - --force "${BINARY}" 2>/dev/null || true
+    echo "✓ Ad-hoc signed (dev build — see SIGNING.md for distribution signing)"
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
@@ -146,3 +224,9 @@ echo "NOTE: ChromeDriver is managed automatically by Selenium Manager."
 echo "      Only Google Chrome must be installed on the user's machine."
 echo "      https://www.google.com/chrome/"
 echo ""
+if [ -z "${SIGN_IDENTITY}" ]; then
+    echo "NOTE: This is an unsigned (ad-hoc) build."
+    echo "      Downloaded builds may trigger Gatekeeper on other Macs."
+    echo "      See SIGNING.md for Developer ID signing + notarization setup."
+    echo ""
+fi

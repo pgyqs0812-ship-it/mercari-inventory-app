@@ -12,6 +12,15 @@ jobs:
   build:
     runs-on: macos-latest
 
+    env:
+      APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+
     steps:
 
       - name: Checkout code
@@ -32,6 +41,60 @@ jobs:
         run: |
           chmod +x build_mac.sh
           ./build_mac.sh
+
+      # ── Optional: Developer ID signing + notarization ──────────────────────
+      # This step runs only when the APPLE_CERTIFICATE_BASE64 secret is present.
+      # To enable, add the repository secrets listed in SIGNING.md:
+      #   APPLE_CERTIFICATE_BASE64     — base64-encoded .p12 certificate
+      #   APPLE_CERTIFICATE_PASSWORD   — .p12 export password
+      #   APPLE_SIGN_IDENTITY          — "Developer ID Application: Name (TEAMID)"
+      #   APPLE_TEAM_ID                — 10-char Apple Team ID
+      #   APPLE_API_KEY_BASE64         — base64-encoded .p8 App Store Connect API key
+      #   APPLE_API_KEY_ID             — API key ID (10 chars)
+      #   APPLE_API_ISSUER_ID          — API issuer ID (UUID)
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          echo "${APPLE_CERTIFICATE_BASE64}" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "${KEYCHAIN_PATH}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -T /usr/bin/codesign
+          security list-keychain -d user -s "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> "$GITHUB_ENV"
+
+      - name: Sign app bundle
+        if: env.APPLE_SIGN_IDENTITY != ''
+        run: |
+          APP="dist/MercariInventory/MercariInventory"
+          find dist/MercariInventory \( -name "*.dylib" -o -name "*.so" \) -print0 \
+            | xargs -0 -I{} codesign --sign "${APPLE_SIGN_IDENTITY}" --force --options runtime "{}" 2>/dev/null || true
+          codesign --sign "${APPLE_SIGN_IDENTITY}" --force --options runtime \
+            --entitlements entitlements.plist "${APP}"
+          echo "✓ Signed"
+
+      - name: Notarize app
+        if: env.APPLE_API_KEY_BASE64 != ''
+        run: |
+          KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "${APPLE_API_KEY_BASE64}" | base64 --decode -o "${KEY_PATH}"
+          zip -qr notarize_submit.zip dist/MercariInventory/
+          xcrun notarytool submit notarize_submit.zip \
+            --key "${KEY_PATH}" \
+            --key-id "${APPLE_API_KEY_ID}" \
+            --issuer "${APPLE_API_ISSUER_ID}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --wait
+          xcrun stapler staple dist/MercariInventory/MercariInventory
+          rm -f notarize_submit.zip "${KEY_PATH}"
+          echo "✓ Notarized and stapled"
 
       - name: Zip dist
         run: |
