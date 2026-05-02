@@ -37,6 +37,7 @@ def jst_now() -> str:
     """Return the current time in JST as 'YYYY-MM-DD HH:MM:SS'."""
     return datetime.now(tz=_JST).strftime("%Y-%m-%d %H:%M:%S")
 
+
 app = Flask(__name__)
 
 TIME_KEYWORDS = [
@@ -45,11 +46,21 @@ TIME_KEYWORDS = [
     "半年前", "半年以上前",
 ]
 
-INVALID_TITLES = {"公開停止中", "出品停止中", "売却済み", "出品中", "取引中", "名称未取得", "販売履歴"}
+INVALID_TITLES = {
+    "公開停止中", "出品停止中", "売却済み", "出品中", "取引中", "名称未取得", "販売履歴"
+}
 
+# Statuses that have dedicated scraping URLs (sync targets)
 STATUSES = ["出品中", "取引中", "売却済み", "販売履歴"]
 
-# Mercari mypage URL for each status
+# Statuses shown in the search filter UI
+# 公開停止中 is a sub-filter of 出品中 (stored as visibility_status='stopped')
+FILTER_STATUSES = ["出品中", "公開停止中", "取引中", "売却済み", "販売履歴"]
+
+# Badge texts that can appear on cards (superset of STATUSES for detection)
+_DETECT_STATUSES = set(STATUSES) | {"公開停止中", "出品停止中"}
+
+# Mercari mypage URL for each sync status
 STATUS_URLS = {
     "出品中":   "https://jp.mercari.com/mypage/listings",
     "取引中":   "https://jp.mercari.com/mypage/listings/in_progress",
@@ -82,20 +93,16 @@ def init_db():
         cursor.execute("ALTER TABLE mercari_products ADD COLUMN created_at TEXT")
     if "status" not in columns:
         cursor.execute("ALTER TABLE mercari_products ADD COLUMN status TEXT DEFAULT ''")
-    # Backfill: records saved before per-status scraping have status=''.
-    # Treat them as 出品中 so IN-based search works correctly.
+    # KAN-11: track 公開停止中 as a sub-state of 出品中
+    if "visibility_status" not in columns:
+        cursor.execute("ALTER TABLE mercari_products ADD COLUMN visibility_status TEXT DEFAULT ''")
+    # Backfill: records without status treated as 出品中
     cursor.execute(
         "UPDATE mercari_products SET status = '出品中' WHERE status IS NULL OR status = ''"
     )
-    # KAN-10: correct status names to match updated URL mapping.
-    # ORDER MATTERS: rename 売却済み→販売履歴 first so the second rename
-    # (公開停止中→売却済み) does not collide with records just renamed.
-    cursor.execute(
-        "UPDATE mercari_products SET status = '販売履歴' WHERE status = '売却済み'"
-    )
-    cursor.execute(
-        "UPDATE mercari_products SET status = '売却済み' WHERE status = '公開停止中'"
-    )
+    # KAN-10: correct status names to match URL mapping (order-safe)
+    cursor.execute("UPDATE mercari_products SET status = '販売履歴' WHERE status = '売却済み'")
+    cursor.execute("UPDATE mercari_products SET status = '売却済み' WHERE status = '公開停止中'")
     conn.commit()
     conn.close()
 
@@ -103,27 +110,39 @@ def init_db():
 # Badge style per status: (bg_color, text_color)
 STATUS_BADGE = {
     "出品中":    ("#dcfce7", "#166534"),
+    "公開停止中": ("#fee2e2", "#991b1b"),
     "取引中":    ("#fef9c3", "#854d0e"),
     "売却済み":  ("#f3f4f6", "#374151"),
-    "公開停止中": ("#fee2e2", "#991b1b"),  # legacy — kept for display of old records
     "販売履歴":  ("#dbeafe", "#1e40af"),
 }
 
 
 def _query_products(q="", statuses=None):
-    """Query mercari_products filtered by keyword and status list."""
+    """Query mercari_products filtered by keyword and status list.
+
+    公開停止中 is handled as a sub-filter: status='出品中' AND visibility_status='stopped'.
+    Multiple selected statuses are OR-combined.
+    """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    sql = ("SELECT title, price, item_url, created_at, synced_at, status "
+    sql = ("SELECT title, price, item_url, created_at, synced_at, status, visibility_status "
            "FROM mercari_products WHERE 1=1")
     params = []
     if q:
         sql += " AND title LIKE ?"
         params.append(f"%{q}%")
     if statuses:
-        ph = ",".join("?" * len(statuses))
-        sql += f" AND status IN ({ph})"
-        params.extend(statuses)
+        regular = [s for s in statuses if s != "公開停止中"]
+        include_stopped = "公開停止中" in statuses
+        conditions = []
+        if regular:
+            ph = ",".join("?" * len(regular))
+            conditions.append(f"status IN ({ph})")
+            params.extend(regular)
+        if include_stopped:
+            conditions.append("(status = '出品中' AND visibility_status = 'stopped')")
+        if conditions:
+            sql += " AND (" + " OR ".join(conditions) + ")"
     sql += " ORDER BY id DESC"
     cursor.execute(sql, params)
     rows = cursor.fetchall()
@@ -236,22 +255,45 @@ tbody tr:hover { background: #f9fafb; }
 .modal-close:hover { background: #1d4ed8; }
 """
 
+# Inline JS for the shutdown flow — kept in a variable to avoid f-string escaping
+_SHUTDOWN_JS = """
+function doShutdown() {
+  if (!confirm('アプリを終了しますか？')) return;
+  fetch('/shutdown', {method: 'POST'})
+    .then(function() {
+      document.open();
+      document.write('<!DOCTYPE html><html><body style="font-family:sans-serif;padding:60px;text-align:center"><h2>アプリを終了しました</h2><p>このタブを閉じてください。</p></body></html>');
+      document.close();
+      setTimeout(function() { try { window.close(); } catch(e) {} }, 400);
+    })
+    .catch(function() {
+      document.body.innerHTML = '<div style="padding:60px;text-align:center;font-family:sans-serif"><h2>アプリを終了しました</h2><p>このタブを閉じてください。</p></div>';
+    });
+}
+"""
 
-def _badge_html(status):
-    bg, fg = STATUS_BADGE.get(status, ("#f3f4f6", "#374151"))
-    s = html_module.escape(status or "—")
+
+def _badge_html(status, visibility_status=""):
+    # 出品中 items with visibility_status='stopped' display as 公開停止中
+    if status == "出品中" and visibility_status == "stopped":
+        display = "公開停止中"
+    else:
+        display = status
+    bg, fg = STATUS_BADGE.get(display, ("#f3f4f6", "#374151"))
+    s = html_module.escape(display or "—")
     return f'<span class="badge" style="background:{bg};color:{fg}">{s}</span>'
 
 
 def _build_result_rows(products):
     rows = ""
     for i, p in enumerate(products, start=1):
-        title     = html_module.escape(p[0] or "名称未取得")
-        price     = html_module.escape(p[1] or "—")
-        url       = html_module.escape(p[2] or "")
-        created   = html_module.escape(p[3] or "—")
-        synced    = html_module.escape(p[4] or "—")
-        badge     = _badge_html(p[5] or "")
+        title      = html_module.escape(p[0] or "名称未取得")
+        price      = html_module.escape(p[1] or "—")
+        url        = html_module.escape(p[2] or "")
+        created    = html_module.escape(p[3] or "—")
+        synced     = html_module.escape(p[4] or "—")
+        vis_status = p[6] if len(p) > 6 else ""
+        badge      = _badge_html(p[5] or "", vis_status or "")
         rows += f"""
         <tr>
           <td style="color:var(--muted);font-size:12px">{i}</td>
@@ -269,7 +311,7 @@ def _build_result_rows(products):
 def home():
     searched      = request.args.get("searched") == "1"
     q             = request.args.get("q", "").strip()
-    sel_statuses  = request.args.getlist("statuses") or list(STATUSES)
+    sel_statuses  = request.args.getlist("statuses") or list(FILTER_STATUSES)
     show_summary  = request.args.get("summary") == "1" and bool(_last_sync_summary)
 
     conn = sqlite3.connect(DB_NAME)
@@ -285,21 +327,23 @@ def home():
         per_status = {}
         for p in products:
             s = p[5] or "出品中"
-            per_status[s] = per_status.get(s, 0) + 1
+            vis = p[6] if len(p) > 6 else ""
+            label = "公開停止中" if (s == "出品中" and vis == "stopped") else s
+            per_status[label] = per_status.get(label, 0) + 1
         status_summary = ", ".join(f"{s}={c}" for s, c in per_status.items())
         print(f"[search] selected: {', '.join(sel_statuses)}")
         print(f"[search] result: {status_summary or '0件'} (total={count})")
 
-    # ── sync card checkboxes ──────────────────────────────────────────────
+    # ── sync card checkboxes (only real sync targets) ─────────────────────
     sync_cbs = ""
     for s in STATUSES:
         sync_cbs += (f'<label class="cb-label">'
                      f'<input type="checkbox" name="statuses" value="{s}" checked> {s}'
                      f'</label>\n')
 
-    # ── search filter checkboxes (reflect current selection) ─────────────
+    # ── search filter checkboxes (FILTER_STATUSES, reflect current selection)
     search_cbs = ""
-    for s in STATUSES:
+    for s in FILTER_STATUSES:
         chk = "checked" if s in sel_statuses else ""
         search_cbs += (f'<label class="cb-label">'
                        f'<input type="checkbox" name="statuses" value="{s}" {chk}> {s}'
@@ -404,8 +448,7 @@ def home():
     </div>
     <div style="display:flex;gap:10px;align-items:center">
       <span class="db-pill">DB: {total_db} 件</span>
-      <button class="btn-exit"
-              onclick="if(confirm('アプリを終了しますか？')){{fetch('/shutdown',{{method:'POST'}}).then(()=>{{document.body.innerHTML='<p style=\\'padding:40px;font-family:sans-serif\\'>アプリを終了しました。このウィンドウを閉じてください。</p>'}})}}}}">[終了]</button>
+      <button class="btn-exit" onclick="doShutdown()">終了</button>
     </div>
   </div>
 </header>
@@ -448,7 +491,10 @@ def home():
 
 </main>
 {summary_modal}
-<script>{export_js}</script>
+<script>
+{_SHUTDOWN_JS}
+{export_js}
+</script>
 </body>
 </html>"""
 
@@ -464,25 +510,28 @@ def sync():
 
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
+    # Give the browser enough time to receive this response before the process exits
     threading.Thread(
-        target=lambda: (time.sleep(0.4), os._exit(0)),
+        target=lambda: (time.sleep(0.8), os._exit(0)),
         daemon=True,
     ).start()
-    return Response("shutting down", status=200)
+    return Response("ok", status=200, headers={"Content-Type": "text/plain"})
 
 
 @app.route("/export/csv")
 def export_csv():
     q            = request.args.get("q", "").strip()
-    sel_statuses = request.args.getlist("statuses") or list(STATUSES)
+    sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
 
     buf = io.StringIO()
-    buf.write("﻿")  # UTF-8 BOM — ensures Excel opens without garbled text
+    buf.write("﻿")  # UTF-8 BOM
     writer = csv.writer(buf)
     writer.writerow(["状態", "商品名", "価格", "商品登録時間", "抓取時間", "リンク"])
     for p in products:
-        writer.writerow([p[5] or "", p[0] or "", p[1] or "",
+        vis = p[6] if len(p) > 6 else ""
+        display_status = "公開停止中" if (p[5] == "出品中" and vis == "stopped") else (p[5] or "")
+        writer.writerow([display_status, p[0] or "", p[1] or "",
                          p[3] or "", p[4] or "", p[2] or ""])
 
     return Response(
@@ -495,7 +544,7 @@ def export_csv():
 @app.route("/export/xlsx")
 def export_xlsx():
     q            = request.args.get("q", "").strip()
-    sel_statuses = request.args.getlist("statuses") or list(STATUSES)
+    sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
 
     wb = openpyxl.Workbook()
@@ -503,7 +552,9 @@ def export_xlsx():
     ws.title = "Mercari商品"
     ws.append(["状態", "商品名", "価格", "商品登録時間", "抓取時間", "リンク"])
     for p in products:
-        ws.append([p[5] or "", p[0] or "", p[1] or "",
+        vis = p[6] if len(p) > 6 else ""
+        display_status = "公開停止中" if (p[5] == "出品中" and vis == "stopped") else (p[5] or "")
+        ws.append([display_status, p[0] or "", p[1] or "",
                    p[3] or "", p[4] or "", p[2] or ""])
 
     buf = io.BytesIO()
@@ -522,11 +573,11 @@ def export_xlsx():
 # ---------------------------------------------------------------------------
 
 def parse_listing_text(text):
-    """Extract title, price, created_at, status from a listing-page link's visible text.
+    """Extract title, price, created_at, status from a listing card's visible text.
 
-    Mercari renders each listing card as a single <a> element whose .text
-    contains all visible fields separated by newlines.
     Returns a 4-tuple: (title, price, created_at, status).
+    Uses _DETECT_STATUSES so 公開停止中 badges are captured even though it is
+    not a sync target in STATUSES.
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     price = ""
@@ -535,25 +586,21 @@ def parse_listing_text(text):
     status = ""
 
     for i, line in enumerate(lines):
-        # Status label (appears as a badge on the card)
-        if line in STATUSES and not status:
+        if line in _DETECT_STATUSES and not status:
             status = line
 
-        # Price: either "¥1,234" on one line, or "¥" followed by digits
         if line == "¥" and i + 1 < len(lines) and lines[i + 1].replace(",", "").isdigit():
             price = "¥" + lines[i + 1]
         elif line.startswith("¥") and not price:
             price = line
 
-        # created_at: a line containing a relative time keyword
         for kw in TIME_KEYWORDS:
             if kw in line:
-                # Prefer lines that also say "更新" (last-updated marker)
                 if "更新" in line or not created_at:
                     created_at = line
                 break
 
-    ignore = {"¥", "公開停止中", "出品中", "取引中", "売却済み", "出品停止中", "販売履歴"}
+    ignore = {"¥"} | INVALID_TITLES | _DETECT_STATUSES
     for line in reversed(lines):
         if line in ignore:
             continue
@@ -577,51 +624,100 @@ def is_valid_title(title):
 # Selenium helpers
 # ---------------------------------------------------------------------------
 
-def get_target_count(driver):
-    """Parse the total listing count from the page using regex for reliability."""
-    try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-    except Exception:
-        return None
-
-    matches = re.findall(r"(\d[\d,]*)\s*件", body_text)
-    if matches:
-        return max(int(m.replace(",", "")) for m in matches)
-    return None
-
-
-def wait_for_items(driver, timeout=10):
-    """Block until at least one item link is present, or timeout."""
-    try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/item/']"))
-        )
-    except Exception:
-        pass
+def wait_for_items(driver, timeout=15):
+    """Block until at least one item/transaction link or table row is present."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if (driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']") or
+                driver.find_elements(By.CSS_SELECTOR, "a[href*='/transaction/']") or
+                driver.find_elements(By.CSS_SELECTOR, "table tr td")):
+            return
+        time.sleep(0.5)
 
 
 def wait_for_count_increase(driver, previous_count, timeout=6):
-    """Poll until the number of item links on the page exceeds previous_count."""
+    """Poll until collected item count exceeds previous_count."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if len(driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")) > previous_count:
+        n = (len(driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']")) +
+             len(driver.find_elements(By.CSS_SELECTOR, "a[href*='/transaction/']")))
+        if n > previous_count:
             return
         time.sleep(0.4)
 
 
-def collect_items_from_page(driver):
-    """Return all unique item links with listing-page metadata (title, price, created_at)."""
+def _collect_from_table(driver, seen_urls):
+    """Parse table/row-based listing pages (e.g., 販売履歴 sold page)."""
+    items = []
+    for row in driver.find_elements(By.CSS_SELECTOR, "tr"):
+        row_link = None
+        for a in row.find_elements(By.TAG_NAME, "a"):
+            href = a.get_attribute("href") or ""
+            if "/item/" in href or "/transaction/" in href:
+                row_link = a
+                break
+        if not row_link:
+            continue
+        href = row_link.get_attribute("href")
+        if href in seen_urls:
+            continue
+        row_text = row.text.strip()
+        title, price, created_at, status = parse_listing_text(row_text) if row_text else ("", "", "", "")
+        items.append({
+            "url": href,
+            "title": title or row_link.text.strip(),
+            "price": price,
+            "created_at": created_at,
+            "status": status,
+            "raw_text": row_text,
+        })
+        seen_urls.add(href)
+    return items
+
+
+def collect_items_from_page(driver, status_label=None):
+    """Return all unique item links with listing-page metadata.
+
+    Uses three strategies in order:
+    1. Standard <a href="/item/..."> links (all listing pages)
+    2. Table-row parser (for 販売履歴 sold page which uses table DOM)
+    3. Transaction links <a href="/transaction/..."> (fallback)
+    """
     seen_urls = set()
     items = []
 
+    # Strategy 1: standard item links
     for a in driver.find_elements(By.TAG_NAME, "a"):
-        href = a.get_attribute("href")
-        if not href or "/item/" not in href or href in seen_urls:
+        href = a.get_attribute("href") or ""
+        if "/item/" not in href or href in seen_urls:
             continue
-
         text = a.text.strip()
         title, price, created_at, status = parse_listing_text(text) if text else ("", "", "", "")
+        items.append({
+            "url": href,
+            "title": title,
+            "price": price,
+            "created_at": created_at,
+            "status": status,
+            "raw_text": text,
+        })
+        seen_urls.add(href)
 
+    if items:
+        return items
+
+    # Strategy 2: table rows (sold page DOM)
+    table_items = _collect_from_table(driver, seen_urls)
+    if table_items:
+        return table_items
+
+    # Strategy 3: transaction links (last resort)
+    for a in driver.find_elements(By.TAG_NAME, "a"):
+        href = a.get_attribute("href") or ""
+        if "/transaction/" not in href or href in seen_urls:
+            continue
+        text = a.text.strip()
+        title, price, created_at, status = parse_listing_text(text) if text else ("", "", "", "")
         items.append({
             "url": href,
             "title": title,
@@ -645,10 +741,9 @@ def find_more_button(driver):
 def load_listings_for_status(driver, status_label, pagination_timeout=6):
     """Load all items from the Mercari page for one status, paginating fully.
 
-    All returned items have their 'status' field set to status_label,
-    overriding any badge text detected by parse_listing_text.  This is
-    necessary because the 出品中 page does not show a status badge on cards,
-    so parse_listing_text would return status='' for every item there.
+    Sets item['status'] = status_label (URL-based, overrides card badge).
+    For 出品中 pages, also sets item['visibility_status'] based on whether the
+    card showed a 公開停止中 badge ('stopped') or not ('public').
     """
     url = STATUS_URLS.get(status_label)
     if not url:
@@ -657,9 +752,9 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
 
     print(f"\n[{status_label}] {url} に遷移中...")
     driver.get(url)
-    wait_for_items(driver, timeout=10)
+    wait_for_items(driver, timeout=15)
 
-    initial = collect_items_from_page(driver)
+    initial = collect_items_from_page(driver, status_label)
     if not initial:
         print(f"[{status_label}] 商品が見つかりませんでした")
         return []
@@ -668,7 +763,7 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(0.8)
 
-        current_items = collect_items_from_page(driver)
+        current_items = collect_items_from_page(driver, status_label)
         print(f"  [{status_label}] 読み込み済み: {len(current_items)} 件", end="\r", flush=True)
 
         more_btn = find_more_button(driver)
@@ -681,12 +776,20 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
         print(f"\n[{status_label}] 「もっと見る」クリック {click_num + 1} 回目...", flush=True)
         wait_for_count_increase(driver, prev_count, timeout=pagination_timeout)
 
-    final = collect_items_from_page(driver)
-    # Force the status to the URL-based label — card text may not have a badge
-    for item in final:
-        item["status"] = status_label
+    final = collect_items_from_page(driver, status_label)
 
-    print(f"[{status_label}] 取得完了: {len(final)} 件")
+    # Apply URL-based status; detect 公開停止中 sub-state for 出品中 items
+    for item in final:
+        badge_status = item.get("status", "")
+        item["status"] = status_label
+        if status_label == "出品中":
+            item["visibility_status"] = "stopped" if badge_status == "公開停止中" else "public"
+        else:
+            item["visibility_status"] = ""
+
+    stopped_count = sum(1 for i in final if i.get("visibility_status") == "stopped")
+    print(f"[{status_label}] 取得完了: {len(final)} 件"
+          + (f" (うち公開停止中: {stopped_count} 件)" if stopped_count else ""))
     return final
 
 
@@ -723,17 +826,26 @@ def fetch_existing_batch(urls):
     cursor = conn.cursor()
     placeholders = ",".join("?" * len(urls))
     cursor.execute(
-        f"SELECT item_url, title, price, created_at, status FROM mercari_products "
-        f"WHERE item_url IN ({placeholders})",
+        f"SELECT item_url, title, price, created_at, status, visibility_status "
+        f"FROM mercari_products WHERE item_url IN ({placeholders})",
         urls,
     )
-    result = {row[0]: {"title": row[1], "price": row[2], "created_at": row[3], "status": row[4] or ""}
-              for row in cursor.fetchall()}
+    result = {
+        row[0]: {
+            "title": row[1],
+            "price": row[2],
+            "created_at": row[3],
+            "status": row[4] or "",
+            "visibility_status": row[5] or "",
+        }
+        for row in cursor.fetchall()
+    }
     conn.close()
     return result
 
 
-def save_or_update_product(item_url, title, price, status, created_at, raw_text):
+def save_or_update_product(item_url, title, price, status, created_at, raw_text,
+                           visibility_status=""):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM mercari_products WHERE item_url = ?", (item_url,))
@@ -743,17 +855,18 @@ def save_or_update_product(item_url, title, price, status, created_at, raw_text)
         cursor.execute("""
             UPDATE mercari_products
             SET title = ?, price = ?, status = ?, created_at = ?, raw_text = ?,
-                synced_at = ?
+                synced_at = ?, visibility_status = ?
             WHERE item_url = ?
-        """, (title, price, status, created_at, raw_text, jst_now(), item_url))
+        """, (title, price, status, created_at, raw_text, jst_now(), visibility_status, item_url))
         conn.commit()
         conn.close()
         return "updated"
 
     cursor.execute("""
-        INSERT INTO mercari_products (item_url, title, price, status, created_at, raw_text, synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (item_url, title, price, status, created_at, raw_text, jst_now()))
+        INSERT INTO mercari_products
+            (item_url, title, price, status, created_at, raw_text, synced_at, visibility_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (item_url, title, price, status, created_at, raw_text, jst_now(), visibility_status))
     conn.commit()
     conn.close()
     return "inserted"
@@ -775,12 +888,7 @@ def touch_synced_at(item_url):
 # ---------------------------------------------------------------------------
 
 def scrape_item_detail(driver, url):
-    """Open a product detail page and extract title, price, raw_text.
-
-    Retries up to MAX_RETRY times (with a 2-second pause between attempts)
-    when price is missing. Logs each retry and a final warning if price
-    cannot be found after all attempts.
-    """
+    """Open a product detail page and extract title, price, raw_text."""
     item_id = url.rstrip("/").split("/")[-1]
     title = ""
     price = ""
@@ -839,11 +947,7 @@ def _make_chrome_driver(headless=False):
         "profile.managed_default_content_settings.images": 2
     })
 
-    # Selenium 4 prefers a chromedriver found in PATH over Selenium Manager.
-    # A PATH-resident chromedriver (e.g. from Homebrew) is often a different
-    # version than the installed Chrome and causes SessionNotCreatedException.
-    # Temporarily removing chromedriver directories from PATH forces Selenium
-    # Manager to download and cache the exactly matching driver version.
+    # Scrub PATH of any Homebrew/system chromedriver to force Selenium Manager
     original_path = os.environ.get("PATH", "")
     clean_path = os.pathsep.join(
         d for d in original_path.split(os.pathsep)
@@ -863,13 +967,6 @@ def _make_chrome_driver(headless=False):
 
 
 def build_driver_pool(n, seed_cookies=None):
-    """
-    Create a pool of n headless Chrome drivers.
-
-    If seed_cookies is provided (grabbed from the logged-in main driver),
-    each worker navigates to the Mercari domain once to apply them so the
-    session is shared across workers.
-    """
     pool = queue.Queue()
     for i in range(n):
         driver = _make_chrome_driver(headless=True)
@@ -886,12 +983,6 @@ def build_driver_pool(n, seed_cookies=None):
 
 
 def make_pool_fetcher(driver_pool):
-    """
-    Return fetch_item_detail(url) — a closure that checks out a driver
-    from the pool, scrapes the detail page, then returns the driver.
-
-    Safe for concurrent use: each call holds exactly one driver at a time.
-    """
     def fetch_item_detail(url):
         driver = driver_pool.get()
         try:
@@ -912,13 +1003,7 @@ def make_pool_fetcher(driver_pool):
 # ---------------------------------------------------------------------------
 
 def classify_items(items, existing_map):
-    """
-    Split items into three buckets:
-
-    to_skip        — DB has a valid title and created_at matches; no fetch needed.
-    to_save_direct — Listing page already provides valid title + price; no detail page needed.
-    to_fetch_detail — Data is incomplete; must open the detail page.
-    """
+    """Split items into to_skip / to_save_direct / to_fetch_detail."""
     to_skip = []
     to_save_direct = []
     to_fetch_detail = []
@@ -926,11 +1011,15 @@ def classify_items(items, existing_map):
     for item in items:
         existing = existing_map.get(item["url"])
         if existing:
-            old_title = existing["title"] or ""
-            old_created_at = existing["created_at"] or ""
+            old_title  = existing["title"] or ""
+            old_cat    = existing["created_at"] or ""
             old_status = existing.get("status") or ""
+            old_vis    = existing.get("visibility_status") or ""
             new_status = item.get("status") or ""
-            if is_valid_title(old_title) and old_created_at == item["created_at"] and old_status == new_status:
+            new_vis    = item.get("visibility_status") or ""
+            # Skip only when everything including visibility_status matches
+            if (is_valid_title(old_title) and old_cat == item["created_at"]
+                    and old_status == new_status and old_vis == new_vis):
                 to_skip.append(item)
                 continue
 
@@ -962,18 +1051,14 @@ def click_login_button_if_exists(driver):
 
 
 def wait_for_login(driver, timeout=300):
-    """Poll until the browser URL leaves the login page (user completed login).
-
-    Replaces the old input() prompt — no Enter key needed. Times out after
-    `timeout` seconds (default 5 minutes).
-    """
+    """Poll until the browser URL leaves the login page."""
     print("ブラウザで Mercari にログインしてください。")
     print("ログイン完了後、自動的に同期を開始します（最大 5 分待機）...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             if "login" not in driver.current_url:
-                time.sleep(1)  # let post-login redirect settle
+                time.sleep(1)
                 print("ログイン確認完了。同期を開始します...")
                 return
         except Exception:
@@ -996,7 +1081,7 @@ def run_scraper(selected_statuses=None):
     sync_start = time.time()
 
     # ------------------------------------------------------------------
-    # Phase 1: login with the main (visible) driver, collect all listings
+    # Phase 1: login with main (visible) driver, collect all listings
     # ------------------------------------------------------------------
     main_driver = _make_chrome_driver(headless=False)
     main_driver.get("https://jp.mercari.com/login")
@@ -1014,13 +1099,16 @@ def run_scraper(selected_statuses=None):
           f"列表页直接保存：{len(to_save_direct)} 件 | "
           f"需打开详情页：{len(to_fetch_detail)} 件")
 
-    # Capture session before quitting the main driver
     seed_cookies = main_driver.get_cookies()
     main_driver.quit()
 
     phase1_elapsed = time.time() - phase1_start
 
-    # Apply skip (just touch synced_at) and direct saves
+    # Build lookup maps for all items
+    visibility_status_map = {item["url"]: item.get("visibility_status", "") for item in items}
+    created_at_map        = {item["url"]: item["created_at"] for item in items}
+    status_map            = {item["url"]: item.get("status", "") for item in items}
+
     for item in to_skip:
         touch_synced_at(item["url"])
 
@@ -1028,7 +1116,8 @@ def run_scraper(selected_statuses=None):
     for item in to_save_direct:
         r = save_or_update_product(
             item["url"], item["title"], item["price"],
-            item.get("status", ""), item["created_at"], item["raw_text"]
+            item.get("status", ""), item["created_at"], item["raw_text"],
+            item.get("visibility_status", ""),
         )
         if r == "inserted":
             direct_inserted += 1
@@ -1036,7 +1125,7 @@ def run_scraper(selected_statuses=None):
             direct_updated += 1
 
     # ------------------------------------------------------------------
-    # Phase 2: parallel detail fetches for items with incomplete data
+    # Phase 2: parallel detail fetches
     # ------------------------------------------------------------------
     detail_inserted = detail_updated = detail_errors = 0
     phase2_elapsed = 0.0
@@ -1048,18 +1137,14 @@ def run_scraper(selected_statuses=None):
 
         fetch_item_detail = make_pool_fetcher(pool)
         urls_to_fetch = [item["url"] for item in to_fetch_detail]
-        created_at_map = {item["url"]: item["created_at"] for item in to_fetch_detail}
-        status_map = {item["url"]: item.get("status", "") for item in to_fetch_detail}
 
         print(f"开始并行抓取 {len(urls_to_fetch)} 个详情页（{MAX_WORKERS} workers）...")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             results = list(executor.map(fetch_item_detail, urls_to_fetch))
 
-        # Drain and quit worker drivers
         while not pool.empty():
             pool.get().quit()
 
-        # Write results to DB sequentially (SQLite is not thread-safe for writes)
         for r in results:
             if r["error"]:
                 detail_errors += 1
@@ -1067,7 +1152,8 @@ def run_scraper(selected_statuses=None):
                 continue
             result = save_or_update_product(
                 r["url"], r["title"], r["price"],
-                status_map[r["url"]], created_at_map[r["url"]], r["raw_text"]
+                status_map[r["url"]], created_at_map[r["url"]], r["raw_text"],
+                visibility_status_map.get(r["url"], ""),
             )
             if result == "inserted":
                 detail_inserted += 1
@@ -1081,8 +1167,8 @@ def run_scraper(selected_statuses=None):
     # Summary
     # ------------------------------------------------------------------
     total_inserted = direct_inserted + detail_inserted
-    total_updated = direct_updated + detail_updated
-    total_elapsed = time.time() - sync_start
+    total_updated  = direct_updated  + detail_updated
+    total_elapsed  = time.time() - sync_start
 
     print(f"\n{'=' * 56}")
     print(f"  同步完成")
@@ -1102,17 +1188,16 @@ def run_scraper(selected_statuses=None):
     print(f"{'=' * 56}")
 
     _last_sync_summary = {
-        "start_jst": start_jst,
-        "end_jst": jst_now(),
-        "elapsed": round(total_elapsed, 1),
+        "start_jst":  start_jst,
+        "end_jst":    jst_now(),
+        "elapsed":    round(total_elapsed, 1),
         "per_status": per_status_counts,
-        "inserted": total_inserted,
-        "updated": total_updated,
-        "skipped": len(to_skip),
-        "total": total_count,
+        "inserted":   total_inserted,
+        "updated":    total_updated,
+        "skipped":    len(to_skip),
+        "total":      total_count,
     }
-
-    webbrowser.open("http://127.0.0.1:5050")
+    # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
 
 
 if __name__ == "__main__":
