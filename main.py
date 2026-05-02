@@ -6,6 +6,7 @@ browser automatically. The terminal stays open so that Selenium sync
 steps (login prompt, input() calls) are visible and interactive.
 """
 import os
+import shutil
 import socket
 import sys
 import threading
@@ -33,7 +34,26 @@ def is_port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def check_chromedriver() -> None:
+    """Exit with a clear install message if chromedriver is not on PATH."""
+    if shutil.which("chromedriver") is None:
+        print("----------------------------------------")
+        print("ChromeDriver not found.")
+        print("")
+        print("Please install it using:")
+        print("")
+        print("  brew install chromedriver")
+        print("")
+        print("Then allow it in:")
+        print("")
+        print("  System Settings → Privacy & Security")
+        print("----------------------------------------")
+        sys.exit(1)
+
+
 def main() -> None:
+    check_chromedriver()
+
     data_dir = get_data_dir()
 
     # Resolve all relative paths (products.db, .env) against data_dir
