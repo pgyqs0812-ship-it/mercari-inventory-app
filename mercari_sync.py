@@ -1,3 +1,4 @@
+import os
 import re
 import queue
 import time
@@ -9,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, redirect
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service  # noqa: F401 — used by Selenium Manager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -425,7 +425,28 @@ def _make_chrome_driver(headless=False):
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2
     })
-    return webdriver.Chrome(options=opts)
+
+    # Selenium 4 prefers a chromedriver found in PATH over Selenium Manager.
+    # A PATH-resident chromedriver (e.g. from Homebrew) is often a different
+    # version than the installed Chrome and causes SessionNotCreatedException.
+    # Temporarily removing chromedriver directories from PATH forces Selenium
+    # Manager to download and cache the exactly matching driver version.
+    original_path = os.environ.get("PATH", "")
+    clean_path = os.pathsep.join(
+        d for d in original_path.split(os.pathsep)
+        if d and not os.path.isfile(os.path.join(d, "chromedriver"))
+    )
+    os.environ["PATH"] = clean_path
+    try:
+        return webdriver.Chrome(options=opts)
+    except Exception as exc:
+        raise RuntimeError(
+            "Chrome の自動ドライバーセットアップに失敗しました。\n"
+            "Google Chrome がインストールされていることを確認してください。\n"
+            "https://www.google.com/chrome/"
+        ) from exc
+    finally:
+        os.environ["PATH"] = original_path
 
 
 def build_driver_pool(n, seed_cookies=None):
