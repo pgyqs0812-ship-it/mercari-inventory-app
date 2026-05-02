@@ -19,12 +19,16 @@ def get_data_dir() -> str:
     """
     Return the directory where user data (products.db, .env) should live.
 
-    PyInstaller frozen binary  → directory containing the executable,
-                                 so data survives app updates.
+    PyInstaller frozen binary  → ~/Library/Application Support/MercariInventory/
+                                 Survives app updates (new dist.zip extracts never
+                                 touch this path).
     Normal Python script       → project root.
     """
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
+        app_support = os.path.expanduser("~/Library/Application Support")
+        data_dir = os.path.join(app_support, "MercariInventory")
+        os.makedirs(data_dir, exist_ok=True)
+        return data_dir
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -57,19 +61,44 @@ def check_chrome_browser() -> None:
         sys.exit(1)
 
 
+def _migrate_db_if_needed(data_dir: str) -> None:
+    """One-time migration: copy products.db from the old location (next to the
+    executable) to the new persistent app data directory, so existing users do
+    not lose their sync history after updating the app."""
+    import shutil  # noqa: PLC0415
+
+    new_db = os.path.join(data_dir, "products.db")
+    if os.path.exists(new_db):
+        return  # already migrated or fresh install
+
+    old_db = os.path.join(os.path.dirname(sys.executable), "products.db")
+    if os.path.exists(old_db):
+        print(f"[migration] データを新しい保存先にコピーします: {new_db}")
+        shutil.copy2(old_db, new_db)
+        print("[migration] 完了")
+
+
 def main() -> None:
     check_chrome_browser()
 
     data_dir = get_data_dir()
 
-    # Resolve all relative paths (products.db, .env) against data_dir
-    # before importing mercari_sync, which sets DB_NAME at module level.
+    # For frozen builds, migrate products.db from the old location if needed.
+    if getattr(sys, "frozen", False):
+        _migrate_db_if_needed(data_dir)
+
+    # Set DB_NAME to an absolute path before importing mercari_sync so the
+    # database is always found regardless of the process working directory.
+    # (os.chdir is kept as a fallback for .env loading via python-dotenv.)
     os.chdir(data_dir)
 
     # Disable Flask/Werkzeug debug output noise in production
     os.environ.setdefault("FLASK_ENV", "production")
 
-    from mercari_sync import app as flask_app, init_db  # noqa: PLC0415
+    import mercari_sync as _ms  # noqa: PLC0415
+    _ms.DB_NAME = os.path.join(data_dir, "products.db")
+    flask_app = _ms.app
+    init_db = _ms.init_db
 
     print("=" * 54)
     print("  Mercari Inventory App")
