@@ -220,10 +220,14 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
                border-radius: 20px; padding: 2px 10px; font-size: 12px;
                font-weight: 600; margin-left: 8px; }
 table { width: 100%; border-collapse: collapse; }
+/* Sticky search/filter card */
+#search-card { position: sticky; top: 8px; z-index: 10; }
+/* Sticky table header — JS sets correct top offset to sit below #search-card */
 thead th { background: #f9fafb; color: var(--muted); font-size: 12px;
            font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
            padding: 10px 14px; text-align: left;
-           border-bottom: 2px solid var(--border); }
+           border-bottom: 2px solid var(--border);
+           position: sticky; top: 0; z-index: 5; }
 tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border);
            font-size: 14px; vertical-align: middle; }
 tbody tr:last-child td { border-bottom: none; }
@@ -253,6 +257,27 @@ tbody tr:hover { background: #f9fafb; }
                border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
                cursor: pointer; transition: background .15s; }
 .modal-close:hover { background: #1d4ed8; }
+"""
+
+# JS that keeps the sticky table header just below the sticky search card.
+# Runs once on load and on every resize so narrow-screen wrapping is handled.
+_STICKY_JS = """
+(function() {
+  var SEARCH_TOP = 8;
+  function updateStickyOffset() {
+    var sc = document.getElementById('search-card');
+    var ths = document.querySelectorAll('thead th');
+    if (!sc || !ths.length) return;
+    var offset = sc.offsetHeight + SEARCH_TOP;
+    for (var i = 0; i < ths.length; i++) { ths[i].style.top = offset + 'px'; }
+  }
+  updateStickyOffset();
+  window.addEventListener('resize', updateStickyOffset);
+  if (window.ResizeObserver) {
+    var sc = document.getElementById('search-card');
+    if (sc) { new ResizeObserver(updateStickyOffset).observe(sc); }
+  }
+})();
 """
 
 # Inline JS for the shutdown flow — kept in a variable to avoid f-string escaping
@@ -468,8 +493,8 @@ def home():
     </div>
   </div>
 
-  <!-- Search card -->
-  <div class="card">
+  <!-- Search card (sticky) -->
+  <div class="card" id="search-card">
     <div class="card-header">
       <span class="card-title">商品を検索</span>
     </div>
@@ -492,6 +517,7 @@ def home():
 </main>
 {summary_modal}
 <script>
+{_STICKY_JS}
 {_SHUTDOWN_JS}
 {export_js}
 </script>
