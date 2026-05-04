@@ -1877,7 +1877,7 @@ def _do_login() -> None:
 # ---------------------------------------------------------------------------
 
 def run_scraper(selected_statuses=None):
-    global _last_sync_summary
+    global _last_sync_summary, _session_state
 
     if selected_statuses is None:
         selected_statuses = list(STATUSES)
@@ -1898,7 +1898,6 @@ def run_scraper(selected_statuses=None):
 
     # Re-verify session is still live (cookies may have expired since login check)
     if not _try_restore_session(main_driver):
-        global _session_state  # noqa: PLW0603
         _session_state = "invalid"
         raise RuntimeError(
             "Mercari セッションが切れました。ログイン画面から再度ログインしてください。"

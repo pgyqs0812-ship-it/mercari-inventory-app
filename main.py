@@ -141,7 +141,7 @@ def main() -> None:
     webbrowser.open(f"http://127.0.0.1:{PORT}")
 
     print("\nアプリが起動しました。")
-    print("同期を行う際はこのウィンドウで Mercari のログイン操作が必要です。")
+    print("ログイン・同期はブラウザ画面から操作してください。")
     print("終了するには Ctrl+C を押してください。\n")
 
     try:

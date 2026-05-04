@@ -124,6 +124,10 @@ pyinstaller \
     `# Bundle selenium-manager as a binary so execute permissions are preserved` \
     --add-binary "${SM_BIN}:selenium/webdriver/common/macos/" \
     \
+    `# openpyxl (used by /export/xlsx route)` \
+    --hidden-import "openpyxl" \
+    --collect-submodules "openpyxl" \
+    \
     `# python-dotenv (used by create_jira_ticket.py)` \
     --hidden-import "dotenv" \
     \
