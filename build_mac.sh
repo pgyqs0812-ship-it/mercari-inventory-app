@@ -1,9 +1,8 @@
 #!/bin/bash
-# build_mac.sh — Build Mercari Inventory as a Mac desktop app.
+# build_mac.sh — Build Mercari Inventory as a macOS .app bundle.
 #
 # Produces:
-#   dist/MercariInventory/           PyInstaller bundle (all binaries + deps)
-#   dist/MercariInventory.command    Double-clickable launcher (opens in Terminal)
+#   dist/MercariInventory.app    Standard macOS app bundle (double-click to launch)
 #
 # Optional signing (set env vars before running):
 #   SIGN_IDENTITY  — "Developer ID Application: Your Name (TEAMID)"
@@ -26,6 +25,8 @@ ENTRY="main.py"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARIZE="${NOTARIZE:-0}"
 NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-notarytool-profile}"
+
+APP_BUNDLE="dist/${APP_NAME}.app"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo ""
@@ -74,14 +75,8 @@ fi
 echo "Cleaning previous build artifacts..."
 rm -rf build/ dist/ "${APP_NAME}.spec"
 
-# ── PyInstaller build ─────────────────────────────────────────────────────────
-echo "Building ${APP_NAME} (this may take a minute)..."
-echo ""
-
-# Resolve the selenium-manager binary path at build time.
-# --collect-data "selenium" includes it as a data file but does NOT preserve
-# the execute bit. Adding it via --add-binary ensures +x is preserved so
-# Selenium Manager can launch chromedriver without a Permission denied error.
+# ── selenium-manager binary path ─────────────────────────────────────────────
+# Resolved at build time so execute permissions are preserved inside the bundle.
 SM_BIN="$(python3 -c "
 import selenium, os
 print(os.path.join(os.path.dirname(selenium.__file__), 'webdriver', 'common', 'macos', 'selenium-manager'))
@@ -92,10 +87,14 @@ if [ ! -f "${SM_BIN}" ]; then
 fi
 echo "✓ selenium-manager: ${SM_BIN}"
 
+# ── PyInstaller build ─────────────────────────────────────────────────────────
+echo "Building ${APP_NAME}.app (this may take a minute)..."
+echo ""
+
 pyinstaller \
     --name "${APP_NAME}" \
     --onedir \
-    --console \
+    --windowed \
     --noconfirm \
     \
     `# Flask and its runtime deps` \
@@ -128,7 +127,7 @@ pyinstaller \
     --hidden-import "openpyxl" \
     --collect-submodules "openpyxl" \
     \
-    `# python-dotenv (used by create_jira_ticket.py)` \
+    `# python-dotenv` \
     --hidden-import "dotenv" \
     \
     `# Standard library modules PyInstaller sometimes misses` \
@@ -138,85 +137,42 @@ pyinstaller \
     \
     "${ENTRY}"
 
-# ── Double-clickable launcher ─────────────────────────────────────────────────
-# When a .command file is double-clicked in Finder, macOS opens it in
-# Terminal.app — giving the user a visible window for Mercari login prompts.
-#
-# The launcher also strips com.apple.quarantine on first run.
-# macOS sets this xattr on every file inside a downloaded zip, which causes
-# unsigned PyInstaller binaries to be killed with SIGKILL (Killed: 9) on
-# Apple Silicon. The .command itself passes the one-time Gatekeeper dialog,
-# so after the user clicks "Open", this script is allowed to clean up the
-# quarantine from the entire bundle.
-
-LAUNCHER="dist/${APP_NAME}.command"
-
-cat > "${LAUNCHER}" << LAUNCHER_SCRIPT
-#!/bin/bash
-# Mercari Inventory — double-click to launch.
-# macOS opens .command files in Terminal.app automatically.
-
-SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-
-# Strip quarantine xattr set by macOS on downloaded files.
-# Prevents "Killed: 9" on Apple Silicon for unsigned PyInstaller binaries.
-# Safe here because the user already approved this .command via Gatekeeper.
-if xattr -p com.apple.quarantine "\${SCRIPT_DIR}/${APP_NAME}/${APP_NAME}" 2>/dev/null | grep -q .; then
-    echo "[setup] Removing macOS download quarantine (first run only)..."
-    xattr -dr com.apple.quarantine "\${SCRIPT_DIR}" 2>/dev/null || true
-fi
-
-cd "\${SCRIPT_DIR}/${APP_NAME}"
-./MercariInventory
-LAUNCHER_SCRIPT
-
-chmod +x "${LAUNCHER}"
-
 # ── Code signing ──────────────────────────────────────────────────────────────
-# Always apply at least ad-hoc signing to the main executable.
-# Ad-hoc signing (-) fixes Killed:9 when the binary is run on the SAME machine.
-# For distributed builds, set SIGN_IDENTITY to your Developer ID certificate.
-
-BINARY="dist/${APP_NAME}/${APP_NAME}"
+# --windowed produces dist/MercariInventory.app — sign the whole bundle.
+# --deep signs the top-level bundle and all nested binaries/frameworks in one pass.
 
 if [ -n "${SIGN_IDENTITY}" ]; then
     echo ""
     echo "Signing with Developer ID: ${SIGN_IDENTITY}"
 
-    # Sign all bundled dylibs and .so files first (leaf nodes before the root).
-    find "dist/${APP_NAME}" \( -name "*.dylib" -o -name "*.so" \) -print0 \
-        | xargs -0 -I{} codesign --sign "${SIGN_IDENTITY}" --force --options runtime "{}" 2>/dev/null || true
-
-    # Sign the main executable with entitlements (required for hardened runtime).
     ENTITLEMENTS="entitlements.plist"
-    if [ ! -f "${ENTITLEMENTS}" ]; then
-        echo "  ⚠  entitlements.plist not found — signing without entitlements"
-        codesign --sign "${SIGN_IDENTITY}" --force --options runtime "${BINARY}"
+    SIGN_ARGS=(--sign "${SIGN_IDENTITY}" --force --options runtime)
+    if [ -f "${ENTITLEMENTS}" ]; then
+        SIGN_ARGS+=(--entitlements "${ENTITLEMENTS}")
     else
-        codesign --sign "${SIGN_IDENTITY}" --force --options runtime \
-            --entitlements "${ENTITLEMENTS}" "${BINARY}"
+        echo "  ⚠  entitlements.plist not found — signing without entitlements"
     fi
 
+    codesign "${SIGN_ARGS[@]}" --deep "${APP_BUNDLE}"
     echo "✓ Signed (Developer ID)"
 
     # ── Notarization ─────────────────────────────────────────────────────────
     if [ "${NOTARIZE}" = "1" ]; then
         echo "Submitting to Apple notarization service (this takes a few minutes)..."
         NOTARIZE_ZIP="notarize_submit.zip"
-        zip -qr "${NOTARIZE_ZIP}" "dist/${APP_NAME}/"
+        ditto -c -k --keepParent "${APP_BUNDLE}" "${NOTARIZE_ZIP}"
         xcrun notarytool submit "${NOTARIZE_ZIP}" \
             --keychain-profile "${NOTARIZE_PROFILE}" \
             --wait
         rm -f "${NOTARIZE_ZIP}"
-        xcrun stapler staple "${BINARY}"
+        xcrun stapler staple "${APP_BUNDLE}"
         echo "✓ Notarized and stapled"
     fi
 
 else
-    # Ad-hoc sign the main binary only.
-    # This alone does NOT satisfy Gatekeeper for downloaded builds, but it
-    # prevents Killed:9 when running on the same machine (e.g., local dev builds).
-    codesign --sign - --force "${BINARY}" 2>/dev/null || true
+    # Ad-hoc sign the bundle for local dev runs.
+    # Prevents Killed:9 on the same machine; does NOT satisfy Gatekeeper on other Macs.
+    codesign --sign - --force --deep "${APP_BUNDLE}" 2>/dev/null || true
     echo "✓ Ad-hoc signed (dev build — see SIGNING.md for distribution signing)"
 fi
 
@@ -226,17 +182,13 @@ echo "╔═══════════════════════�
 echo "║   Build complete!                            ║"
 echo "╠══════════════════════════════════════════════╣"
 echo "║                                              ║"
-printf "║  Bundle:   dist/%-28s║\n" "${APP_NAME}/"
-printf "║  Launcher: dist/%-28s║\n" "${APP_NAME}.command"
+printf "║  App bundle: dist/%-26s║\n" "${APP_NAME}.app"
 echo "║                                              ║"
-echo "║  Launch (double-click):                      ║"
-printf "║    dist/%-36s║\n" "${APP_NAME}.command"
-echo "║                                              ║"
-echo "║  Launch from Terminal:                       ║"
-printf "║    ./dist/%s/%s  %-10s║\n" "${APP_NAME}" "${APP_NAME}" ""
+echo "║  Launch:                                     ║"
+printf "║    open dist/%-31s║\n" "${APP_NAME}.app"
 echo "║                                              ║"
 echo "║  Distribute:                                 ║"
-echo "║    zip -r MercariInventory.zip dist/         ║"
+printf "║    zip -r %s.zip dist/%s  ║\n" "${APP_NAME}" "${APP_NAME}.app"
 echo "║                                              ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
@@ -247,6 +199,7 @@ echo ""
 if [ -z "${SIGN_IDENTITY}" ]; then
     echo "NOTE: This is an unsigned (ad-hoc) build."
     echo "      Downloaded builds may trigger Gatekeeper on other Macs."
-    echo "      See SIGNING.md for Developer ID signing + notarization setup."
+    echo "      Right-click → Open on first launch, or see SIGNING.md for"
+    echo "      Developer ID signing + notarization setup."
     echo ""
 fi

@@ -73,11 +73,9 @@ jobs:
       - name: Sign app bundle
         if: env.APPLE_SIGN_IDENTITY != ''
         run: |
-          APP="dist/MercariInventory/MercariInventory"
-          find dist/MercariInventory \( -name "*.dylib" -o -name "*.so" \) -print0 \
-            | xargs -0 -I{} codesign --sign "${APPLE_SIGN_IDENTITY}" --force --options runtime "{}" 2>/dev/null || true
+          APP="dist/MercariInventory.app"
           codesign --sign "${APPLE_SIGN_IDENTITY}" --force --options runtime \
-            --entitlements entitlements.plist "${APP}"
+            --deep --entitlements entitlements.plist "${APP}"
           echo "✓ Signed"
 
       - name: Notarize app
@@ -85,20 +83,20 @@ jobs:
         run: |
           KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
           echo "${APPLE_API_KEY_BASE64}" | base64 --decode -o "${KEY_PATH}"
-          zip -qr notarize_submit.zip dist/MercariInventory/
+          ditto -c -k --keepParent dist/MercariInventory.app notarize_submit.zip
           xcrun notarytool submit notarize_submit.zip \
             --key "${KEY_PATH}" \
             --key-id "${APPLE_API_KEY_ID}" \
             --issuer "${APPLE_API_ISSUER_ID}" \
             --team-id "${APPLE_TEAM_ID}" \
             --wait
-          xcrun stapler staple dist/MercariInventory/MercariInventory
+          xcrun stapler staple dist/MercariInventory.app
           rm -f notarize_submit.zip "${KEY_PATH}"
           echo "✓ Notarized and stapled"
 
       - name: Zip dist
         run: |
-          zip -r dist.zip dist/
+          ditto -c -k --keepParent dist/MercariInventory.app dist.zip
 
       - name: Generate QR code for release download URL
         run: |
