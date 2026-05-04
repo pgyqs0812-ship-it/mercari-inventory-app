@@ -38,6 +38,17 @@ _last_sync_summary: dict = {}
 # Guard against concurrent sync requests
 _sync_running = False
 
+# Live progress state updated by the background sync thread; read by /sync_status
+_sync_progress: dict = {
+    "running":     False,
+    "done":        True,   # True at startup so UI doesn't show stale "in-progress"
+    "step":        "",
+    "step_num":    0,
+    "total_steps": 0,
+    "fetched":     0,
+    "error":       "",
+}
+
 # Singleton visible-Chrome driver shared by sync and link-open
 _singleton_driver = None
 _driver_lock = threading.Lock()   # guards singleton creation only
@@ -470,6 +481,13 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .error-banner { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px;
                 color: #dc2626; padding: 14px 18px; font-size: 14px; line-height: 1.5; }
 .error-banner strong { font-weight: 600; }
+/* Sync progress */
+.progress-track { background: var(--border); border-radius: 99px; height: 8px;
+                  overflow: hidden; margin: 10px 0 6px; }
+.progress-fill  { background: var(--primary); height: 100%; border-radius: 99px;
+                  transition: width .5s ease; min-width: 4px; }
+.sync-meta      { font-size: 13px; color: var(--muted); display: flex;
+                  justify-content: space-between; align-items: center; }
 """
 
 # JS that keeps the sticky table header just below the sticky search card.
@@ -590,6 +608,43 @@ document.addEventListener('click', function(e) {
 })();
 """
 
+# Polling JS injected only on /?syncing=1 — polls /sync_status every 2 s,
+# updates the progress bar, and redirects when sync completes or errors.
+_SYNC_POLL_JS = """
+(function() {
+  function poll() {
+    fetch('/sync_status')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var pct = 4;
+        if (d.total_steps > 0) {
+          pct = d.done ? 100 : Math.max(4, Math.round((d.step_num - 1) / d.total_steps * 100));
+        }
+        var fill = document.getElementById('progress-fill');
+        if (fill) fill.style.width = pct + '%';
+        var pctEl = document.getElementById('sync-pct');
+        if (pctEl) pctEl.textContent = pct + '%';
+        var stepEl = document.getElementById('sync-step');
+        if (stepEl) stepEl.textContent = d.step || '準備中...';
+        var fracEl = document.getElementById('sync-fraction');
+        if (fracEl && d.total_steps > 0)
+          fracEl.textContent = d.step_num + ' / ' + d.total_steps;
+        if (d.done) {
+          if (d.error) {
+            window.location = '/?error=' + encodeURIComponent(d.error);
+          } else {
+            window.location = '/?summary=1';
+          }
+          return;
+        }
+        setTimeout(poll, 2000);
+      })
+      .catch(function() { setTimeout(poll, 3000); });
+  }
+  poll();
+})();
+"""
+
 
 def _badge_html(status, visibility_status=""):
     # 出品中 items with visibility_status='stopped' display as 公開停止中
@@ -641,6 +696,7 @@ def home():
     sel_statuses  = request.args.getlist("statuses") or list(FILTER_STATUSES)
     show_summary  = request.args.get("summary") == "1" and bool(_last_sync_summary)
     error_param   = request.args.get("error", "")
+    syncing       = request.args.get("syncing") == "1" or _sync_running
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -805,12 +861,19 @@ def home():
   {error_banner}
 
   <!-- Sync card -->
-  <div class="card">
+  <div class="card" id="sync-card">
     <div class="card-header">
-      <span class="card-title">同期設定</span>
+      <span class="card-title">{"同期中" if syncing else "同期設定"}</span>
+      {"" if not syncing else '<span id="sync-pct" class="db-pill" style="background:rgba(37,99,235,.12);color:#2563eb">…</span>'}
     </div>
     <div class="card-body">
-      <form method="POST" action="/sync">
+      {"" if not syncing else '''
+      <div class="progress-track"><div class="progress-fill" id="progress-fill" style="width:4%"></div></div>
+      <div class="sync-meta">
+        <span id="sync-step">準備中...</span>
+        <span id="sync-fraction"></span>
+      </div>'''}
+      <form method="POST" action="/sync" {"style='display:none'" if syncing else ""}>
         <p class="field-label">同期するステータス</p>
         <div class="cb-row">{sync_cbs}</div>
         <button class="btn btn-primary" type="submit">&#x21BB; 同期を開始</button>
@@ -847,6 +910,7 @@ def home():
 {_SORT_JS}
 {_OPEN_LINK_JS}
 {export_js}
+{"" if not syncing else _SYNC_POLL_JS}
 </script>
 </body>
 </html>"""
@@ -854,25 +918,44 @@ def home():
 
 @app.route("/sync", methods=["POST"])
 def sync():
-    global _sync_running
+    global _sync_running, _sync_progress
     if _sync_running:
         return redirect("/?error=sync_running")
+
+    selected = request.form.getlist("statuses") or list(STATUSES)
     _sync_running = True
-    try:
-        selected = request.form.getlist("statuses")
-        if not selected:
-            selected = list(STATUSES)
-        run_scraper(selected_statuses=selected)
-    except Exception as exc:
-        import traceback
-        import urllib.parse
-        print("[sync] 同期エラー:")
-        traceback.print_exc()
-        msg = urllib.parse.quote(str(exc).split("\n")[0][:200])
-        return redirect(f"/?error={msg}")
-    finally:
-        _sync_running = False
-    return redirect("/?summary=1")
+    _sync_progress = {
+        "running":     True,
+        "done":        False,
+        "step":        "準備中",
+        "step_num":    0,
+        "total_steps": len(selected),
+        "fetched":     0,
+        "error":       "",
+    }
+
+    def _bg_sync():
+        global _sync_running, _sync_progress
+        try:
+            run_scraper(selected_statuses=selected)
+        except Exception as exc:
+            import traceback
+            print("[sync] 同期エラー:")
+            traceback.print_exc()
+            _sync_progress["error"] = str(exc).split("\n")[0][:200]
+        finally:
+            _sync_running = False
+            _sync_progress["running"] = False
+            _sync_progress["done"]    = True
+
+    threading.Thread(target=_bg_sync, daemon=True, name="sync-bg").start()
+    return redirect("/?syncing=1")
+
+
+@app.route("/sync_status")
+def sync_status():
+    from flask import jsonify
+    return jsonify(_sync_progress)
 
 
 @app.route("/open")
@@ -1175,6 +1258,25 @@ def find_more_button(driver):
     return None
 
 
+def _find_next_button(driver):
+    """Find an active Next/次へ pagination button (used by 販売履歴 table pages).
+
+    Returns None if no button is found or if it is disabled.
+    """
+    for el in driver.find_elements(By.TAG_NAME, "button") + driver.find_elements(By.TAG_NAME, "a"):
+        text = el.text.strip()
+        if "次へ" not in text and "次のページ" not in text:
+            continue
+        disabled = (
+            el.get_attribute("disabled") is not None
+            or "disabled" in (el.get_attribute("class") or "").lower()
+            or el.get_attribute("aria-disabled") == "true"
+        )
+        if not disabled:
+            return el
+    return None
+
+
 def _log_empty_page(driver, status_label: str) -> None:
     """Log diagnostic details when a listing page yields no product cards.
 
@@ -1219,24 +1321,52 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
         _log_empty_page(driver, status_label)
         return []
 
-    for click_num in range(200):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(0.8)
+    # Detect page layout: table DOM → Next-button pagination (e.g. 販売履歴)
+    #                    card DOM  → scroll + もっと見る pagination
+    is_table_page = bool(driver.find_elements(By.CSS_SELECTOR, "table tr td"))
 
-        current_items = collect_items_from_page(driver, status_label)
-        print(f"  [{status_label}] 読み込み済み: {len(current_items)} 件", end="\r", flush=True)
+    if is_table_page:
+        # ── Next-button pagination ─────────────────────────────────────────
+        seen_urls = {i["url"] for i in initial}
+        all_items = list(initial)
+        for page_num in range(1, 51):  # safety cap: 50 pages
+            next_btn = _find_next_button(driver)
+            if not next_btn:
+                print(f"\n[{status_label}] 次へボタンなし — 全件読み込み完了 ({page_num} ページ)")
+                break
+            print(f"\n[{status_label}] 次へ クリック (ページ {page_num + 1})...", flush=True)
+            driver.execute_script("arguments[0].click();", next_btn)
+            time.sleep(2)
+            wait_for_items(driver, timeout=10)
+            page_items = collect_items_from_page(driver, status_label)
+            new = [i for i in page_items if i["url"] not in seen_urls]
+            if not new:
+                print(f"\n[{status_label}] 新規アイテムなし — 終了")
+                break
+            seen_urls.update(i["url"] for i in new)
+            all_items.extend(new)
+            print(f"  [{status_label}] 累計: {len(all_items)} 件", flush=True)
+        final = all_items
+    else:
+        # ── Scroll + もっと見る pagination ────────────────────────────────
+        for click_num in range(200):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(0.8)
 
-        more_btn = find_more_button(driver)
-        if not more_btn:
-            print(f"\n[{status_label}] 全件読み込み完了")
-            break
+            current_items = collect_items_from_page(driver, status_label)
+            print(f"  [{status_label}] 読み込み済み: {len(current_items)} 件", end="\r", flush=True)
 
-        prev_count = len(current_items)
-        driver.execute_script("arguments[0].click();", more_btn)
-        print(f"\n[{status_label}] 「もっと見る」クリック {click_num + 1} 回目...", flush=True)
-        wait_for_count_increase(driver, prev_count, timeout=pagination_timeout)
+            more_btn = find_more_button(driver)
+            if not more_btn:
+                print(f"\n[{status_label}] 全件読み込み完了")
+                break
 
-    final = collect_items_from_page(driver, status_label)
+            prev_count = len(current_items)
+            driver.execute_script("arguments[0].click();", more_btn)
+            print(f"\n[{status_label}] 「もっと見る」クリック {click_num + 1} 回目...", flush=True)
+            wait_for_count_increase(driver, prev_count, timeout=pagination_timeout)
+
+        final = collect_items_from_page(driver, status_label)
 
     # Apply URL-based status; detect 公開停止中 sub-state for 出品中 items
     for item in final:
@@ -1259,13 +1389,20 @@ def load_all_listings(driver, selected_statuses):
     seen_urls = set()
     counts = {}
 
-    for status in selected_statuses:
+    _sync_progress["total_steps"] = len(selected_statuses)
+
+    for idx, status in enumerate(selected_statuses, start=1):
+        _sync_progress["step"]     = status
+        _sync_progress["step_num"] = idx
+
         timeout = 10 if status in _LONG_TIMEOUT_STATUSES else 6
         items = load_listings_for_status(driver, status, pagination_timeout=timeout)
         new_items = [i for i in items if i["url"] not in seen_urls]
         seen_urls.update(i["url"] for i in new_items)
         all_items.extend(new_items)
         counts[status] = len(new_items)
+
+        _sync_progress["fetched"] = len(all_items)
 
     print("\n--- ステータス別取得件数 ---")
     for s in selected_statuses:
@@ -1605,9 +1742,11 @@ def run_scraper(selected_statuses=None):
     # Move Chrome off-screen so it doesn't stay in the foreground.
     # Do NOT minimize — a minimized window collapses the viewport to ~0,
     # which prevents Intersection Observer from firing and breaks lazy-loading
-    # on card-based pages (出品中, 取引中, 売却済み).  Off-screen keeps the
-    # viewport at its full rendered size so all lazy-load triggers work normally.
+    # on card-based pages (出品中, 取引中, 売却済み).  We first maximize to
+    # ensure a valid viewport (un-minimizes if user collapsed it manually),
+    # then move the window off the visible screen area.
     try:
+        main_driver.maximize_window()
         main_driver.set_window_position(-3000, 0)
     except Exception:
         pass
