@@ -38,8 +38,12 @@ _last_sync_summary: dict = {}
 # Guard against concurrent sync requests
 _sync_running = False
 
-# Login session state machine: "unknown" → "checking" → "valid" / "invalid" / "logging_in"
+# Login session state machine:
+#   "unknown" → "checking" → "found_session" / "invalid"
+#   "found_session" → "valid" / "logging_in" / "clearing" → "invalid"
+#   "logging_in" → "valid" / "invalid"
 _session_state: str = "unknown"
+_session_last_login: str = ""  # "YYYY-MM-DD HH:MM" — set on save or check
 
 # Live progress state updated by the background sync thread; read by /sync_status
 _sync_progress: dict = {
@@ -68,12 +72,14 @@ def jst_now() -> str:
 
 def _save_session_cookies(driver) -> None:
     """Persist Mercari session cookies to COOKIE_FILE for later re-use."""
+    global _session_last_login
     if not COOKIE_FILE:
         return
     try:
         cookies = driver.get_cookies()
         with open(COOKIE_FILE, "w", encoding="utf-8") as f:
             json.dump(cookies, f, ensure_ascii=False)
+        _session_last_login = jst_now()[:16]
         print(f"[session] クッキーを保存しました ({len(cookies)} 件): {COOKIE_FILE}")
     except Exception as e:
         print(f"[session] クッキー保存失敗: {e}")
@@ -611,8 +617,10 @@ document.addEventListener('click', function(e) {
 })();
 """
 
-# Polling JS injected on /login while state is "checking" or "logging_in".
-# Redirects to "/" on "valid", reloads /login on "invalid" / "unknown".
+# Polling JS injected on /login while state is "checking", "logging_in", or "clearing".
+# Redirects to "/" on "valid".
+# Reloads /login on terminal states: "found_session", "invalid", "unknown"
+#   (page re-renders with the correct UI for the new state).
 _LOGIN_POLL_JS = """
 (function() {
   function poll() {
@@ -623,10 +631,11 @@ _LOGIN_POLL_JS = """
           window.location = '/';
           return;
         }
-        if (d.state === 'invalid' || d.state === 'unknown') {
+        if (d.state === 'found_session' || d.state === 'invalid' || d.state === 'unknown') {
           window.location = '/login';
           return;
         }
+        // still in-progress: 'checking', 'logging_in', 'clearing'
         setTimeout(poll, 2000);
       })
       .catch(function() { setTimeout(poll, 3000); });
@@ -725,7 +734,7 @@ def home():
             target=_check_session_background, daemon=True, name="session-check"
         ).start()
         return redirect("/login")
-    if _session_state == "invalid":
+    if _session_state != "valid":
         return redirect("/login")
 
     searched      = request.args.get("searched") == "1"
@@ -997,18 +1006,54 @@ def sync_status():
 
 @app.route("/login")
 def login_page():
-    is_waiting = _session_state in ("checking", "logging_in")
-    if is_waiting:
-        status_label = "ログイン中..." if _session_state == "logging_in" else "セッションを確認中..."
+    state = _session_state
+
+    if state in ("checking", "logging_in", "clearing"):
+        if state == "logging_in":
+            status_label = "ログイン中... ブラウザで Mercari にログインしてください"
+        elif state == "clearing":
+            status_label = "セッションデータを削除中..."
+        else:
+            status_label = "セッションを確認中..."
         body_content = f"""
       <p class="login-status">{status_label}</p>
       <div class="spinner"></div>"""
         poll_js = _LOGIN_POLL_JS
+
+    elif state == "found_session":
+        last_login_html = (
+            f'<p class="login-info">最終ログイン: {html_module.escape(_session_last_login)}</p>'
+            if _session_last_login else ""
+        )
+        body_content = f"""
+      <p class="login-badge">&#10003; ログイン済み</p>
+      {last_login_html}
+      <div class="login-btn-group">
+        <form method="POST" action="/login/use">
+          <button class="btn btn-primary login-btn" type="submit">
+            既存のセッションを使用
+          </button>
+        </form>
+        <form method="POST" action="/login/relogin">
+          <button class="btn btn-outline login-btn" type="submit">
+            再ログイン
+          </button>
+        </form>
+        <form method="POST" action="/login/clear">
+          <button class="btn btn-danger login-btn" type="submit"
+                  onclick="return confirm('ログインデータを削除しますか？\\nChromeプロファイルとCookieが削除されます。')">
+            ログインデータを削除
+          </button>
+        </form>
+      </div>"""
+        poll_js = ""
+
     else:
+        # "invalid" or anything unexpected — show the login button
         body_content = """
       <p class="login-desc">Mercari の在庫を同期するには、<br>Mercari アカウントでログインが必要です。</p>
       <form method="POST" action="/login/start">
-        <button class="btn btn-primary" type="submit" style="width:100%;padding:14px;font-size:16px">
+        <button class="btn btn-primary login-btn" type="submit">
           ログインを開始
         </button>
       </form>"""
@@ -1022,8 +1067,18 @@ def login_page():
   <title>Mercari ログイン</title>
   <style>{_CSS}
   .login-card {{ max-width: 480px; margin: 80px auto; }}
-  .login-desc {{ font-size: 15px; color: var(--muted); line-height: 1.6; margin-bottom: 24px; text-align: center; }}
-  .login-status {{ font-size: 15px; color: var(--muted); margin-bottom: 20px; text-align: center; }}
+  .login-desc {{ font-size: 15px; color: var(--muted); line-height: 1.6;
+                margin-bottom: 24px; text-align: center; }}
+  .login-status {{ font-size: 15px; color: var(--muted); margin-bottom: 20px;
+                  text-align: center; }}
+  .login-badge {{ font-size: 17px; font-weight: 700; color: #166534;
+                 margin-bottom: 6px; text-align: center; }}
+  .login-info {{ font-size: 13px; color: var(--muted); margin-bottom: 24px;
+                text-align: center; }}
+  .login-btn-group {{ display: flex; flex-direction: column; gap: 10px; }}
+  .login-btn {{ width: 100%; padding: 13px; font-size: 15px; justify-content: center; }}
+  .btn-danger {{ background: #ef4444; color: #fff; border: none; }}
+  .btn-danger:hover {{ background: #dc2626; }}
   .spinner {{ width: 36px; height: 36px; border: 4px solid var(--border);
              border-top-color: var(--primary); border-radius: 50%;
              animation: spin .8s linear infinite; margin: 0 auto; }}
@@ -1064,10 +1119,45 @@ def login_start():
     return redirect("/login")
 
 
+@app.route("/login/use", methods=["POST"])
+def login_use():
+    """Accept the existing session and proceed to the main screen."""
+    global _session_state
+    if _session_state == "found_session":
+        _session_state = "valid"
+    return redirect("/")
+
+
+@app.route("/login/relogin", methods=["POST"])
+def login_relogin():
+    """Discard the existing session and force a fresh interactive login."""
+    global _session_state
+    if _session_state == "logging_in":
+        return redirect("/login")
+    _session_state = "logging_in"
+    threading.Thread(
+        target=lambda: _do_login(force_relogin=True),
+        daemon=True,
+        name="login-relogin",
+    ).start()
+    return redirect("/login")
+
+
+@app.route("/login/clear", methods=["POST"])
+def login_clear():
+    """Delete all stored session data (cookies + Chrome profile) and log out."""
+    global _session_state
+    if _session_state == "clearing":
+        return redirect("/login")
+    _session_state = "clearing"
+    threading.Thread(target=_clear_session, daemon=True, name="session-clear").start()
+    return redirect("/login")
+
+
 @app.route("/login/status")
 def login_status():
     from flask import jsonify
-    return jsonify({"state": _session_state})
+    return jsonify({"state": _session_state, "last_login": _session_last_login})
 
 
 @app.route("/open")
@@ -1827,14 +1917,24 @@ def wait_for_login(driver, timeout=300):
 def _check_session_background() -> None:
     """Check Mercari session validity in a background thread.
 
-    Sets _session_state to "valid" or "invalid" when done.
-    Called once on first visit to home() when state is "unknown".
+    Sets _session_state to "found_session" (session exists — user must choose)
+    or "invalid" (no session — show login button).
+    Never auto-transitions to "valid"; that requires an explicit user action.
     """
-    global _session_state
+    global _session_state, _session_last_login
     try:
         driver = _get_or_create_driver()
         if _try_restore_session(driver):
-            _session_state = "valid"
+            # Populate last-login time from cookie file modification time
+            if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+                try:
+                    mtime = os.path.getmtime(COOKIE_FILE)
+                    _session_last_login = datetime.fromtimestamp(mtime, tz=_JST).strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                except Exception:
+                    _session_last_login = jst_now()[:16]
+            _session_state = "found_session"
         else:
             _session_state = "invalid"
     except Exception as exc:
@@ -1842,12 +1942,15 @@ def _check_session_background() -> None:
         _session_state = "invalid"
 
 
-def _do_login() -> None:
+def _do_login(force_relogin: bool = False) -> None:
     """Perform interactive Mercari login in a background thread.
 
     Brings Chrome to screen, navigates to the login page, waits for the user
     to complete login, saves cookies, then moves Chrome off-screen.
     Sets _session_state to "valid" on success, "invalid" on failure/timeout.
+
+    force_relogin=True: deletes browser cookies before opening the login page
+    so the existing session cannot silently bypass the login form.
     """
     global _session_state
     try:
@@ -1857,6 +1960,17 @@ def _do_login() -> None:
             driver.set_window_position(0, 0)
         except Exception:
             pass
+
+        if force_relogin:
+            # Wipe in-session cookies so Chrome doesn't auto-restore the old login.
+            # delete_all_cookies() flushes through to the profile's SQLite DB.
+            try:
+                driver.get("https://jp.mercari.com")
+                driver.delete_all_cookies()
+                time.sleep(0.5)
+            except Exception:
+                pass
+
         driver.get("https://jp.mercari.com/login")
         click_login_button_if_exists(driver)
         wait_for_login(driver)
@@ -1870,6 +1984,58 @@ def _do_login() -> None:
     except Exception as exc:
         print(f"[login] ログイン失敗: {exc}")
         _session_state = "invalid"
+
+
+def _clear_session() -> None:
+    """Delete all stored session data and reset to logged-out state.
+
+    Safety: only deletes CHROME_PROFILE_DIR when it is inside the app's own
+    Application Support directory — never touches the system Chrome profile.
+    """
+    global _singleton_driver, _session_state, _session_last_login
+
+    # Quit the singleton driver before touching the profile directory.
+    # Chrome holds a lock on the profile; deleting while it's open corrupts it.
+    with _driver_lock:
+        if _singleton_driver is not None:
+            try:
+                _singleton_driver.quit()
+            except Exception:
+                pass
+            _singleton_driver = None
+    _kill_orphan_chromedriver()
+    time.sleep(0.5)   # let Chrome release file handles
+
+    # Delete JSON cookie backup
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+        try:
+            os.remove(COOKIE_FILE)
+            print(f"[session] クッキーファイルを削除しました: {COOKIE_FILE}")
+        except OSError as exc:
+            print(f"[session] クッキーファイル削除失敗: {exc}")
+
+    # Delete the app-specific Chrome profile directory.
+    # Guard: the path must be inside ~/Library/Application Support/MercariInventory/
+    _app_support = os.path.join(
+        os.path.expanduser("~"), "Library", "Application Support", "MercariInventory"
+    )
+    if (CHROME_PROFILE_DIR
+            and os.path.isdir(CHROME_PROFILE_DIR)
+            and os.path.realpath(CHROME_PROFILE_DIR).startswith(
+                os.path.realpath(_app_support)
+            )):
+        import shutil
+        try:
+            shutil.rmtree(CHROME_PROFILE_DIR, ignore_errors=False)
+            print(f"[session] Chromeプロファイルを削除しました: {CHROME_PROFILE_DIR}")
+        except Exception as exc:
+            print(f"[session] Chromeプロファイル削除失敗: {exc}")
+    elif CHROME_PROFILE_DIR:
+        print(f"[session] 安全チェック: プロファイルパスがアプリ外のため削除をスキップ: {CHROME_PROFILE_DIR}")
+
+    _session_last_login = ""
+    _session_state = "invalid"
+    print("[session] セッションデータを削除しました — ログアウト状態")
 
 
 # ---------------------------------------------------------------------------
