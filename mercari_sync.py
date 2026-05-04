@@ -286,7 +286,23 @@ def init_db():
     cursor.execute("UPDATE mercari_products SET status = '販売履歴' WHERE status = '売却済み'")
     cursor.execute("UPDATE mercari_products SET status = '売却済み' WHERE status = '公開停止中'")
     conn.commit()
+
+    # Log current DB state at startup so counts are visible in the terminal
+    cursor.execute(
+        "SELECT status, COUNT(*) FROM mercari_products GROUP BY status ORDER BY COUNT(*) DESC"
+    )
+    rows = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) FROM mercari_products")
+    total = cursor.fetchone()[0]
     conn.close()
+
+    if total:
+        print("[DB] 起動時レコード数:")
+        for s, c in rows:
+            print(f"  {s}: {c}")
+        print(f"  合計: {total}")
+    else:
+        print("[DB] データなし（初回起動）")
 
 
 # Badge style per status: (bg_color, text_color)
@@ -303,6 +319,8 @@ def _query_products(q="", statuses=None):
     """Query mercari_products filtered by keyword and status list.
 
     公開停止中 is handled as a sub-filter: status='出品中' AND visibility_status='stopped'.
+    売却済み implicitly covers 販売履歴 — the KAN-10 DB migration renamed the
+    original 売却済み records to 販売履歴, so both values represent "sold" items.
     Multiple selected statuses are OR-combined.
     """
     conn = sqlite3.connect(DB_NAME)
@@ -314,8 +332,12 @@ def _query_products(q="", statuses=None):
         sql += " AND title LIKE ?"
         params.append(f"%{q}%")
     if statuses:
-        regular = [s for s in statuses if s != "公開停止中"]
-        include_stopped = "公開停止中" in statuses
+        # Expand 売却済み to also cover 販売履歴 records (same logical category)
+        expanded = list(statuses)
+        if "売却済み" in expanded and "販売履歴" not in expanded:
+            expanded.append("販売履歴")
+        regular = [s for s in expanded if s != "公開停止中"]
+        include_stopped = "公開停止中" in expanded
         conditions = []
         if regular:
             ph = ",".join("?" * len(regular))
@@ -714,9 +736,12 @@ def home():
     # ── sync summary modal ────────────────────────────────────────────────
     if show_summary:
         s = _last_sync_summary
-        status_rows = ""
+        fetched_rows = ""
         for st, cnt in s.get("per_status", {}).items():
-            status_rows += f"<tr><td>{html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
+            fetched_rows += f"<tr><td>取得: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
+        db_rows = ""
+        for st, cnt in s.get("db_by_status", {}).items():
+            db_rows += f"<tr><td>DB: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
         summary_modal = f"""
         <div class="modal-overlay" id="summary-modal">
           <div class="modal-box">
@@ -728,8 +753,11 @@ def home():
               <tr><td>検出合計</td><td>{s.get('total', 0)} 件</td></tr>
               <tr><td>新増</td><td>{s.get('inserted', 0)} 件</td></tr>
               <tr><td>更新</td><td>{s.get('updated', 0)} 件</td></tr>
-              <tr><td>跳過</td><td>{s.get('skipped', 0)} 件</td></tr>
-              {status_rows}
+              <tr><td>スキップ</td><td>{s.get('skipped', 0)} 件</td></tr>
+              {fetched_rows}
+              <tr><td colspan="2" style="padding-top:6px;font-weight:600;font-size:12px;color:#6b7280">DB合計</td></tr>
+              {db_rows}
+              <tr><td>DB合計</td><td>{s.get('db_total', '–')} 件</td></tr>
             </table>
             <button class="modal-close" onclick="document.getElementById('summary-modal').remove()">閉じる</button>
           </div>
@@ -1147,6 +1175,29 @@ def find_more_button(driver):
     return None
 
 
+def _log_empty_page(driver, status_label: str) -> None:
+    """Log diagnostic details when a listing page yields no product cards.
+
+    Helps distinguish a genuinely empty account page from a rendering failure
+    (minimized viewport, login redirect, lazy-load timeout, DOM change).
+    """
+    print(f"[{status_label}] 商品が見つかりませんでした — 診断情報:")
+    try:
+        print(f"  URL    : {driver.current_url}")
+        print(f"  Title  : {driver.title}")
+        if "login" in driver.current_url.lower():
+            print(f"  [警告] ログインページにリダイレクトされています — セッション切れの可能性")
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        snippet = " ".join(body_text.split())[:300]
+        print(f"  Body先頭: {snippet}")
+        item_links  = len(driver.find_elements(By.CSS_SELECTOR, "a[href*='/item/']"))
+        trans_links = len(driver.find_elements(By.CSS_SELECTOR, "a[href*='/transaction/']"))
+        table_rows  = len(driver.find_elements(By.CSS_SELECTOR, "table tr td"))
+        print(f"  /item/ リンク数: {item_links} | /transaction/ リンク数: {trans_links} | テーブル行: {table_rows}")
+    except Exception as exc:
+        print(f"  [診断取得エラー] {exc}")
+
+
 def load_listings_for_status(driver, status_label, pagination_timeout=6):
     """Load all items from the Mercari page for one status, paginating fully.
 
@@ -1165,7 +1216,7 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
 
     initial = collect_items_from_page(driver, status_label)
     if not initial:
-        print(f"[{status_label}] 商品が見つかりませんでした")
+        _log_empty_page(driver, status_label)
         return []
 
     for click_num in range(200):
@@ -1551,9 +1602,13 @@ def run_scraper(selected_statuses=None):
         wait_for_login(main_driver)
         _save_session_cookies(main_driver)
 
-    # Minimize Chrome during background sync so it doesn't stay in the foreground
+    # Move Chrome off-screen so it doesn't stay in the foreground.
+    # Do NOT minimize — a minimized window collapses the viewport to ~0,
+    # which prevents Intersection Observer from firing and breaks lazy-loading
+    # on card-based pages (出品中, 取引中, 売却済み).  Off-screen keeps the
+    # viewport at its full rendered size so all lazy-load triggers work normally.
     try:
-        main_driver.minimize_window()
+        main_driver.set_window_position(-3000, 0)
     except Exception:
         pass
 
@@ -1640,32 +1695,48 @@ def run_scraper(selected_statuses=None):
     total_updated  = direct_updated  + detail_updated
     total_elapsed  = time.time() - sync_start
 
+    # DB counts by status — confirms what is searchable after sync
+    _db_conn = sqlite3.connect(DB_NAME)
+    _db_cur  = _db_conn.cursor()
+    _db_cur.execute(
+        "SELECT status, COUNT(*) FROM mercari_products GROUP BY status ORDER BY COUNT(*) DESC"
+    )
+    db_counts_by_status = dict(_db_cur.fetchall())
+    _db_cur.execute("SELECT COUNT(*) FROM mercari_products")
+    db_total = _db_cur.fetchone()[0]
+    _db_conn.close()
+
     print(f"\n{'=' * 56}")
-    print(f"  同步完成")
-    print(f"  共检测到：        {total_count:>4} 件")
-    print(f"  新增：            {total_inserted:>4} 件")
+    print(f"  同期完了")
+    print(f"  検出合計：        {total_count:>4} 件")
+    print(f"  新増：            {total_inserted:>4} 件")
     print(f"  更新：            {total_updated:>4} 件")
-    print(f"  跳过（未変化）：  {len(to_skip):>4} 件")
-    print(f"  详情页打开：      {len(to_fetch_detail):>4} 件  "
-          f"（{MAX_WORKERS} 个并行 worker）")
+    print(f"  スキップ：        {len(to_skip):>4} 件")
+    print(f"  詳細取得：        {len(to_fetch_detail):>4} 件"
+          f"  ({MAX_WORKERS} 並列 worker)")
     if detail_errors:
-        print(f"  抓取失败：        {detail_errors:>4} 件")
-    print(f"  阶段1耗时（列表）：{phase1_elapsed:>6.1f} 秒")
+        print(f"  取得失敗：        {detail_errors:>4} 件")
+    print(f"  Phase1（一覧）：  {phase1_elapsed:>6.1f} 秒")
     if to_fetch_detail:
-        print(f"  阶段2耗时（详情）：{phase2_elapsed:>6.1f} 秒  "
-              f"（顺序预计 {phase2_elapsed * MAX_WORKERS:.1f} 秒）")
-    print(f"  总耗时：           {total_elapsed:>6.1f} 秒")
+        print(f"  Phase2（詳細）：  {phase2_elapsed:>6.1f} 秒")
+    print(f"  合計時間：        {total_elapsed:>6.1f} 秒")
+    print(f"\n  --- DB ステータス別件数 ---")
+    for _s, _c in db_counts_by_status.items():
+        print(f"    {_s}: {_c}")
+    print(f"    合計: {db_total}")
     print(f"{'=' * 56}")
 
     _last_sync_summary = {
-        "start_jst":  start_jst,
-        "end_jst":    jst_now(),
-        "elapsed":    round(total_elapsed, 1),
-        "per_status": per_status_counts,
-        "inserted":   total_inserted,
-        "updated":    total_updated,
-        "skipped":    len(to_skip),
-        "total":      total_count,
+        "start_jst":    start_jst,
+        "end_jst":      jst_now(),
+        "elapsed":      round(total_elapsed, 1),
+        "per_status":   per_status_counts,
+        "inserted":     total_inserted,
+        "updated":      total_updated,
+        "skipped":      len(to_skip),
+        "total":        total_count,
+        "db_by_status": db_counts_by_status,
+        "db_total":     db_total,
     }
     # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
 
