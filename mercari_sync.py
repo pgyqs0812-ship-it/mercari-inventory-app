@@ -1614,6 +1614,17 @@ def load_all_listings(driver, selected_statuses):
 
 
 # ---------------------------------------------------------------------------
+# Normalization helpers for comparison
+# ---------------------------------------------------------------------------
+
+def _norm_str(s) -> str:
+    return (s or "").strip()
+
+def _norm_price(s) -> str:
+    return re.sub(r"\s+", "", s or "")
+
+
+# ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
@@ -1647,10 +1658,38 @@ def save_or_update_product(item_url, title, price, status, created_at, raw_text,
                            visibility_status=""):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM mercari_products WHERE item_url = ?", (item_url,))
-    exists = cursor.fetchone()
+    cursor.execute(
+        "SELECT id, title, price, status, created_at, visibility_status "
+        "FROM mercari_products WHERE item_url = ?",
+        (item_url,),
+    )
+    row = cursor.fetchone()
 
-    if exists:
+    if row:
+        _, old_title, old_price, old_status, old_created_at, old_vis = row
+
+        changes = []
+        if _norm_str(old_title) != _norm_str(title):
+            changes.append(f"title: {old_title!r} → {title!r}")
+        if _norm_price(old_price) != _norm_price(price):
+            changes.append(f"price: {old_price} → {price}")
+        if _norm_str(old_status) != _norm_str(status):
+            changes.append(f"status: {old_status} → {status}")
+        if _norm_str(old_created_at) != _norm_str(created_at):
+            changes.append(f"created_at: {old_created_at} → {created_at}")
+        if _norm_str(old_vis) != _norm_str(visibility_status):
+            changes.append(f"visibility_status: {old_vis} → {visibility_status}")
+
+        if not changes:
+            cursor.execute(
+                "UPDATE mercari_products SET synced_at = ? WHERE item_url = ?",
+                (jst_now(), item_url),
+            )
+            conn.commit()
+            conn.close()
+            return "skipped"
+
+        print(f"  [更新理由] {', '.join(changes)} — {item_url}")
         cursor.execute("""
             UPDATE mercari_products
             SET title = ?, price = ?, status = ?, created_at = ?, raw_text = ?,
@@ -1860,13 +1899,17 @@ def classify_items(items, existing_map):
             old_cat    = existing["created_at"] or ""
             old_status = existing.get("status") or ""
             old_vis    = existing.get("visibility_status") or ""
+            old_price  = existing.get("price") or ""
             new_status = item.get("status") or ""
             new_vis    = item.get("visibility_status") or ""
-            # Skip only when everything including visibility_status matches
-            # and the existing price is valid (re-fetch if price was "¥ only")
-            if (is_valid_title(old_title) and old_cat == item["created_at"]
-                    and old_status == new_status and old_vis == new_vis
-                    and _is_valid_price(existing.get("price", ""))):
+            new_price  = item.get("price") or ""
+            # Skip when all meaningful fields match (normalized) and price is valid
+            if (is_valid_title(_norm_str(old_title))
+                    and _norm_str(old_cat) == _norm_str(item["created_at"])
+                    and _norm_str(old_status) == _norm_str(new_status)
+                    and _norm_str(old_vis) == _norm_str(new_vis)
+                    and _norm_price(old_price) == _norm_price(new_price)
+                    and _is_valid_price(old_price)):
                 to_skip.append(item)
                 continue
 
@@ -2106,7 +2149,7 @@ def run_scraper(selected_statuses=None):
     for item in to_skip:
         touch_synced_at(item["url"])
 
-    direct_inserted = direct_updated = 0
+    direct_inserted = direct_updated = direct_skipped = 0
     for item in to_save_direct:
         r = save_or_update_product(
             item["url"], item["title"], item["price"],
@@ -2115,13 +2158,15 @@ def run_scraper(selected_statuses=None):
         )
         if r == "inserted":
             direct_inserted += 1
-        else:
+        elif r == "updated":
             direct_updated += 1
+        else:
+            direct_skipped += 1
 
     # ------------------------------------------------------------------
     # Phase 2: parallel detail fetches
     # ------------------------------------------------------------------
-    detail_inserted = detail_updated = detail_errors = 0
+    detail_inserted = detail_updated = detail_skipped = detail_errors = 0
     phase2_elapsed = 0.0
 
     if to_fetch_detail:
@@ -2151,9 +2196,12 @@ def run_scraper(selected_statuses=None):
             )
             if result == "inserted":
                 detail_inserted += 1
-            else:
+                print(f"  新増：{r['title']} / {r['price']}")
+            elif result == "updated":
                 detail_updated += 1
-            print(f"  {'新増' if result == 'inserted' else '更新'}：{r['title']} / {r['price']}")
+                print(f"  更新：{r['title']} / {r['price']}")
+            else:
+                detail_skipped += 1
 
         phase2_elapsed = time.time() - phase2_start
 
@@ -2162,6 +2210,7 @@ def run_scraper(selected_statuses=None):
     # ------------------------------------------------------------------
     total_inserted = direct_inserted + detail_inserted
     total_updated  = direct_updated  + detail_updated
+    total_skipped  = len(to_skip) + direct_skipped + detail_skipped
     total_elapsed  = time.time() - sync_start
 
     # DB counts by status — confirms what is searchable after sync
@@ -2180,7 +2229,7 @@ def run_scraper(selected_statuses=None):
     print(f"  検出合計：        {total_count:>4} 件")
     print(f"  新増：            {total_inserted:>4} 件")
     print(f"  更新：            {total_updated:>4} 件")
-    print(f"  スキップ：        {len(to_skip):>4} 件")
+    print(f"  スキップ：        {total_skipped:>4} 件")
     print(f"  詳細取得：        {len(to_fetch_detail):>4} 件"
           f"  ({MAX_WORKERS} 並列 worker)")
     if detail_errors:
@@ -2202,7 +2251,7 @@ def run_scraper(selected_statuses=None):
         "per_status":   per_status_counts,
         "inserted":     total_inserted,
         "updated":      total_updated,
-        "skipped":      len(to_skip),
+        "skipped":      total_skipped,
         "total":        total_count,
         "db_by_status": db_counts_by_status,
         "db_total":     db_total,
