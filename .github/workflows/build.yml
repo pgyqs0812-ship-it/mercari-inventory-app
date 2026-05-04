@@ -117,7 +117,9 @@ jobs:
       #   JIRA_PROJECT_KEY    KAN
       # If any secret is missing or the API call fails, this step exits non-zero
       # and the "Upload release assets" step is skipped — the release is blocked.
+      # The issue key is written to GITHUB_OUTPUT and used by the close step below.
       - name: Create Jira issue
+        id: create_jira
         env:
           JIRA_URL:         ${{ secrets.JIRA_URL }}
           JIRA_EMAIL:       ${{ secrets.JIRA_EMAIL }}
@@ -127,7 +129,8 @@ jobs:
           pip install requests python-dotenv
           python create_jira_ticket.py \
             --version "${{ github.ref_name }}" \
-            --summary "${{ github.ref_name }} — $(git log -1 --pretty=%s)"
+            --summary "${{ github.ref_name }} — $(git log -1 --pretty=%s)" \
+            --release-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -135,3 +138,19 @@ jobs:
           files: |
             dist.zip
             download-qr.png
+
+      # ── Jira issue close (runs after release upload succeeds) ────────────
+      # Transitions the issue created above to Done and adds a release comment.
+      # Fails loudly (exit 1) if the transition or comment call fails.
+      - name: Close Jira issue
+        if: steps.create_jira.outputs.issue_key != ''
+        env:
+          JIRA_URL:         ${{ secrets.JIRA_URL }}
+          JIRA_EMAIL:       ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN:   ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          python create_jira_ticket.py \
+            --done "${{ steps.create_jira.outputs.issue_key }}" \
+            --version "${{ github.ref_name }}" \
+            --release-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
