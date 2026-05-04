@@ -128,12 +128,62 @@ def _try_restore_session(driver) -> bool:
 # ---------------------------------------------------------------------------
 
 def _is_driver_alive(driver) -> bool:
-    """Return True if the driver's Chrome process is still running."""
+    """Return True if the driver's Chrome process is still responsive (3 s timeout)."""
+    result = [False]
+
+    def _check():
+        try:
+            _ = driver.current_url
+            result[0] = True
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_check, daemon=True)
+    t.start()
+    t.join(timeout=3.0)
+    return result[0]
+
+
+def _kill_orphan_chromedriver() -> None:
+    """Kill stale chromedriver processes left over from a previous crashed session."""
     try:
-        _ = driver.current_url
-        return True
+        import subprocess
+        subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True, timeout=5)
+        time.sleep(0.3)
     except Exception:
-        return False
+        pass
+
+
+def _ensure_selenium_manager() -> None:
+    """Locate the Selenium Manager binary and ensure it is executable.
+
+    PyInstaller's collect_data_files() does not preserve the +x bit on
+    binary files. This function fixes that at runtime and pins SE_MANAGER_PATH
+    so Selenium always finds the correct binary regardless of how path
+    resolution behaves inside the frozen bundle.
+    """
+    if os.environ.get("SE_MANAGER_PATH"):
+        return  # already pinned by a previous call
+
+    import selenium as _sel
+    selenium_pkg_dir = os.path.dirname(os.path.abspath(_sel.__file__))
+    sm_path = os.path.join(
+        selenium_pkg_dir, "webdriver", "common", "macos", "selenium-manager"
+    )
+
+    if not os.path.isfile(sm_path):
+        print(f"[driver] selenium-manager が見つかりません: {sm_path}")
+        return
+
+    if not os.access(sm_path, os.X_OK):
+        try:
+            os.chmod(sm_path, 0o755)
+            print(f"[driver] selenium-manager の実行権限を付与しました: {sm_path}")
+        except OSError as exc:
+            print(f"[driver] selenium-manager chmod 失敗: {exc}")
+
+    os.environ["SE_MANAGER_PATH"] = sm_path
+    print(f"[driver] SE_MANAGER_PATH={sm_path}")
 
 
 def _get_or_create_driver() -> "webdriver.Chrome":
@@ -141,8 +191,10 @@ def _get_or_create_driver() -> "webdriver.Chrome":
 
     Reuses the existing driver when it is still alive. If it is dead (user
     closed the Chrome window, or a transient error), the old driver is quit
-    gracefully, stale profile lock files are removed, and a new driver is
-    created. This prevents the 'ChromeDriver setup failed' error on re-sync.
+    gracefully, orphan processes and stale profile lock files are cleaned up,
+    and a new driver is created.
+    Profile locks are always cleared before creating a new driver, even on
+    a fresh process start where _singleton_driver was never set.
     """
     global _singleton_driver
     with _driver_lock:
@@ -154,9 +206,13 @@ def _get_or_create_driver() -> "webdriver.Chrome":
                 pass
             _singleton_driver = None
             time.sleep(0.5)          # let Chrome release file handles
+            _kill_orphan_chromedriver()
             _clear_profile_lock()    # remove any stale lock files
 
         if _singleton_driver is None:
+            # Always clear profile locks before creating a new driver so stale
+            # locks from a previous app session (or crashed Chrome) don't block startup.
+            _clear_profile_lock()
             _singleton_driver = _make_chrome_driver(headless=False)
 
         return _singleton_driver
@@ -388,6 +444,10 @@ thead th[data-sortable] { cursor: pointer; user-select: none; white-space: nowra
 thead th[data-sortable]:hover { background: #f1f5f9; }
 thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .sort-icon { font-size: 10px; color: #d1d5db; margin-left: 4px; }
+/* Error banner */
+.error-banner { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px;
+                color: #dc2626; padding: 14px 18px; font-size: 14px; line-height: 1.5; }
+.error-banner strong { font-weight: 600; }
 """
 
 # JS that keeps the sticky table header just below the sticky search card.
@@ -558,6 +618,7 @@ def home():
     q             = request.args.get("q", "").strip()
     sel_statuses  = request.args.getlist("statuses") or list(FILTER_STATUSES)
     show_summary  = request.args.get("summary") == "1" and bool(_last_sync_summary)
+    error_param   = request.args.get("error", "")
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -676,6 +737,20 @@ def home():
     else:
         summary_modal = ""
 
+    if error_param:
+        import urllib.parse
+        if error_param == "sync_running":
+            _err_display = "同期はすでに実行中です。完了をお待ちください。"
+        else:
+            _err_display = urllib.parse.unquote(error_param)
+        error_banner = (
+            f'<div class="error-banner">'
+            f'<strong>エラー:</strong> {html_module.escape(_err_display)}'
+            f'</div>'
+        )
+    else:
+        error_banner = ""
+
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -698,6 +773,8 @@ def home():
   </div>
 </header>
 <main>
+
+  {error_banner}
 
   <!-- Sync card -->
   <div class="card">
@@ -758,6 +835,13 @@ def sync():
         if not selected:
             selected = list(STATUSES)
         run_scraper(selected_statuses=selected)
+    except Exception as exc:
+        import traceback
+        import urllib.parse
+        print("[sync] 同期エラー:")
+        traceback.print_exc()
+        msg = urllib.parse.quote(str(exc).split("\n")[0][:200])
+        return redirect(f"/?error={msg}")
     finally:
         _sync_running = False
     return redirect("/?summary=1")
@@ -1299,23 +1383,32 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
             opts.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
             opts.add_argument("--profile-directory=Default")
 
-    # Scrub PATH of any Homebrew/system chromedriver to force Selenium Manager
-    original_path = os.environ.get("PATH", "")
-    clean_path = os.pathsep.join(
-        d for d in original_path.split(os.pathsep)
-        if d and not os.path.isfile(os.path.join(d, "chromedriver"))
-    )
-    os.environ["PATH"] = clean_path
-    try:
-        driver = webdriver.Chrome(options=opts)
-    except Exception as exc:
+    # Ensure Selenium Manager binary is found and executable before first use.
+    # PyInstaller's collect_data_files() does not preserve the +x bit; this
+    # call fixes that and sets SE_MANAGER_PATH so Selenium always finds it.
+    _ensure_selenium_manager()
+
+    # Attempt to start Chrome; retry once with extra cleanup for visible driver.
+    max_attempts = 2 if not headless else 1
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            driver = webdriver.Chrome(options=opts)
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"[driver] Chrome起動失敗 (attempt {attempt + 1}/{max_attempts}): {exc}")
+            if attempt == 0 and not headless:
+                # First failure on visible driver: kill orphans, clear locks, retry
+                _kill_orphan_chromedriver()
+                _clear_profile_lock()
+                time.sleep(1.0)
+    else:
         raise RuntimeError(
             "Chrome の自動ドライバーセットアップに失敗しました。\n"
             "Google Chrome がインストールされていることを確認してください。\n"
             "https://www.google.com/chrome/"
-        ) from exc
-    finally:
-        os.environ["PATH"] = original_path
+        ) from last_exc
 
     # Remove navigator.webdriver fingerprint so Mercari does not detect Selenium
     try:

@@ -78,6 +78,20 @@ rm -rf build/ dist/ "${APP_NAME}.spec"
 echo "Building ${APP_NAME} (this may take a minute)..."
 echo ""
 
+# Resolve the selenium-manager binary path at build time.
+# --collect-data "selenium" includes it as a data file but does NOT preserve
+# the execute bit. Adding it via --add-binary ensures +x is preserved so
+# Selenium Manager can launch chromedriver without a Permission denied error.
+SM_BIN="$(python3 -c "
+import selenium, os
+print(os.path.join(os.path.dirname(selenium.__file__), 'webdriver', 'common', 'macos', 'selenium-manager'))
+")"
+if [ ! -f "${SM_BIN}" ]; then
+    echo "Error: selenium-manager binary not found at: ${SM_BIN}"
+    exit 1
+fi
+echo "✓ selenium-manager: ${SM_BIN}"
+
 pyinstaller \
     --name "${APP_NAME}" \
     --onedir \
@@ -107,6 +121,8 @@ pyinstaller \
     --hidden-import "selenium.webdriver.remote.webdriver" \
     --collect-submodules "selenium" \
     --collect-data "selenium" \
+    `# Bundle selenium-manager as a binary so execute permissions are preserved` \
+    --add-binary "${SM_BIN}:selenium/webdriver/common/macos/" \
     \
     `# python-dotenv (used by create_jira_ticket.py)` \
     --hidden-import "dotenv" \
