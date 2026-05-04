@@ -96,8 +96,9 @@ def main() -> None:
     os.environ.setdefault("FLASK_ENV", "production")
 
     import mercari_sync as _ms  # noqa: PLC0415
-    _ms.DB_NAME    = os.path.join(data_dir, "products.db")
-    _ms.COOKIE_FILE = os.path.join(data_dir, "mercari_session.json")
+    _ms.DB_NAME          = os.path.join(data_dir, "products.db")
+    _ms.COOKIE_FILE      = os.path.join(data_dir, "mercari_session.json")
+    _ms.CHROME_PROFILE_DIR = os.path.join(data_dir, "chrome-profile")
     flask_app = _ms.app
     init_db = _ms.init_db
 

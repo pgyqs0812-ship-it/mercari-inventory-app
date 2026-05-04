@@ -21,10 +21,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-DB_NAME = "products.db"
-COOKIE_FILE = "mercari_session.json"   # patched to absolute path by main.py
+DB_NAME          = "products.db"
+COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
+CHROME_PROFILE_DIR = ""                    # patched to absolute path by main.py
 MAX_WORKERS = 4
-MAX_RETRY = 3
+MAX_RETRY   = 3
 
 _JST = timezone(timedelta(hours=9))
 
@@ -36,6 +37,10 @@ _last_sync_summary: dict = {}
 
 # Guard against concurrent sync requests
 _sync_running = False
+
+# Singleton visible-Chrome driver shared by sync and link-open
+_singleton_driver = None
+_driver_lock = threading.Lock()   # guards singleton creation only
 
 
 def jst_now() -> str:
@@ -90,22 +95,58 @@ def _inject_saved_cookies(driver) -> bool:
 
 
 def _try_restore_session(driver) -> bool:
-    """Inject saved cookies then verify the session is still valid.
+    """Verify the driver has a valid Mercari session, restoring it if needed.
 
-    Navigates to /mypage/listings after injecting cookies. Returns True if the
-    browser stays on mypage (session valid) rather than being redirected to the
-    login page.
+    Strategy 1 — direct navigation: works when the persistent Chrome profile
+    (--user-data-dir) already holds valid session cookies.
+    Strategy 2 — JSON injection: fallback for a clean/new profile or when the
+    profile cookies have expired but the JSON backup is still valid.
     """
-    if not _inject_saved_cookies(driver):
-        return False
+    # Strategy 1: profile cookies (the normal case after first login)
     driver.get("https://jp.mercari.com/mypage/listings")
     time.sleep(2)
-    valid = "login" not in driver.current_url
-    if valid:
-        print("[session] 保存済みセッションを復元しました（ログイン不要）")
-    else:
-        print("[session] 保存済みセッションが期限切れです。再ログインが必要です。")
-    return valid
+    if "login" not in driver.current_url:
+        print("[session] セッション有効（プロファイルのCookie）— ログイン不要")
+        _save_session_cookies(driver)
+        return True
+
+    # Strategy 2: inject from JSON backup file
+    if _inject_saved_cookies(driver):
+        driver.get("https://jp.mercari.com/mypage/listings")
+        time.sleep(2)
+        if "login" not in driver.current_url:
+            print("[session] セッション復元（JSON Cookie）— ログイン不要")
+            _save_session_cookies(driver)
+            return True
+
+    print("[session] セッション無効 → ログインが必要です")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Singleton driver
+# ---------------------------------------------------------------------------
+
+def _is_driver_alive(driver) -> bool:
+    """Return True if the driver's Chrome process is still running."""
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+def _get_or_create_driver() -> "webdriver.Chrome":
+    """Return the long-lived singleton visible Chrome driver.
+
+    Creates a new instance (with the persistent profile) if one does not exist
+    or if the previous Chrome window was closed by the user.
+    """
+    global _singleton_driver
+    with _driver_lock:
+        if _singleton_driver is None or not _is_driver_alive(_singleton_driver):
+            _singleton_driver = _make_chrome_driver(headless=False)
+        return _singleton_driver
 
 
 app = Flask(__name__)
@@ -709,33 +750,36 @@ def sync():
 
 @app.route("/open")
 def open_url():
-    """Open a Mercari product page in Chrome with the saved session injected.
+    """Open a Mercari product URL in a new tab of the singleton Chrome driver.
 
-    Launches a new (non-headless) Chrome window, injects the saved Mercari
-    cookies, then navigates to the requested URL. The window stays open for the
-    user to browse. The detach option keeps Chrome alive after the driver is GC'd.
+    Because the singleton uses a persistent Chrome profile with a live Mercari
+    session, the product page opens already logged in — no cookie injection
+    needed. If sync is currently running (_sync_running) or the driver is
+    unavailable, falls back to the system browser.
     """
     url = request.args.get("url", "")
     if not url.startswith("https://jp.mercari.com/"):
         return Response("Invalid URL", status=400)
 
-    def _launch():
+    def _open_tab():
+        if _sync_running:
+            # Singleton is busy navigating listing pages; use system browser
+            print(f"[open] 同期中のためフォールバック: {url}")
+            webbrowser.open(url)
+            return
         try:
-            driver = _make_chrome_driver(headless=False, detach=True)
-            if not _inject_saved_cookies(driver):
-                # No saved cookies — navigate directly; user may need to log in
-                driver.get(url)
-            else:
-                driver.get(url)
+            driver = _get_or_create_driver()
+            # Open the product URL in a new tab within the existing Chrome window
+            driver.execute_script("window.open(arguments[0], '_blank');", url)
         except Exception as exc:
-            print(f"[open] Chrome起動失敗 — fallback to webbrowser: {exc}")
+            print(f"[open] 新タブ失敗 — fallback: {exc}")
             webbrowser.open(url)
 
-    threading.Thread(target=_launch, daemon=True).start()
-    # Return a page that closes itself so the /open tab disappears immediately
+    threading.Thread(target=_open_tab, daemon=True).start()
+    # Close the intermediate /open tab that the browser opened
     return Response(
         '<!DOCTYPE html><html><head>'
-        '<script>window.close();setTimeout(function(){window.close();},300);</script>'
+        '<script>window.close();</script>'
         '</head><body></body></html>',
         mimetype="text/html",
     )
@@ -1166,25 +1210,43 @@ def scrape_item_detail(driver, url):
 # Parallel detail fetching
 # ---------------------------------------------------------------------------
 
-def _make_chrome_driver(headless=False, detach=False):
-    """Create a configured Chrome driver. Workers use headless mode.
+def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
+    """Create a configured Chrome driver.
 
-    detach=True keeps the Chrome window open after the Python driver is GC'd
-    (used by the /open route so the browser stays up for the user).
+    Visible driver (headless=False):
+    - Uses persistent profile at CHROME_PROFILE_DIR so Mercari session cookies
+      are stored natively and survive across app restarts.
+    - Images are allowed (needed for product-page viewing).
+
+    Headless workers (headless=True):
+    - Fresh profile each time (no --user-data-dir).
+    - Images blocked to speed up detail-page scraping.
+
+    Anti-detection flags are applied to all instances.
     """
     opts = Options()
+
+    # ── Anti-detection ────────────────────────────────────────────────────
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
     if headless:
         opts.add_argument("--headless=new")
         opts.add_argument("--window-size=1280,900")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
+        # Block images only for headless scraping workers (not for product viewing)
+        opts.add_experimental_option("prefs", {
+            "profile.managed_default_content_settings.images": 2
+        })
     else:
         opts.add_argument("--start-maximized")
-    opts.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2
-    })
-    if detach:
-        opts.add_experimental_option("detach", True)
+        # Persistent profile: Mercari session and cookies survive across runs
+        if CHROME_PROFILE_DIR:
+            os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+            opts.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
+            opts.add_argument("--profile-directory=Default")
 
     # Scrub PATH of any Homebrew/system chromedriver to force Selenium Manager
     original_path = os.environ.get("PATH", "")
@@ -1194,7 +1256,7 @@ def _make_chrome_driver(headless=False, detach=False):
     )
     os.environ["PATH"] = clean_path
     try:
-        return webdriver.Chrome(options=opts)
+        driver = webdriver.Chrome(options=opts)
     except Exception as exc:
         raise RuntimeError(
             "Chrome の自動ドライバーセットアップに失敗しました。\n"
@@ -1203,6 +1265,16 @@ def _make_chrome_driver(headless=False, detach=False):
         ) from exc
     finally:
         os.environ["PATH"] = original_path
+
+    # Remove navigator.webdriver fingerprint so Mercari does not detect Selenium
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+    except Exception:
+        pass  # CDP may not be available for some headless configurations
+
+    return driver
 
 
 def build_driver_pool(n, seed_cookies=None):
@@ -1320,19 +1392,17 @@ def run_scraper(selected_statuses=None):
     sync_start = time.time()
 
     # ------------------------------------------------------------------
-    # Phase 1: login with main (visible) driver, collect all listings
+    # Phase 1: login with singleton visible driver, collect all listings
+    # The singleton Chrome stays alive after sync for product-link opening.
     # ------------------------------------------------------------------
-    main_driver = _make_chrome_driver(headless=False)
+    main_driver = _get_or_create_driver()
 
-    # Try to restore saved session first; only prompt for login if expired
+    # Try to restore session via profile cookies or JSON fallback
     session_restored = _try_restore_session(main_driver)
     if not session_restored:
         main_driver.get("https://jp.mercari.com/login")
         click_login_button_if_exists(main_driver)
         wait_for_login(main_driver)
-        _save_session_cookies(main_driver)
-    else:
-        # Refresh cookies even on a restored session so the file stays current
         _save_session_cookies(main_driver)
 
     phase1_start = time.time()
@@ -1347,7 +1417,8 @@ def run_scraper(selected_statuses=None):
           f"需打开详情页：{len(to_fetch_detail)} 件")
 
     seed_cookies = main_driver.get_cookies()
-    main_driver.quit()
+    # Do NOT quit main_driver — it is the singleton and stays alive for
+    # product-link opening between syncs.
 
     phase1_elapsed = time.time() - phase1_start
 
