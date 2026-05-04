@@ -38,6 +38,9 @@ _last_sync_summary: dict = {}
 # Guard against concurrent sync requests
 _sync_running = False
 
+# Login session state machine: "unknown" → "checking" → "valid" / "invalid" / "logging_in"
+_session_state: str = "unknown"
+
 # Live progress state updated by the background sync thread; read by /sync_status
 _sync_progress: dict = {
     "running":     False,
@@ -608,6 +611,30 @@ document.addEventListener('click', function(e) {
 })();
 """
 
+# Polling JS injected on /login while state is "checking" or "logging_in".
+# Redirects to "/" on "valid", reloads /login on "invalid" / "unknown".
+_LOGIN_POLL_JS = """
+(function() {
+  function poll() {
+    fetch('/login/status')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.state === 'valid') {
+          window.location = '/';
+          return;
+        }
+        if (d.state === 'invalid' || d.state === 'unknown') {
+          window.location = '/login';
+          return;
+        }
+        setTimeout(poll, 2000);
+      })
+      .catch(function() { setTimeout(poll, 3000); });
+  }
+  poll();
+})();
+"""
+
 # Polling JS injected only on /?syncing=1 — polls /sync_status every 2 s,
 # updates the progress bar, and redirects when sync completes or errors.
 _SYNC_POLL_JS = """
@@ -691,6 +718,16 @@ def _build_result_rows(products):
 
 @app.route("/")
 def home():
+    global _session_state
+    if _session_state == "unknown":
+        _session_state = "checking"
+        threading.Thread(
+            target=_check_session_background, daemon=True, name="session-check"
+        ).start()
+        return redirect("/login")
+    if _session_state == "invalid":
+        return redirect("/login")
+
     searched      = request.args.get("searched") == "1"
     q             = request.args.get("q", "").strip()
     sel_statuses  = request.args.getlist("statuses") or list(FILTER_STATUSES)
@@ -956,6 +993,81 @@ def sync():
 def sync_status():
     from flask import jsonify
     return jsonify(_sync_progress)
+
+
+@app.route("/login")
+def login_page():
+    is_waiting = _session_state in ("checking", "logging_in")
+    if is_waiting:
+        status_label = "ログイン中..." if _session_state == "logging_in" else "セッションを確認中..."
+        body_content = f"""
+      <p class="login-status">{status_label}</p>
+      <div class="spinner"></div>"""
+        poll_js = _LOGIN_POLL_JS
+    else:
+        body_content = """
+      <p class="login-desc">Mercari の在庫を同期するには、<br>Mercari アカウントでログインが必要です。</p>
+      <form method="POST" action="/login/start">
+        <button class="btn btn-primary" type="submit" style="width:100%;padding:14px;font-size:16px">
+          ログインを開始
+        </button>
+      </form>"""
+        poll_js = ""
+
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mercari ログイン</title>
+  <style>{_CSS}
+  .login-card {{ max-width: 480px; margin: 80px auto; }}
+  .login-desc {{ font-size: 15px; color: var(--muted); line-height: 1.6; margin-bottom: 24px; text-align: center; }}
+  .login-status {{ font-size: 15px; color: var(--muted); margin-bottom: 20px; text-align: center; }}
+  .spinner {{ width: 36px; height: 36px; border: 4px solid var(--border);
+             border-top-color: var(--primary); border-radius: 50%;
+             animation: spin .8s linear infinite; margin: 0 auto; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  </style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div>
+      <h1>Mercari 在庫管理</h1>
+      <p>商品データの同期・検索・エクスポート</p>
+    </div>
+  </div>
+</header>
+<main>
+  <div class="card login-card">
+    <div class="card-header">
+      <span class="card-title">Mercari ログイン</span>
+    </div>
+    <div class="card-body" style="text-align:center;padding:32px">
+      {body_content}
+    </div>
+  </div>
+</main>
+<script>{poll_js}</script>
+</body>
+</html>"""
+
+
+@app.route("/login/start", methods=["POST"])
+def login_start():
+    global _session_state
+    if _session_state == "logging_in":
+        return redirect("/login")
+    _session_state = "logging_in"
+    threading.Thread(target=_do_login, daemon=True, name="login-thread").start()
+    return redirect("/login")
+
+
+@app.route("/login/status")
+def login_status():
+    from flask import jsonify
+    return jsonify({"state": _session_state})
 
 
 @app.route("/open")
@@ -1712,6 +1824,54 @@ def wait_for_login(driver, timeout=300):
     raise TimeoutError("ログインがタイムアウトしました（5 分）。アプリを再起動してください。")
 
 
+def _check_session_background() -> None:
+    """Check Mercari session validity in a background thread.
+
+    Sets _session_state to "valid" or "invalid" when done.
+    Called once on first visit to home() when state is "unknown".
+    """
+    global _session_state
+    try:
+        driver = _get_or_create_driver()
+        if _try_restore_session(driver):
+            _session_state = "valid"
+        else:
+            _session_state = "invalid"
+    except Exception as exc:
+        print(f"[session] セッションチェック失敗: {exc}")
+        _session_state = "invalid"
+
+
+def _do_login() -> None:
+    """Perform interactive Mercari login in a background thread.
+
+    Brings Chrome to screen, navigates to the login page, waits for the user
+    to complete login, saves cookies, then moves Chrome off-screen.
+    Sets _session_state to "valid" on success, "invalid" on failure/timeout.
+    """
+    global _session_state
+    try:
+        driver = _get_or_create_driver()
+        try:
+            driver.maximize_window()
+            driver.set_window_position(0, 0)
+        except Exception:
+            pass
+        driver.get("https://jp.mercari.com/login")
+        click_login_button_if_exists(driver)
+        wait_for_login(driver)
+        _save_session_cookies(driver)
+        try:
+            driver.set_window_position(-3000, 0)
+        except Exception:
+            pass
+        _session_state = "valid"
+        print("[login] ログイン完了 — セッション有効")
+    except Exception as exc:
+        print(f"[login] ログイン失敗: {exc}")
+        _session_state = "invalid"
+
+
 # ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
@@ -1726,18 +1886,23 @@ def run_scraper(selected_statuses=None):
     sync_start = time.time()
 
     # ------------------------------------------------------------------
-    # Phase 1: login with singleton visible driver, collect all listings
+    # Phase 1: session check, collect all listings
     # The singleton Chrome stays alive after sync for product-link opening.
     # ------------------------------------------------------------------
+    if _session_state != "valid":
+        raise RuntimeError(
+            "セッションが無効です。ログイン画面からログインし直してください。"
+        )
+
     main_driver = _get_or_create_driver()
 
-    # Try to restore session via profile cookies or JSON fallback
-    session_restored = _try_restore_session(main_driver)
-    if not session_restored:
-        main_driver.get("https://jp.mercari.com/login")
-        click_login_button_if_exists(main_driver)
-        wait_for_login(main_driver)
-        _save_session_cookies(main_driver)
+    # Re-verify session is still live (cookies may have expired since login check)
+    if not _try_restore_session(main_driver):
+        global _session_state  # noqa: PLW0603
+        _session_state = "invalid"
+        raise RuntimeError(
+            "Mercari セッションが切れました。ログイン画面から再度ログインしてください。"
+        )
 
     # Move Chrome off-screen so it doesn't stay in the foreground.
     # Do NOT minimize — a minimized window collapses the viewport to ~0,
