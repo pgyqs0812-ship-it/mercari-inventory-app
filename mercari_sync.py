@@ -25,6 +25,10 @@ DB_NAME          = "products.db"
 COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
 CHROME_PROFILE_DIR = ""                    # patched to absolute path by main.py
 LICENSE_FILE     = "license.json"          # patched to absolute path by main.py
+
+
+class _SyncStopped(Exception):
+    """Raised inside run_scraper() / scraper loops when force-stop is requested."""
 MAX_WORKERS = 4
 MAX_RETRY   = 3
 
@@ -43,6 +47,7 @@ _last_sync_summary: dict = {}
 
 # Guard against concurrent sync requests
 _sync_running = False
+_sync_stop_requested = False
 
 # Login session state machine:
 #   "unknown" → "checking" → "found_session" / "invalid"
@@ -60,6 +65,7 @@ _sync_progress: dict = {
     "total_steps": 0,
     "fetched":     0,
     "error":       "",
+    "stopped":     False,
 }
 
 # Singleton visible-Chrome driver shared by sync and link-open
@@ -938,7 +944,9 @@ _SYNC_POLL_JS = """
         if (fracEl && d.total_steps > 0)
           fracEl.textContent = d.step_num + ' / ' + d.total_steps;
         if (d.done) {
-          if (d.error) {
+          if (d.stopped) {
+            window.location = '/';
+          } else if (d.error) {
             window.location = '/?error=' + encodeURIComponent(d.error);
           } else {
             window.location = '/?summary=1';
@@ -1116,7 +1124,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.0</div>
+  <div class="sidebar-footer">v1.4.1</div>
 </nav>"""
 
 
@@ -1125,6 +1133,22 @@ def _page_shell(title: str, active: str, content: str,
     """Return a full HTML page with sidebar layout."""
     stats = _get_kpi_stats()
     sub_html = f'<p>{html_module.escape(subtitle)}</p>' if subtitle else ""
+
+    # Inject sidebar nav-lock when a sync is in progress so users cannot
+    # navigate away mid-sync from any page (not just the main sync page).
+    sync_lock_js = ""
+    if _sync_running:
+        sync_lock_js = """
+(function() {
+  document.querySelectorAll('.nav-item a').forEach(function(a) {
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      alert('同期中です。完了するまでお待ちください。');
+    });
+  });
+})();
+"""
+
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1154,6 +1178,7 @@ def _page_shell(title: str, active: str, content: str,
 </div>
 <script>
 {_SHUTDOWN_JS}
+{sync_lock_js}
 {extra_js}
 </script>
 </body>
@@ -1162,12 +1187,22 @@ def _page_shell(title: str, active: str, content: str,
 
 @app.route("/")
 def home():
-    global _session_state
+    global _session_state, _session_last_login
     if _session_state == "unknown":
-        _session_state = "checking"
-        threading.Thread(
-            target=_check_session_background, daemon=True, name="session-check"
-        ).start()
+        # File-based check: never open Chrome on startup.
+        # If cookie file exists, show "found session" screen so user can choose.
+        # Only start Chrome when the user explicitly clicks "ログインを開始".
+        if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+            _session_state = "found_session"
+            try:
+                mtime = os.path.getmtime(COOKIE_FILE)
+                _session_last_login = datetime.fromtimestamp(mtime, tz=_JST).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            except Exception:
+                pass
+        else:
+            _session_state = "invalid"
         return redirect("/login")
     if _session_state != "valid":
         return redirect("/login")
@@ -1228,8 +1263,19 @@ def home():
         <div class="card" id="sync-card">
           <div class="card-header">
             <span class="card-title">同期中</span>
-            <span id="sync-pct" class="db-pill"
-                  style="background:rgba(37,99,235,.12);color:#2563eb">…</span>
+            <div style="display:flex;gap:8px;align-items:center">
+              <span id="sync-pct" class="db-pill"
+                    style="background:rgba(37,99,235,.12);color:#2563eb">…</span>
+              <button id="btn-force-stop"
+                      style="background:#ef4444;color:#fff;border:none;border-radius:8px;
+                             padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer"
+                      onclick="if(confirm('同期を強制停止しますか？\\n現在処理中のデータは保存されます。')){{
+                        this.disabled=true;this.textContent='停止中…';
+                        fetch('/sync/stop',{{method:'POST'}}).catch(function(){{}});
+                      }}">
+                &#9632; 強制停止
+              </button>
+            </div>
           </div>
           <div class="card-body">
             <div class="sync-warning">
@@ -1372,14 +1418,19 @@ def sync():
         "total_steps": len(selected),
         "fetched":     0,
         "error":       "",
+        "stopped":     False,
     }
 
     def _bg_sync():
-        global _sync_running, _sync_progress
+        global _sync_running, _sync_progress, _sync_stop_requested
+        _sync_stop_requested = False   # clear any leftover stop flag from previous run
         try:
             run_scraper(selected_statuses=selected)
             if _check_plan() == "free":
                 _record_sync_date()
+        except _SyncStopped:
+            print("[sync] 強制停止されました")
+            _sync_progress["stopped"] = True
         except Exception as exc:
             import traceback
             print("[sync] 同期エラー:")
@@ -1398,6 +1449,21 @@ def sync():
 def sync_status():
     from flask import jsonify
     return jsonify(_sync_progress)
+
+
+@app.route("/sync/stop", methods=["POST"])
+def sync_stop():
+    """Signal the background sync to abort and quit the Selenium driver immediately."""
+    global _sync_stop_requested, _singleton_driver
+    _sync_stop_requested = True
+    with _driver_lock:
+        if _singleton_driver is not None:
+            try:
+                _singleton_driver.quit()
+            except Exception:
+                pass
+            _singleton_driver = None
+    return Response("ok", status=200, headers={"Content-Type": "text/plain"})
 
 
 @app.route("/login")
@@ -2337,7 +2403,7 @@ def settings_page():
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.0</span>
+          <span class="settings-value">v1.4.1</span>
         </div>
       </div>
     </div>"""
@@ -2618,6 +2684,8 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
         seen_urls = {i["url"] for i in initial}
         all_items = list(initial)
         for page_num in range(1, 51):  # safety cap: 50 pages
+            if _sync_stop_requested:
+                raise _SyncStopped()
             next_btn = _find_next_button(driver)
             if not next_btn:
                 print(f"\n[{status_label}] 次へボタンなし — 全件読み込み完了 ({page_num} ページ)")
@@ -2638,6 +2706,8 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
     else:
         # ── Scroll + もっと見る pagination ────────────────────────────────
         for click_num in range(200):
+            if _sync_stop_requested:
+                raise _SyncStopped()
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(0.8)
 
@@ -2680,6 +2750,9 @@ def load_all_listings(driver, selected_statuses):
     _sync_progress["total_steps"] = len(selected_statuses)
 
     for idx, status in enumerate(selected_statuses, start=1):
+        if _sync_stop_requested:
+            raise _SyncStopped()
+
         _sync_progress["step"]     = status
         _sync_progress["step_num"] = idx
 
@@ -3252,6 +3325,9 @@ def run_scraper(selected_statuses=None):
     # ------------------------------------------------------------------
     # Phase 2: parallel detail fetches
     # ------------------------------------------------------------------
+    if _sync_stop_requested:
+        raise _SyncStopped()
+
     detail_inserted = detail_updated = detail_skipped = detail_errors = 0
     phase2_elapsed = 0.0
 
