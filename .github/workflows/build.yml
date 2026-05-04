@@ -111,6 +111,26 @@ jobs:
           print(f"QR code generated for: {url}")
           PYEOF
 
+      # ── Jira issue creation (MUST succeed before release is published) ──────
+      # Requires four repository secrets:
+      #   JIRA_URL            https://yoursite.atlassian.net
+      #   JIRA_EMAIL          your@email.com
+      #   JIRA_API_TOKEN      Atlassian API token (https://id.atlassian.com/manage-profile/security/api-tokens)
+      #   JIRA_PROJECT_KEY    KAN
+      # If any secret is missing or the API call fails, this step exits non-zero
+      # and the "Upload release assets" step is skipped — the release is blocked.
+      - name: Create Jira issue
+        env:
+          JIRA_URL:         ${{ secrets.JIRA_URL }}
+          JIRA_EMAIL:       ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN:   ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          pip install requests python-dotenv
+          python create_jira_ticket.py \
+            --version "${{ github.ref_name }}" \
+            --summary "${{ github.ref_name }} — $(git log -1 --pretty=%s)"
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
