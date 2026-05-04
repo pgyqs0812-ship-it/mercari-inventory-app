@@ -34,7 +34,10 @@ MAX_RETRY   = 3
 
 # Monetization constants
 _TRIAL_DAYS     = 7
-_LICENSE_SECRET = b"mi-inventory-license-v1-secret"
+_MONTHLY_DAYS   = 30
+# v2 secret — keys now use MIA-LIFE-XXXX-XXXX / MIA-MONTH-XXXX-XXXX format.
+# Test keys: MIA-MONTH-7A33-AD8C  |  MIA-LIFE-7114-3540
+_LICENSE_SECRET = b"mia-license-v2-secret"
 _license_cache: dict = {}   # in-memory; cleared on every write to license.json
 
 _JST = timezone(timedelta(hours=9))
@@ -326,14 +329,30 @@ def init_license() -> None:
     state = _get_license()
     if not state.get("first_launch"):
         state = {
+            "license_schema_version": 2,
             "first_launch":    datetime.now(_JST).isoformat(),
             "plan":            "trial",
             "activated_at":    None,
+            "expiry_time":     None,   # set when monthly key is activated
             "last_sync_date":  None,
+            "validation_server": None, # future: URL for online key verification
         }
         _save_license(state)
         print(f"[license] トライアル開始: {state['first_launch']}")
     else:
+        # Migrate older license.json to schema v2 if fields are missing
+        changed = False
+        for field, default in (
+            ("license_schema_version", 2),
+            ("expiry_time",     None),
+            ("validation_server", None),
+        ):
+            if field not in state:
+                state[field] = default
+                changed = True
+        if changed:
+            _save_license(state)
+            print("[license] schema v2 へ移行しました")
         plan = _check_plan()
         days = _trial_days_remaining()
         print(f"[license] プラン: {plan}, トライアル残り: {days} 日")
@@ -350,6 +369,14 @@ def _check_plan() -> str:
                 launched = datetime.fromisoformat(first)
                 if (datetime.now(_JST) - launched).days >= _TRIAL_DAYS:
                     return "expired"
+            except Exception:
+                pass
+    elif plan == "monthly":
+        expiry = state.get("expiry_time")
+        if expiry:
+            try:
+                if datetime.now(_JST) > datetime.fromisoformat(expiry):
+                    return "free"   # monthly period ended → revert to free
             except Exception:
                 pass
     return plan
@@ -371,6 +398,31 @@ def _trial_days_remaining() -> int:
         return 0
 
 
+def _monthly_days_remaining() -> int:
+    """Days until monthly plan expires (0 when expired or not monthly)."""
+    if _check_plan() != "monthly":
+        return 0
+    expiry = _get_license().get("expiry_time")
+    if not expiry:
+        return _MONTHLY_DAYS
+    try:
+        delta = datetime.fromisoformat(expiry) - datetime.now(_JST)
+        return max(0, delta.days)
+    except Exception:
+        return 0
+
+
+def _monthly_expiry_str() -> str:
+    """Return the monthly expiry date as 'YYYY-MM-DD', or '' if unavailable."""
+    expiry = _get_license().get("expiry_time")
+    if not expiry:
+        return ""
+    try:
+        return datetime.fromisoformat(expiry).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def _is_paid() -> bool:
     return _check_plan() in ("monthly", "lifetime")
 
@@ -378,21 +430,26 @@ def _is_paid() -> bool:
 def _validate_license_key(key: str) -> tuple:
     """Validate a license key and return (plan_str, error_str).
 
-    Key format:  MONTHLY-<16 HEX>   or   LIFETIME-<16 HEX>
-    The hex suffix is the first 16 chars of
-    HMAC-SHA256(_LICENSE_SECRET, plan_prefix.lower().encode()).hexdigest().upper()
+    Key format:  MIA-LIFE-XXXX-XXXX   (lifetime plan)
+                 MIA-MONTH-XXXX-XXXX  (monthly plan)
+
+    XXXX-XXXX = first 8 hex chars of HMAC-SHA256(_LICENSE_SECRET, tag.lower())
+                split into two groups of 4 (e.g. "7114-3540").
+
+    This is a local offline check — no network call required.
+    Future: pass key to validation server; treat server 200 as authoritative.
     """
     key = key.strip().upper()
-    for prefix, plan_name in (("MONTHLY", "monthly"), ("LIFETIME", "lifetime")):
-        expected_hex = _hmac_mod.new(
+    for tag, plan_name in (("LIFE", "lifetime"), ("MONTH", "monthly")):
+        raw_hex = _hmac_mod.new(
             _LICENSE_SECRET,
-            prefix.lower().encode(),
+            tag.lower().encode(),
             _hashlib.sha256,
-        ).hexdigest()[:16].upper()
-        expected_key = f"{prefix}-{expected_hex}"
+        ).hexdigest()[:8].upper()
+        expected_key = f"MIA-{tag}-{raw_hex[:4]}-{raw_hex[4:]}"
         if key == expected_key:
             return plan_name, ""
-    return "", "無効なライセンスキーです。キーを確認してもう一度お試しください。"
+    return "", "無効なライセンスキーです。キーの形式は MIA-LIFE-XXXX-XXXX または MIA-MONTH-XXXX-XXXX です。"
 
 
 def _license_badge_html() -> str:
@@ -410,10 +467,12 @@ def _license_badge_html() -> str:
         label  = "無料版"
     elif plan == "monthly":
         bg, fg = "#dcfce7", "#166534"
-        label  = "Pro 月額プラン"
+        days = _monthly_days_remaining()
+        exp  = _monthly_expiry_str()
+        label = f"Pro 月額 — 残り {days} 日 ({exp} まで)" if exp else "Pro 月額プラン"
     elif plan == "lifetime":
         bg, fg = "#dcfce7", "#166534"
-        label  = "Pro 買い切り"
+        label  = "Pro 買い切り（無期限）"
     else:
         bg, fg = "#f3f4f6", "#374151"
         label  = plan
@@ -1124,7 +1183,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.1</div>
+  <div class="sidebar-footer">v1.4.2</div>
 </nav>"""
 
 
@@ -1552,7 +1611,7 @@ def login_page():
   <div class="header-inner">
     <div>
       <h1>Mercari 在庫管理</h1>
-      <p>商品データの同期・検索・エクスポート</p>
+      <p>Mercari 販売者向け在庫管理ツール</p>
     </div>
   </div>
 </header>
@@ -1767,7 +1826,7 @@ def upgrade_page():
         <div class="plan-name">月額プラン</div>
         <div class="plan-price">¥480<small>/月</small></div>
         <div class="plan-features">{monthly_features}</div>
-        <a class="plan-cta plan-cta-primary" href="/license?plan=monthly"
+        <a class="plan-cta plan-cta-primary" href="/settings"
            style="display:block;text-decoration:none">
           月額プランに登録
         </a>
@@ -1776,7 +1835,7 @@ def upgrade_page():
         <div class="plan-name">買い切り</div>
         <div class="plan-price">¥1,980</div>
         <div class="plan-features">{lifetime_features}</div>
-        <a class="plan-cta plan-cta-primary" href="/license?plan=lifetime"
+        <a class="plan-cta plan-cta-primary" href="/settings"
            style="display:block;text-decoration:none">
           今すぐ購入
         </a>
@@ -1785,7 +1844,7 @@ def upgrade_page():
 
     content = f"{banner_html}\n{plan_grid}"
     return _page_shell("プランを選択", "main", content,
-                       subtitle="お使いのプランをアップグレードしてすべての機能を利用できます")
+                       subtitle="Mercari 販売者向け在庫管理ツール — プランをアップグレードしてすべての機能を利用できます")
 
 
 @app.route("/license/choose-free", methods=["POST"])
@@ -1799,63 +1858,8 @@ def license_choose_free():
 
 @app.route("/license", methods=["GET", "POST"])
 def license_page():
-    if _session_state != "valid":
-        return redirect("/login")
-
-    plan_hint = request.args.get("plan", "")
-    error_msg = ""
-    success   = False
-
-    if request.method == "POST":
-        key = request.form.get("key", "").strip()
-        plan_name, err = _validate_license_key(key)
-        if err:
-            error_msg = err
-        else:
-            state = _get_license()
-            state["plan"]         = plan_name
-            state["activated_at"] = datetime.now(_JST).isoformat()
-            _save_license(state)
-            return redirect("/?licensed=1")
-
-    plan_label = {"monthly": "月額プラン", "lifetime": "買い切り"}.get(plan_hint, "ライセンス")
-    error_html = (
-        f'<div class="error-banner" style="margin-bottom:16px">'
-        f'<strong>エラー:</strong> {html_module.escape(error_msg)}</div>'
-        if error_msg else ""
-    )
-    note = (
-        "ご購入後、届いたライセンスキーを以下に入力してください。<br>"
-        "キーの形式: <code>MONTHLY-XXXXXXXXXXXXXXXX</code>"
-        " または <code>LIFETIME-XXXXXXXXXXXXXXXX</code>"
-    )
-
-    content = f"""
-    <div class="card license-wrap">
-      <div class="card-header">
-        <span class="card-title">{html_module.escape(plan_label)}のアクティベーション</span>
-      </div>
-      <div class="card-body">
-        {error_html}
-        <p class="license-note">{note}</p>
-        <form method="POST" action="/license">
-          <input type="hidden" name="plan" value="{html_module.escape(plan_hint)}">
-          <div class="search-row" style="margin-bottom:0">
-            <input class="text-input" type="text" name="key"
-                   placeholder="MONTHLY-XXXXXXXXXXXXXXXX"
-                   style="font-family:monospace;letter-spacing:.05em">
-            <button class="btn btn-primary" type="submit">アクティベート</button>
-          </div>
-        </form>
-        <p style="margin-top:16px;font-size:12px;color:var(--muted)">
-          ライセンスキーをお持ちでない場合は
-          <a href="/upgrade" style="color:var(--primary)">プラン選択ページ</a>へ。
-        </p>
-      </div>
-    </div>"""
-
-    return _page_shell(f"{plan_label}のアクティベーション", "settings",
-                       content, subtitle="ライセンスキーを入力して機能を解放します")
+    """Kept for backward compatibility — activation moved to /settings."""
+    return redirect("/settings")
 
 
 # ---------------------------------------------------------------------------
@@ -2274,10 +2278,28 @@ def ai_page():
 # Settings page
 # ---------------------------------------------------------------------------
 
-@app.route("/settings")
+@app.route("/settings", methods=["GET", "POST"])
 def settings_page():
     if _session_state != "valid":
         return redirect("/login")
+
+    # Inline license key activation (POST from plan card form)
+    if request.method == "POST" and request.args.get("action") == "activate":
+        key = request.form.get("key", "").strip()
+        plan_name, err = _validate_license_key(key)
+        if err:
+            import urllib.parse
+            return redirect("/settings?key_err=" + urllib.parse.quote(err))
+        state = _get_license()
+        state["plan"]         = plan_name
+        state["activated_at"] = datetime.now(_JST).isoformat()
+        if plan_name == "monthly":
+            expiry = datetime.now(_JST) + timedelta(days=_MONTHLY_DAYS)
+            state["expiry_time"] = expiry.isoformat()
+        else:
+            state["expiry_time"] = None
+        _save_license(state)
+        return redirect("/settings?key_ok=1")
 
     _state_map = {
         "valid":   ("✓ ログイン済み", "#dcfce7", "#166534"),
@@ -2346,10 +2368,32 @@ def settings_page():
       </div>
     </div>"""
 
+    # ── Inline activation flash messages ──────────────────────────────────
+    key_ok  = request.args.get("key_ok") == "1"
+    key_err = request.args.get("key_err", "")
+    if key_ok:
+        activate_flash = (
+            '<div class="error-banner" '
+            'style="background:#dcfce7;border-color:#86efac;color:#166534;margin-bottom:12px">'
+            '&#10003; ライセンスが有効化されました。プロ機能が利用可能です。'
+            '</div>'
+        )
+    elif key_err:
+        import urllib.parse
+        activate_flash = (
+            f'<div class="error-banner" style="margin-bottom:12px">'
+            f'<strong>エラー:</strong> {html_module.escape(urllib.parse.unquote(key_err))}'
+            f'</div>'
+        )
+    else:
+        activate_flash = ""
+
     # ── Plan info card ────────────────────────────────────────────────────
     lic          = _get_license()
     cur_plan     = _check_plan()
     days_left    = _trial_days_remaining()
+    monthly_days = _monthly_days_remaining()
+    expiry_str   = _monthly_expiry_str()
     activated_at = lic.get("activated_at") or "–"
     if activated_at and activated_at != "–":
         activated_at = activated_at[:16]
@@ -2358,8 +2402,8 @@ def settings_page():
         "trial":    f"トライアル（残り {days_left} 日）",
         "expired":  "トライアル終了",
         "free":     "無料版",
-        "monthly":  "Pro 月額プラン",
-        "lifetime": "Pro 買い切り",
+        "monthly":  f"Pro 月額プラン（残り {monthly_days} 日 / {expiry_str} まで）",
+        "lifetime": "Pro 買い切り（無期限）",
     }
     plan_label = plan_label_map.get(cur_plan, cur_plan)
     upgrade_link = (
@@ -2372,6 +2416,7 @@ def settings_page():
     <div class="card">
       <div class="card-header"><span class="card-title">プラン情報</span></div>
       <div class="card-body">
+        {activate_flash}
         <div class="settings-row">
           <span class="settings-label">現在のプラン</span>
           <div style="display:flex;align-items:center;gap:12px">
@@ -2384,15 +2429,23 @@ def settings_page():
           <span class="settings-value">{html_module.escape(plan_label)}</span>
         </div>
         <div class="settings-row">
-          <span class="settings-label">ライセンス有効化日時</span>
+          <span class="settings-label">有効化日時</span>
           <span class="settings-value">{html_module.escape(str(activated_at))}</span>
         </div>
-        <div class="settings-row">
+        <div class="settings-row" style="flex-direction:column;align-items:flex-start;gap:10px">
           <span class="settings-label">ライセンスキーを入力</span>
-          <a href="/license" class="btn btn-outline"
-             style="padding:7px 14px;font-size:13px;text-decoration:none">
-            キーを入力
-          </a>
+          <form method="POST" action="/settings?action=activate"
+                style="display:flex;gap:10px;align-items:center;width:100%;max-width:480px">
+            <input class="text-input" type="text" name="key"
+                   placeholder="MIA-LIFE-XXXX-XXXX または MIA-MONTH-XXXX-XXXX"
+                   style="font-family:monospace;letter-spacing:.05em;flex:1">
+            <button class="btn btn-primary" type="submit"
+                    style="white-space:nowrap">アクティベート</button>
+          </form>
+          <p style="font-size:12px;color:var(--muted)">
+            キーをお持ちでない場合は
+            <a href="/upgrade" style="color:var(--primary)">プラン選択ページ</a>へ。
+          </p>
         </div>
       </div>
     </div>"""
@@ -2403,7 +2456,14 @@ def settings_page():
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.1</span>
+          <span class="settings-value">v1.4.2</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">免責事項</span>
+          <span class="settings-value" style="font-size:12px;color:var(--muted);text-align:right;max-width:400px">
+            本ツールは Mercari 販売者向けの独立した在庫管理ツールです。
+            Mercari 株式会社との公式な提携・認定関係はありません。
+          </span>
         </div>
       </div>
     </div>"""
