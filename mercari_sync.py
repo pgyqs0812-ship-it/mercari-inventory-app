@@ -497,6 +497,93 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
                   transition: width .5s ease; min-width: 4px; }
 .sync-meta      { font-size: 13px; color: var(--muted); display: flex;
                   justify-content: space-between; align-items: center; }
+/* ── Dashboard sidebar layout ─────────────────────────────────── */
+.app-shell { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 220px; background: #111827; color: #fff;
+  position: fixed; top: 0; left: 0; height: 100vh;
+  display: flex; flex-direction: column;
+  z-index: 200; overflow-y: auto; }
+.sidebar-logo {
+  padding: 20px 20px 16px; font-size: 15px; font-weight: 700;
+  color: #fff; border-bottom: 1px solid rgba(255,255,255,.1); line-height: 1.4; }
+.sidebar-logo small { display: block; font-size: 11px; font-weight: 400;
+                      color: #9ca3af; margin-top: 2px; }
+.sidebar-nav { padding: 12px 0; flex: 1; }
+.sidebar-nav ul { list-style: none; }
+.nav-item a {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 20px; font-size: 13px; font-weight: 500;
+  color: #d1d5db; text-decoration: none;
+  border-left: 3px solid transparent;
+  transition: background .15s, color .15s, border-color .15s; }
+.nav-item a:hover { background: rgba(255,255,255,.06); color: #fff; }
+.nav-item.active a { background: rgba(37,99,235,.25); color: #fff;
+                     border-left-color: #3b82f6; }
+.nav-icon { font-size: 15px; width: 18px; text-align: center; flex-shrink: 0; }
+.sidebar-footer { padding: 14px 20px; border-top: 1px solid rgba(255,255,255,.1);
+                  font-size: 11px; color: #6b7280; }
+/* Page content area */
+.page-content { margin-left: 220px; min-height: 100vh;
+                display: flex; flex-direction: column; }
+.page-header { background: #111827; color: #fff; padding: 18px 32px;
+               display: flex; justify-content: space-between; align-items: center;
+               flex-shrink: 0; }
+.page-header h1 { font-size: 18px; font-weight: 700; }
+.page-header p  { font-size: 12px; color: #9ca3af; margin-top: 2px; }
+.page-header-actions { display: flex; gap: 10px; align-items: center; }
+.page-body { padding: 28px 32px; flex: 1;
+             display: flex; flex-direction: column; gap: 20px; }
+/* KPI cards */
+.kpi-grid { display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
+            gap: 14px; }
+.kpi-card { background: #fff; border-radius: 12px; padding: 18px 20px;
+            box-shadow: var(--shadow-md); }
+.kpi-value { font-size: 26px; font-weight: 700; color: var(--text);
+             letter-spacing: -.5px; }
+.kpi-value.green { color: #16a34a; }
+.kpi-value.blue  { color: #2563eb; }
+.kpi-value.amber { color: #d97706; }
+.kpi-value.red   { color: #dc2626; }
+.kpi-label { font-size: 11px; font-weight: 600; color: var(--muted);
+             margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
+/* Sync warning banner */
+.sync-warning { background: #fffbeb; border: 1px solid #fde68a;
+                border-radius: 8px; color: #92400e;
+                padding: 12px 16px; font-size: 13px; margin-bottom: 12px; }
+/* Sales page */
+.sales-kpi-grid { display: grid;
+                  grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+                  gap: 14px; }
+.chart-wrap { display: flex; align-items: center; justify-content: center;
+              gap: 32px; flex-wrap: wrap; padding: 16px; }
+.chart-legend { display: flex; flex-direction: column; gap: 10px; }
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+/* AI analysis */
+.suggestion-card { background: #fff; border-radius: 12px;
+                   box-shadow: var(--shadow-md); overflow: clip; }
+.suggestion-header { display: flex; align-items: center; gap: 10px;
+                     padding: 14px 20px; border-bottom: 1px solid var(--border); }
+.suggestion-icon { font-size: 18px; }
+.suggestion-title { font-size: 14px; font-weight: 600; }
+.suggestion-badge { margin-left: auto; font-size: 12px; font-weight: 600;
+                    background: #eff6ff; color: #2563eb;
+                    border-radius: 20px; padding: 2px 10px; }
+.suggestion-tip { font-size: 13px; color: var(--muted);
+                  padding: 10px 20px 4px; line-height: 1.5; }
+/* Settings */
+.settings-row { display: flex; align-items: flex-start;
+                justify-content: space-between; gap: 16px;
+                padding: 14px 0; border-bottom: 1px solid var(--border); }
+.settings-row:last-child { border-bottom: none; }
+.settings-label { font-size: 12px; font-weight: 600; color: var(--muted);
+                  text-transform: uppercase; letter-spacing: .04em;
+                  white-space: nowrap; padding-top: 2px; }
+.settings-value { font-size: 14px; color: var(--text); text-align: right; }
+.settings-path  { font-size: 12px; color: var(--muted); font-family: monospace;
+                  word-break: break-all; text-align: right; max-width: 480px; }
 """
 
 # JS that keeps the sticky table header just below the sticky search card.
@@ -682,6 +769,49 @@ _SYNC_POLL_JS = """
 """
 
 
+_SALES_PIE_JS = """
+(function() {
+  var data = (typeof _PIE_DATA !== 'undefined') ? _PIE_DATA : [];
+  var canvas = document.getElementById('pie-chart');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var cx = 100, cy = 100, r = 90;
+  if (!data || !data.length) {
+    ctx.fillStyle = '#e5e7eb';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#6b7280'; ctx.font = '13px sans-serif';
+    ctx.textAlign = 'center'; ctx.fillText('データなし', cx, cy+5);
+    return;
+  }
+  var total = data.reduce(function(s, d) { return s + (d.value || 0); }, 0);
+  if (total <= 0) return;
+  var start = -Math.PI / 2;
+  data.forEach(function(d) {
+    var angle = (d.value / total) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r, start, start + angle);
+    ctx.closePath();
+    ctx.fillStyle = d.color;
+    ctx.fill();
+    start += angle;
+  });
+  var legend = document.getElementById('pie-legend');
+  if (legend) {
+    data.forEach(function(d) {
+      var pct = Math.round(d.value / total * 100);
+      var item = document.createElement('div');
+      item.className = 'legend-item';
+      item.innerHTML = '<span class="legend-dot" style="background:' + d.color + '"></span>'
+        + '<span>' + d.label + ' &nbsp;<strong>¥' + d.value.toLocaleString()
+        + '</strong> (' + pct + '%)</span>';
+      legend.appendChild(item);
+    });
+  }
+})();
+"""
+
+
 def _badge_html(status, visibility_status=""):
     # 出品中 items with visibility_status='stopped' display as 公開停止中
     if status == "出品中" and visibility_status == "stopped":
@@ -725,6 +855,126 @@ def _build_result_rows(products):
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Dashboard helpers
+# ---------------------------------------------------------------------------
+
+def _parse_price_int(s) -> int:
+    """Parse '¥1,000' or '1000円' → 1000. Returns 0 on failure."""
+    if not s:
+        return 0
+    try:
+        return int(re.sub(r"[¥,\s円]", "", s))
+    except ValueError:
+        return 0
+
+
+def _get_kpi_stats() -> dict:
+    """Return KPI counters for the main dashboard header / sidebar DB pill."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM mercari_products")
+        total = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*) FROM mercari_products "
+            "WHERE status='出品中' AND (visibility_status IS NULL OR visibility_status != 'stopped')"
+        )
+        active = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM mercari_products WHERE status='取引中'")
+        trading = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*) FROM mercari_products WHERE status IN ('売却済み','販売履歴')"
+        )
+        sold = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT price FROM mercari_products WHERE status IN ('売却済み','販売履歴')"
+        )
+        total_sales = sum(
+            _parse_price_int(r[0]) for r in cursor.fetchall()
+        )
+        cursor.execute("SELECT MAX(synced_at) FROM mercari_products")
+        row = cursor.fetchone()
+        last_sync = (row[0] or "")[:16] if row else ""
+        conn.close()
+    except Exception:
+        return {"total": 0, "active": 0, "trading": 0, "sold": 0,
+                "total_sales": 0, "last_sync": "–"}
+    return {
+        "total": total,
+        "active": active,
+        "trading": trading,
+        "sold": sold,
+        "total_sales": total_sales,
+        "last_sync": last_sync or "–",
+    }
+
+
+_NAV_ITEMS = [
+    ("main",     "/",         "🏠", "メイン"),
+    ("products", "/products", "📦", "商品管理"),
+    ("sales",    "/sales",    "📊", "売上分析"),
+    ("ai",       "/ai",       "🤖", "AI 分析"),
+    ("settings", "/settings", "⚙️",  "設定"),
+]
+
+
+def _sidebar(active: str) -> str:
+    items = ""
+    for key, href, icon, label in _NAV_ITEMS:
+        cls = "nav-item active" if key == active else "nav-item"
+        items += (
+            f'<li class="{cls}"><a href="{href}">'
+            f'<span class="nav-icon">{icon}</span>'
+            f'{html_module.escape(label)}</a></li>\n'
+        )
+    return f"""<nav class="sidebar">
+  <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
+  <div class="sidebar-nav"><ul>{items}</ul></div>
+  <div class="sidebar-footer">v1.3.0</div>
+</nav>"""
+
+
+def _page_shell(title: str, active: str, content: str,
+                extra_js: str = "", subtitle: str = "") -> str:
+    """Return a full HTML page with sidebar layout."""
+    stats = _get_kpi_stats()
+    sub_html = f'<p>{html_module.escape(subtitle)}</p>' if subtitle else ""
+    return f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{html_module.escape(title)} — Mercari 在庫管理</title>
+  <style>{_CSS}</style>
+</head>
+<body>
+<div class="app-shell">
+  {_sidebar(active)}
+  <div class="page-content">
+    <div class="page-header">
+      <div>
+        <h1>{html_module.escape(title)}</h1>
+        {sub_html}
+      </div>
+      <div class="page-header-actions">
+        <span class="db-pill">DB: {stats['total']} 件</span>
+        <button class="btn-exit" onclick="doShutdown()">終了</button>
+      </div>
+    </div>
+    <div class="page-body">
+      {content}
+    </div>
+  </div>
+</div>
+<script>
+{_SHUTDOWN_JS}
+{extra_js}
+</script>
+</body>
+</html>"""
+
+
 @app.route("/")
 def home():
     global _session_state
@@ -737,136 +987,91 @@ def home():
     if _session_state != "valid":
         return redirect("/login")
 
-    searched      = request.args.get("searched") == "1"
-    q             = request.args.get("q", "").strip()
-    sel_statuses  = request.args.getlist("statuses") or list(FILTER_STATUSES)
-    show_summary  = request.args.get("summary") == "1" and bool(_last_sync_summary)
-    error_param   = request.args.get("error", "")
-    syncing       = request.args.get("syncing") == "1" or _sync_running
+    show_summary = request.args.get("summary") == "1" and bool(_last_sync_summary)
+    error_param  = request.args.get("error", "")
+    syncing      = request.args.get("syncing") == "1" or _sync_running
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM mercari_products")
-    total_db = cursor.fetchone()[0]
-    conn.close()
+    stats = _get_kpi_stats()
 
-    products = _query_products(q, sel_statuses) if searched else []
-    count    = len(products)
+    # ── KPI cards ─────────────────────────────────────────────────────────
+    kpi_html = f"""
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value">{stats['total']}</div>
+        <div class="kpi-label">総商品数</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value green">{stats['active']}</div>
+        <div class="kpi-label">出品中</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value amber">{stats['trading']}</div>
+        <div class="kpi-label">取引中</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value blue">{stats['sold']}</div>
+        <div class="kpi-label">売却済み</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
+        <div class="kpi-label">推定売上合計</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value" style="font-size:14px;letter-spacing:0">
+          {html_module.escape(stats['last_sync'])}
+        </div>
+        <div class="kpi-label">最終同期</div>
+      </div>
+    </div>"""
 
-    if searched:
-        per_status = {}
-        for p in products:
-            s = p[5] or "出品中"
-            vis = p[6] if len(p) > 6 else ""
-            label = "公開停止中" if (s == "出品中" and vis == "stopped") else s
-            per_status[label] = per_status.get(label, 0) + 1
-        status_summary = ", ".join(f"{s}={c}" for s, c in per_status.items())
-        print(f"[search] selected: {', '.join(sel_statuses)}")
-        print(f"[search] result: {status_summary or '0件'} (total={count})")
-
-    # ── sync card checkboxes (only real sync targets) ─────────────────────
+    # ── Sync checkboxes ────────────────────────────────────────────────────
     sync_cbs = ""
     for s in STATUSES:
         sync_cbs += (f'<label class="cb-label">'
                      f'<input type="checkbox" name="statuses" value="{s}" checked> {s}'
                      f'</label>\n')
 
-    # ── search filter checkboxes (FILTER_STATUSES, reflect current selection)
-    search_cbs = ""
-    for s in FILTER_STATUSES:
-        chk = "checked" if s in sel_statuses else ""
-        search_cbs += (f'<label class="cb-label">'
-                       f'<input type="checkbox" name="statuses" value="{s}" {chk}> {s}'
-                       f'</label>\n')
-
-    # ── results section ───────────────────────────────────────────────────
-    if not searched:
-        results_html = ""
-    else:
-        rows_html = _build_result_rows(products)
-        disabled  = 'disabled' if count == 0 else ''
-        empty_row = ("""<tr><td colspan="7">
-            <div class="empty-state">
-              <div class="es-icon">🔍</div>
-              <p>該当する商品が見つかりませんでした</p>
-            </div></td></tr>""" if count == 0 else "")
-
-        results_html = f"""
-        <div class="card">
+    # ── Sync card ──────────────────────────────────────────────────────────
+    if syncing:
+        sync_card = f"""
+        <div class="card" id="sync-card">
           <div class="card-header">
-            <span class="card-title">
-              検索結果
-              <span class="count-badge">{count} 件</span>
-            </span>
-            <div class="export-row">
-              <a class="btn btn-outline" id="export-csv" href="#" {disabled}>
-                ⬇ CSV
-              </a>
-              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>
-                ⬇ Excel
-              </a>
+            <span class="card-title">同期中</span>
+            <span id="sync-pct" class="db-pill"
+                  style="background:rgba(37,99,235,.12);color:#2563eb">…</span>
+          </div>
+          <div class="card-body">
+            <div class="sync-warning">
+              &#9888; 同期中です。ブラウザウィンドウは操作しないでください。
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="progress-fill" style="width:4%"></div>
+            </div>
+            <div class="sync-meta">
+              <span id="sync-step">準備中...</span>
+              <span id="sync-fraction"></span>
             </div>
           </div>
-          <div class="card-body" style="padding:0">
-            <table>
-              <thead>
-                <tr>
-                  <th style="width:40px">#</th>
-                  <th data-sortable data-col="1">商品名</th>
-                  <th data-sortable data-col="2">価格</th>
-                  <th data-sortable data-col="3">状態</th>
-                  <th data-sortable data-col="4">商品登録時間</th>
-                  <th data-sortable data-col="5">抓取時間</th>
-                  <th>リンク</th>
-                </tr>
-              </thead>
-              <tbody>{rows_html}{empty_row}</tbody>
-            </table>
-          </div>
-        </div>"""
-
-    export_js = """
-        const sp = new URLSearchParams(window.location.search);
-        const csv_el  = document.getElementById('export-csv');
-        const xlsx_el = document.getElementById('export-xlsx');
-        if (csv_el  && !csv_el.hasAttribute('disabled'))
-            csv_el.href  = '/export/csv?'  + sp.toString();
-        if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
-            xlsx_el.href = '/export/xlsx?' + sp.toString();
-    """ if searched else ""
-
-    # ── sync summary modal ────────────────────────────────────────────────
-    if show_summary:
-        s = _last_sync_summary
-        fetched_rows = ""
-        for st, cnt in s.get("per_status", {}).items():
-            fetched_rows += f"<tr><td>取得: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
-        db_rows = ""
-        for st, cnt in s.get("db_by_status", {}).items():
-            db_rows += f"<tr><td>DB: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
-        summary_modal = f"""
-        <div class="modal-overlay" id="summary-modal">
-          <div class="modal-box">
-            <h2>同期完了</h2>
-            <table class="modal-table">
-              <tr><td>開始時刻</td><td>{html_module.escape(s.get('start_jst',''))}</td></tr>
-              <tr><td>終了時刻</td><td>{html_module.escape(s.get('end_jst',''))}</td></tr>
-              <tr><td>所要時間</td><td>{s.get('elapsed', 0)} 秒</td></tr>
-              <tr><td>検出合計</td><td>{s.get('total', 0)} 件</td></tr>
-              <tr><td>新増</td><td>{s.get('inserted', 0)} 件</td></tr>
-              <tr><td>更新</td><td>{s.get('updated', 0)} 件</td></tr>
-              <tr><td>スキップ</td><td>{s.get('skipped', 0)} 件</td></tr>
-              {fetched_rows}
-              <tr><td colspan="2" style="padding-top:6px;font-weight:600;font-size:12px;color:#6b7280">DB合計</td></tr>
-              {db_rows}
-              <tr><td>DB合計</td><td>{s.get('db_total', '–')} 件</td></tr>
-            </table>
-            <button class="modal-close" onclick="document.getElementById('summary-modal').remove()">閉じる</button>
-          </div>
         </div>"""
     else:
-        summary_modal = ""
+        sync_card = f"""
+        <div class="card" id="sync-card">
+          <div class="card-header">
+            <span class="card-title">同期</span>
+          </div>
+          <div class="card-body">
+            <form method="POST" action="/sync">
+              <p class="field-label">同期するステータス</p>
+              <div class="cb-row">{sync_cbs}</div>
+              <button class="btn btn-primary" type="submit"
+                      style="font-size:15px;padding:11px 28px">
+                &#x21BB; 同期を開始
+              </button>
+            </form>
+          </div>
+        </div>"""
 
+    # ── Error banner ───────────────────────────────────────────────────────
     if error_param:
         import urllib.parse
         if error_param == "sync_running":
@@ -881,85 +1086,65 @@ def home():
     else:
         error_banner = ""
 
-    return f"""<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Mercari 在庫管理</title>
-  <style>{_CSS}</style>
-</head>
-<body>
-<header>
-  <div class="header-inner">
-    <div>
-      <h1>Mercari 在庫管理</h1>
-      <p>商品データの同期・検索・エクスポート</p>
-    </div>
-    <div style="display:flex;gap:10px;align-items:center">
-      <span class="db-pill">DB: {total_db} 件</span>
-      <button class="btn-exit" onclick="doShutdown()">終了</button>
-    </div>
-  </div>
-</header>
-<main>
+    # ── Sync summary modal ─────────────────────────────────────────────────
+    if show_summary:
+        s = _last_sync_summary
+        fetched_rows = "".join(
+            f"<tr><td>取得: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
+            for st, cnt in s.get("per_status", {}).items()
+        )
+        db_rows = "".join(
+            f"<tr><td>DB: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
+            for st, cnt in s.get("db_by_status", {}).items()
+        )
+        summary_modal = f"""
+        <div class="modal-overlay" id="summary-modal">
+          <div class="modal-box">
+            <h2>同期完了</h2>
+            <table class="modal-table">
+              <tr><td>開始時刻</td><td>{html_module.escape(s.get('start_jst',''))}</td></tr>
+              <tr><td>終了時刻</td><td>{html_module.escape(s.get('end_jst',''))}</td></tr>
+              <tr><td>所要時間</td><td>{s.get('elapsed', 0)} 秒</td></tr>
+              <tr><td>検出合計</td><td>{s.get('total', 0)} 件</td></tr>
+              <tr><td>新増</td><td>{s.get('inserted', 0)} 件</td></tr>
+              <tr><td>更新</td><td>{s.get('updated', 0)} 件</td></tr>
+              <tr><td>スキップ</td><td>{s.get('skipped', 0)} 件</td></tr>
+              {fetched_rows}
+              <tr><td colspan="2"
+                  style="padding-top:6px;font-weight:600;font-size:12px;color:#6b7280">
+                DB合計</td></tr>
+              {db_rows}
+              <tr><td>DB合計</td><td>{s.get('db_total', '–')} 件</td></tr>
+            </table>
+            <button class="modal-close"
+                    onclick="document.getElementById('summary-modal').remove()">
+              閉じる
+            </button>
+          </div>
+        </div>"""
+    else:
+        summary_modal = ""
 
-  {error_banner}
+    content = f"""
+    {error_banner}
+    {kpi_html}
+    {sync_card}
+    {summary_modal}"""
 
-  <!-- Sync card -->
-  <div class="card" id="sync-card">
-    <div class="card-header">
-      <span class="card-title">{"同期中" if syncing else "同期設定"}</span>
-      {"" if not syncing else '<span id="sync-pct" class="db-pill" style="background:rgba(37,99,235,.12);color:#2563eb">…</span>'}
-    </div>
-    <div class="card-body">
-      {"" if not syncing else '''
-      <div class="progress-track"><div class="progress-fill" id="progress-fill" style="width:4%"></div></div>
-      <div class="sync-meta">
-        <span id="sync-step">準備中...</span>
-        <span id="sync-fraction"></span>
-      </div>'''}
-      <form method="POST" action="/sync" {"style='display:none'" if syncing else ""}>
-        <p class="field-label">同期するステータス</p>
-        <div class="cb-row">{sync_cbs}</div>
-        <button class="btn btn-primary" type="submit">&#x21BB; 同期を開始</button>
-      </form>
-    </div>
-  </div>
+    extra_js = f"""
+(function() {{
+  var form = document.querySelector('form[action="/sync"]');
+  if (form) {{
+    form.addEventListener('submit', function() {{
+      var btn = form.querySelector('button[type="submit"]');
+      if (btn) {{ btn.disabled = true; btn.textContent = '同期中...'; }}
+    }});
+  }}
+}})();
+{"" if not syncing else _SYNC_POLL_JS}"""
 
-  <!-- Search card (sticky) -->
-  <div class="card" id="search-card">
-    <div class="card-header">
-      <span class="card-title">商品を検索</span>
-    </div>
-    <div class="card-body">
-      <form method="GET" action="/">
-        <input type="hidden" name="searched" value="1">
-        <div class="search-row">
-          <input class="text-input" type="text" name="q"
-                 placeholder="商品名で検索…" value="{html_module.escape(q)}">
-          <button class="btn btn-primary" type="submit">検索</button>
-        </div>
-        <p class="field-label">ステータスで絞り込み</p>
-        <div class="cb-row">{search_cbs}</div>
-      </form>
-    </div>
-  </div>
-
-  {results_html}
-
-</main>
-{summary_modal}
-<script>
-{_STICKY_JS}
-{_SHUTDOWN_JS}
-{_SORT_JS}
-{_OPEN_LINK_JS}
-{export_js}
-{"" if not syncing else _SYNC_POLL_JS}
-</script>
-</body>
-</html>"""
+    return _page_shell("メインダッシュボード", "main", content, extra_js,
+                       subtitle="同期・KPIモニタリング")
 
 
 @app.route("/sync", methods=["POST"])
@@ -1259,6 +1444,506 @@ def export_xlsx():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=mercari_export.xlsx"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Product Management page
+# ---------------------------------------------------------------------------
+
+@app.route("/products")
+def products_page():
+    if _session_state != "valid":
+        return redirect("/login")
+
+    searched     = request.args.get("searched") == "1"
+    q            = request.args.get("q", "").strip()
+    sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
+    price_min    = request.args.get("price_min", "").strip()
+    price_max    = request.args.get("price_max", "").strip()
+
+    products = _query_products(q, sel_statuses) if searched else []
+
+    if searched and (price_min or price_max):
+        filtered = []
+        for p in products:
+            v = _parse_price_int(p[1])
+            if price_min:
+                try:
+                    if v < int(price_min):
+                        continue
+                except ValueError:
+                    pass
+            if price_max:
+                try:
+                    if v > int(price_max):
+                        continue
+                except ValueError:
+                    pass
+            filtered.append(p)
+        products = filtered
+
+    count = len(products)
+
+    if searched:
+        per_status = {}
+        for p in products:
+            s = p[5] or "出品中"
+            vis = p[6] if len(p) > 6 else ""
+            label = "公開停止中" if (s == "出品中" and vis == "stopped") else s
+            per_status[label] = per_status.get(label, 0) + 1
+        status_summary = ", ".join(f"{s}={c}" for s, c in per_status.items())
+        print(f"[products] selected: {', '.join(sel_statuses)}")
+        print(f"[products] result: {status_summary or '0件'} (total={count})")
+
+    search_cbs = ""
+    for s in FILTER_STATUSES:
+        chk = "checked" if s in sel_statuses else ""
+        search_cbs += (f'<label class="cb-label">'
+                       f'<input type="checkbox" name="statuses" value="{s}" {chk}> {s}'
+                       f'</label>\n')
+
+    search_card = f"""
+    <div class="card" id="search-card">
+      <div class="card-header">
+        <span class="card-title">商品を検索</span>
+      </div>
+      <div class="card-body">
+        <form method="GET" action="/products">
+          <input type="hidden" name="searched" value="1">
+          <div class="search-row">
+            <input class="text-input" type="text" name="q"
+                   placeholder="商品名で検索…" value="{html_module.escape(q)}">
+            <button class="btn btn-primary" type="submit">検索</button>
+          </div>
+          <p class="field-label">ステータスで絞り込み</p>
+          <div class="cb-row">{search_cbs}</div>
+          <div style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
+            <span class="field-label" style="margin:0;white-space:nowrap">価格範囲</span>
+            <input class="text-input" type="number" name="price_min"
+                   placeholder="最低価格 (円)" value="{html_module.escape(price_min)}"
+                   style="flex:0 0 150px">
+            <span style="color:var(--muted)">〜</span>
+            <input class="text-input" type="number" name="price_max"
+                   placeholder="最高価格 (円)" value="{html_module.escape(price_max)}"
+                   style="flex:0 0 150px">
+          </div>
+        </form>
+      </div>
+    </div>"""
+
+    if not searched:
+        results_html = ""
+        export_js = ""
+    else:
+        rows_html = _build_result_rows(products)
+        disabled  = "disabled" if count == 0 else ""
+        empty_row = (
+            '<tr><td colspan="7"><div class="empty-state">'
+            '<div class="es-icon">🔍</div>'
+            '<p>該当する商品が見つかりませんでした</p>'
+            '</div></td></tr>'
+        ) if count == 0 else ""
+        results_html = f"""
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">検索結果
+              <span class="count-badge">{count} 件</span>
+            </span>
+            <div class="export-row">
+              <a class="btn btn-outline" id="export-csv" href="#" {disabled}>⬇ CSV</a>
+              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>⬇ Excel</a>
+            </div>
+          </div>
+          <div class="card-body" style="padding:0">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:40px">#</th>
+                  <th data-sortable data-col="1">商品名</th>
+                  <th data-sortable data-col="2">価格</th>
+                  <th data-sortable data-col="3">状態</th>
+                  <th data-sortable data-col="4">商品登録時間</th>
+                  <th data-sortable data-col="5">抓取時間</th>
+                  <th>リンク</th>
+                </tr>
+              </thead>
+              <tbody>{rows_html}{empty_row}</tbody>
+            </table>
+          </div>
+        </div>"""
+        export_js = """
+const sp = new URLSearchParams(window.location.search);
+const csv_el  = document.getElementById('export-csv');
+const xlsx_el = document.getElementById('export-xlsx');
+if (csv_el  && !csv_el.hasAttribute('disabled'))
+    csv_el.href  = '/export/csv?'  + sp.toString();
+if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
+    xlsx_el.href = '/export/xlsx?' + sp.toString();"""
+
+    content  = search_card + "\n" + results_html
+    extra_js = f"{_STICKY_JS}\n{_SORT_JS}\n{_OPEN_LINK_JS}\n{export_js}"
+    return _page_shell("商品管理", "products", content, extra_js,
+                       subtitle="商品の検索・エクスポート")
+
+
+# ---------------------------------------------------------------------------
+# Sales Performance page
+# ---------------------------------------------------------------------------
+
+@app.route("/sales")
+def sales_page():
+    if _session_state != "valid":
+        return redirect("/login")
+
+    range_param = request.args.get("range", "all")
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    if range_param == "30d":
+        cutoff = (datetime.now(tz=_JST) - timedelta(days=30)).strftime("%Y-%m-%d")
+        cursor.execute(
+            "SELECT title, price, status, created_at, synced_at "
+            "FROM mercari_products "
+            "WHERE status IN ('売却済み','販売履歴') AND synced_at >= ?",
+            (cutoff,),
+        )
+    else:
+        cursor.execute(
+            "SELECT title, price, status, created_at, synced_at "
+            "FROM mercari_products WHERE status IN ('売却済み','販売履歴')"
+        )
+    rows = cursor.fetchall()
+    conn.close()
+
+    valid_prices = [_parse_price_int(r[1]) for r in rows if _parse_price_int(r[1]) > 0]
+    total_sales  = sum(valid_prices)
+    sold_count   = len(rows)
+    avg_price    = (sum(valid_prices) // len(valid_prices)) if valid_prices else 0
+    est_fee      = int(total_sales * 0.10)
+    est_profit   = total_sales - est_fee
+
+    kpi_html = f"""
+    <div class="sales-kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-value red" style="font-size:20px">¥{total_sales:,}</div>
+        <div class="kpi-label">売上合計（推定）</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value blue">{sold_count}</div>
+        <div class="kpi-label">売却件数</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value" style="font-size:20px">¥{avg_price:,}</div>
+        <div class="kpi-label">平均単価</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value amber" style="font-size:20px">¥{est_fee:,}</div>
+        <div class="kpi-label">推定手数料（10%）</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value green" style="font-size:20px">¥{est_profit:,}</div>
+        <div class="kpi-label">推定利益（手数料後）</div>
+      </div>
+    </div>"""
+
+    pie_data = json.dumps([
+        {"label": "推定利益 (90%)", "value": est_profit, "color": "#22c55e"},
+        {"label": "手数料 (10%)",   "value": est_fee,    "color": "#f59e0b"},
+    ]) if total_sales > 0 else "[]"
+
+    range_all = "btn btn-primary" if range_param != "30d" else "btn btn-outline"
+    range_30d = "btn btn-primary" if range_param == "30d" else "btn btn-outline"
+    filter_html = f"""
+    <div style="display:flex;gap:8px">
+      <a class="{range_all}" href="/sales?range=all">全期間</a>
+      <a class="{range_30d}" href="/sales?range=30d">過去30日</a>
+    </div>"""
+
+    chart_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">売上内訳（推定）</span></div>
+      <div class="card-body">
+        <div class="chart-wrap">
+          <canvas id="pie-chart" width="200" height="200"></canvas>
+          <div class="chart-legend" id="pie-legend"></div>
+        </div>
+        <p style="font-size:12px;color:var(--muted);text-align:center;margin-top:4px">
+          ※ 手数料はMercari標準（10%）で推定。送料データは現在非対応です。
+        </p>
+      </div>
+    </div>"""
+
+    table_rows = ""
+    for r in rows:
+        title, price, status, created_at, synced_at = r
+        badge = _badge_html(status)
+        table_rows += (
+            f"<tr>"
+            f"<td>{html_module.escape(title or '')}</td>"
+            f"<td class='price'>{html_module.escape(price or '')}</td>"
+            f"<td>{badge}</td>"
+            f"<td style='color:var(--muted)'>{html_module.escape(created_at or '')}</td>"
+            f"<td style='font-size:12px;color:var(--muted)'>"
+            f"{html_module.escape((synced_at or '')[:16])}</td>"
+            f"</tr>"
+        )
+    if not table_rows:
+        table_rows = (
+            '<tr><td colspan="5"><div class="empty-state">'
+            '<div class="es-icon">📊</div>'
+            '<p>売却済み商品がありません</p>'
+            '</div></td></tr>'
+        )
+
+    table_card = f"""
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">売却商品一覧
+          <span class="count-badge">{sold_count} 件</span>
+        </span>
+      </div>
+      <div class="card-body" style="padding:0">
+        <table>
+          <thead>
+            <tr>
+              <th data-sortable data-col="0">商品名</th>
+              <th data-sortable data-col="1">価格</th>
+              <th data-sortable data-col="2">状態</th>
+              <th data-sortable data-col="3">商品登録日</th>
+              <th data-sortable data-col="4">最終確認</th>
+            </tr>
+          </thead>
+          <tbody>{table_rows}</tbody>
+        </table>
+      </div>
+    </div>"""
+
+    content  = f"{filter_html}\n{kpi_html}\n{chart_card}\n{table_card}"
+    extra_js = f"var _PIE_DATA = {pie_data};\n{_SALES_PIE_JS}\n{_SORT_JS}"
+    return _page_shell("売上分析", "sales", content, extra_js,
+                       subtitle="売却済み商品の実績")
+
+
+# ---------------------------------------------------------------------------
+# AI Analysis page
+# ---------------------------------------------------------------------------
+
+@app.route("/ai")
+def ai_page():
+    if _session_state != "valid":
+        return redirect("/login")
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT title, price, item_url FROM mercari_products "
+        "WHERE status='出品中' AND visibility_status='stopped' ORDER BY synced_at DESC"
+    )
+    stopped_items = cursor.fetchall()
+
+    sixty_ago = (datetime.now(tz=_JST) - timedelta(days=60)).strftime("%Y-%m-%d")
+    cursor.execute(
+        "SELECT title, price, item_url, created_at FROM mercari_products "
+        "WHERE status='出品中' AND (visibility_status IS NULL OR visibility_status!='stopped') "
+        "AND created_at <= ? AND created_at != '' ORDER BY created_at ASC LIMIT 50",
+        (sixty_ago,),
+    )
+    long_items = cursor.fetchall()
+
+    cursor.execute(
+        "SELECT price FROM mercari_products "
+        "WHERE status='出品中' AND (visibility_status IS NULL OR visibility_status!='stopped')"
+    )
+    active_prices = [_parse_price_int(r[0]) for r in cursor.fetchall() if _parse_price_int(r[0]) > 0]
+    avg_active = (sum(active_prices) // len(active_prices)) if active_prices else 0
+
+    if avg_active > 0:
+        cursor.execute(
+            "SELECT title, price, item_url FROM mercari_products "
+            "WHERE status='出品中' AND (visibility_status IS NULL OR visibility_status!='stopped') "
+            "ORDER BY id DESC"
+        )
+        all_active = cursor.fetchall()
+        high_items = [(t, p, u) for t, p, u in all_active
+                      if _parse_price_int(p) >= avg_active * 2][:20]
+        low_items  = [(t, p, u) for t, p, u in all_active
+                      if 0 < _parse_price_int(p) <= avg_active // 2][:20]
+    else:
+        high_items = low_items = []
+
+    cursor.execute(
+        "SELECT title, price, item_url FROM mercari_products "
+        "WHERE status IN ('売却済み','販売履歴') ORDER BY id DESC LIMIT 100"
+    )
+    top_sold = sorted(cursor.fetchall(),
+                      key=lambda r: _parse_price_int(r[1]), reverse=True)[:10]
+    conn.close()
+
+    def _ai_table(items, has_date=False):
+        if not items:
+            return ('<p style="font-size:13px;color:var(--muted);padding:10px 20px 14px">'
+                    '該当商品なし</p>')
+        rows = ""
+        for item in items:
+            title = html_module.escape(item[0] or "")
+            price = html_module.escape(item[1] or "")
+            url   = item[2] or ""
+            link  = (f'<a class="link-btn open-link" href="#" '
+                     f'data-url="{html_module.escape(url)}">開く ↗</a>'
+                     if url else "")
+            date_td = ""
+            if has_date and len(item) > 3:
+                date_td = (f'<td style="font-size:12px;color:var(--muted)">'
+                           f'{html_module.escape(str(item[3] or ""))}</td>')
+            rows += (f"<tr><td>{title}</td>"
+                     f"<td class='price'>{price}</td>"
+                     f"{date_td}"
+                     f"<td>{link}</td></tr>")
+        date_th = "<th>出品日</th>" if has_date else ""
+        return (f'<div style="overflow-x:auto"><table><thead><tr>'
+                f'<th data-sortable data-col="0">商品名</th>'
+                f'<th data-sortable data-col="1">価格</th>'
+                f'{date_th}<th>リンク</th>'
+                f'</tr></thead><tbody>{rows}</tbody></table></div>')
+
+    def _section(icon, title, count, tip, table_html):
+        badge = (f'<span class="suggestion-badge">{count} 件</span>'
+                 if count > 0 else "")
+        return f"""
+        <div class="suggestion-card">
+          <div class="suggestion-header">
+            <span class="suggestion-icon">{icon}</span>
+            <span class="suggestion-title">{html_module.escape(title)}</span>
+            {badge}
+          </div>
+          <p class="suggestion-tip">{tip}</p>
+          {table_html}
+        </div>"""
+
+    sections = [
+        _section(
+            "🚫", "公開停止中商品", len(stopped_items),
+            "出品が停止されています。再開するか、商品リストを整理することをお勧めします。",
+            _ai_table(stopped_items),
+        ),
+        _section(
+            "⏳", "長期出品中（60日以上）", len(long_items),
+            "60日以上出品中の商品です。価格の見直し・商品説明の更新を検討してください。",
+            _ai_table(long_items, has_date=True),
+        ),
+        _section(
+            "💰", f"高価格帯（平均 ¥{avg_active:,} の2倍以上）", len(high_items),
+            "平均価格の2倍以上の商品です。競合価格と比較し、適切な価格設定か確認してください。",
+            _ai_table(high_items),
+        ),
+        _section(
+            "📉", f"低価格帯（平均 ¥{avg_active:,} の50%以下）", len(low_items),
+            "平均価格の半値以下の商品です。値上げの余地がある可能性があります。",
+            _ai_table(low_items),
+        ),
+        _section(
+            "🏆", "高売上商品 TOP 10", len(top_sold),
+            "売却額上位の商品です。仕入れ・出品の参考にしてください。",
+            _ai_table(top_sold),
+        ),
+    ]
+
+    content = "\n".join(sections)
+    return _page_shell("AI 分析", "ai", content, _SORT_JS,
+                       subtitle="商品データに基づく改善提案")
+
+
+# ---------------------------------------------------------------------------
+# Settings page
+# ---------------------------------------------------------------------------
+
+@app.route("/settings")
+def settings_page():
+    if _session_state != "valid":
+        return redirect("/login")
+
+    _state_map = {
+        "valid":   ("✓ ログイン済み", "#dcfce7", "#166534"),
+        "invalid": ("✗ 未ログイン",   "#fee2e2", "#991b1b"),
+    }
+    state_label, badge_bg, badge_fg = _state_map.get(
+        _session_state, (_session_state, "#f3f4f6", "#374151")
+    )
+    state_badge = (f'<span class="badge" style="background:{badge_bg};color:{badge_fg}">'
+                   f'{html_module.escape(state_label)}</span>')
+
+    app_data_dir = os.path.dirname(os.path.abspath(DB_NAME)) if DB_NAME else "不明"
+
+    info_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">セッション情報</span></div>
+      <div class="card-body">
+        <div class="settings-row">
+          <span class="settings-label">ログイン状態</span>
+          {state_badge}
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">最終ログイン</span>
+          <span class="settings-value">
+            {html_module.escape(_session_last_login or "不明")}
+          </span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">Chromeプロファイル</span>
+          <span class="settings-path">
+            {html_module.escape(CHROME_PROFILE_DIR or "未設定")}
+          </span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">データ保存先</span>
+          <span class="settings-path">
+            {html_module.escape(app_data_dir)}
+          </span>
+        </div>
+      </div>
+    </div>"""
+
+    actions_card = """
+    <div class="card">
+      <div class="card-header"><span class="card-title">セッション操作</span></div>
+      <div class="card-body">
+        <div style="display:flex;flex-direction:column;gap:12px;max-width:360px">
+          <form method="POST" action="/login/relogin">
+            <button class="btn btn-outline" type="submit"
+                    style="width:100%;justify-content:center">
+              再ログイン（セッション更新）
+            </button>
+          </form>
+          <form method="POST" action="/login/clear">
+            <button class="btn btn-danger" type="submit"
+                    style="width:100%;justify-content:center"
+                    onclick="return confirm('ログインデータを削除しますか?\\nChromeプロファイルとCookieが削除されます。')">
+              ログインデータを削除
+            </button>
+          </form>
+        </div>
+        <p style="margin-top:16px;font-size:12px;color:var(--muted)">
+          &#9888; 削除されるのはアプリ専用のChromeプロファイルのみです。
+          システムのChromeには影響しません。
+        </p>
+      </div>
+    </div>"""
+
+    app_card = """
+    <div class="card">
+      <div class="card-header"><span class="card-title">アプリ情報</span></div>
+      <div class="card-body">
+        <div class="settings-row">
+          <span class="settings-label">バージョン</span>
+          <span class="settings-value">v1.3.0</span>
+        </div>
+      </div>
+    </div>"""
+
+    content = f"{info_card}\n{actions_card}\n{app_card}"
+    return _page_shell("設定", "settings", content,
+                       subtitle="セッション管理・アプリ情報")
 
 
 # ---------------------------------------------------------------------------
