@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import queue
@@ -21,6 +22,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 DB_NAME = "products.db"
+COOKIE_FILE = "mercari_session.json"   # patched to absolute path by main.py
 MAX_WORKERS = 4
 MAX_RETRY = 3
 
@@ -32,10 +34,78 @@ _LONG_TIMEOUT_STATUSES = {"売却済み", "販売履歴"}
 # Populated at the end of each sync run; read by home() to show the popup
 _last_sync_summary: dict = {}
 
+# Guard against concurrent sync requests
+_sync_running = False
+
 
 def jst_now() -> str:
     """Return the current time in JST as 'YYYY-MM-DD HH:MM:SS'."""
     return datetime.now(tz=_JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Session / cookie helpers
+# ---------------------------------------------------------------------------
+
+def _save_session_cookies(driver) -> None:
+    """Persist Mercari session cookies to COOKIE_FILE for later re-use."""
+    if not COOKIE_FILE:
+        return
+    try:
+        cookies = driver.get_cookies()
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False)
+        print(f"[session] クッキーを保存しました ({len(cookies)} 件): {COOKIE_FILE}")
+    except Exception as e:
+        print(f"[session] クッキー保存失敗: {e}")
+
+
+def _inject_saved_cookies(driver) -> bool:
+    """Load cookies from COOKIE_FILE and inject them into driver.
+
+    The driver must already have navigated to jp.mercari.com (or any page on
+    the domain) before cookies can be added; this function handles that
+    navigation internally.
+    Returns True if cookies were loaded from disk.
+    """
+    if not COOKIE_FILE or not os.path.exists(COOKIE_FILE):
+        return False
+    try:
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+    except Exception:
+        return False
+    if not cookies:
+        return False
+
+    driver.get("https://jp.mercari.com")
+    time.sleep(0.8)
+    safe_keys = {"name", "value", "domain", "path", "secure", "httpOnly"}
+    for cookie in cookies:
+        try:
+            driver.add_cookie({k: v for k, v in cookie.items() if k in safe_keys})
+        except Exception:
+            pass
+    return True
+
+
+def _try_restore_session(driver) -> bool:
+    """Inject saved cookies then verify the session is still valid.
+
+    Navigates to /mypage/listings after injecting cookies. Returns True if the
+    browser stays on mypage (session valid) rather than being redirected to the
+    login page.
+    """
+    if not _inject_saved_cookies(driver):
+        return False
+    driver.get("https://jp.mercari.com/mypage/listings")
+    time.sleep(2)
+    valid = "login" not in driver.current_url
+    if valid:
+        print("[session] 保存済みセッションを復元しました（ログイン不要）")
+    else:
+        print("[session] 保存済みセッションが期限切れです。再ログインが必要です。")
+    return valid
 
 
 app = Flask(__name__)
@@ -257,6 +327,11 @@ tbody tr:hover { background: #f9fafb; }
                border: none; border-radius: 8px; font-size: 14px; font-weight: 600;
                cursor: pointer; transition: background .15s; }
 .modal-close:hover { background: #1d4ed8; }
+/* Sortable column headers */
+thead th[data-sortable] { cursor: pointer; user-select: none; white-space: nowrap; }
+thead th[data-sortable]:hover { background: #f1f5f9; }
+thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
+.sort-icon { font-size: 10px; color: #d1d5db; margin-left: 4px; }
 """
 
 # JS that keeps the sticky table header just below the sticky search card.
@@ -297,6 +372,86 @@ function doShutdown() {
 }
 """
 
+# Client-side column sort — sortable on all columns except # and リンク.
+# Price column uses data-sort with the raw numeric value for correct ordering.
+_SORT_JS = """
+(function() {
+  var _sortCol = -1;
+  var _sortAsc  = true;
+
+  function sortTable(colIdx) {
+    var tbody = document.querySelector('table tbody');
+    if (!tbody) return;
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr')).filter(function(r) {
+      return r.querySelectorAll('td').length > 1;
+    });
+    if (!rows.length) return;
+
+    _sortAsc = (_sortCol === colIdx) ? !_sortAsc : true;
+    _sortCol = colIdx;
+
+    // Update sort icons
+    document.querySelectorAll('thead th[data-sortable]').forEach(function(th) {
+      var icon = th.querySelector('.sort-icon');
+      if (!icon) return;
+      var idx = parseInt(th.getAttribute('data-col'), 10);
+      if (idx === colIdx) {
+        icon.textContent = _sortAsc ? ' ▲' : ' ▼';
+        icon.style.color = 'var(--primary)';
+      } else {
+        icon.textContent = ' ⇅';
+        icon.style.color = '#d1d5db';
+      }
+    });
+
+    rows.sort(function(a, b) {
+      var aCell = a.querySelectorAll('td')[colIdx];
+      var bCell = b.querySelectorAll('td')[colIdx];
+      if (!aCell || !bCell) return 0;
+      var aVal = aCell.getAttribute('data-sort') || aCell.textContent.trim();
+      var bVal = bCell.getAttribute('data-sort') || bCell.textContent.trim();
+      var aNum = parseFloat(aVal.replace(/[¥,]/g, ''));
+      var bNum = parseFloat(bVal.replace(/[¥,]/g, ''));
+      var cmp = (!isNaN(aNum) && !isNaN(bNum))
+        ? (aNum - bNum)
+        : aVal.localeCompare(bVal, 'ja');
+      return _sortAsc ? cmp : -cmp;
+    });
+    rows.forEach(function(r) { tbody.appendChild(r); });
+  }
+
+  document.querySelectorAll('thead th[data-sortable]').forEach(function(th) {
+    var icon = document.createElement('span');
+    icon.className = 'sort-icon';
+    icon.textContent = ' ⇅';
+    th.appendChild(icon);
+    th.addEventListener('click', function() {
+      sortTable(parseInt(th.getAttribute('data-col'), 10));
+    });
+  });
+})();
+"""
+
+# Open-link handler: sends a fetch to /open so the backend launches Chrome
+# with the saved Mercari session; also handles sync-form loading state.
+_OPEN_LINK_JS = """
+document.addEventListener('click', function(e) {
+  var link = e.target.closest('.open-link');
+  if (!link) return;
+  e.preventDefault();
+  fetch('/open?url=' + encodeURIComponent(link.getAttribute('data-url')))
+    .catch(function() {});
+});
+(function() {
+  var form = document.querySelector('form[action="/sync"]');
+  if (!form) return;
+  form.addEventListener('submit', function() {
+    var btn = form.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = '同期中...'; }
+  });
+})();
+"""
+
 
 def _badge_html(status, visibility_status=""):
     # 出品中 items with visibility_status='stopped' display as 公開停止中
@@ -309,25 +464,34 @@ def _badge_html(status, visibility_status=""):
     return f'<span class="badge" style="background:{bg};color:{fg}">{s}</span>'
 
 
+def _price_sort_val(raw: str) -> str:
+    """Strip ¥ and commas to get a numeric string for data-sort."""
+    return re.sub(r"[¥,]", "", raw or "") or "0"
+
+
 def _build_result_rows(products):
     rows = ""
     for i, p in enumerate(products, start=1):
         title      = html_module.escape(p[0] or "名称未取得")
-        price      = html_module.escape(p[1] or "—")
+        raw_price  = p[1] or "—"
+        price      = html_module.escape(raw_price)
+        price_sort = _price_sort_val(raw_price)
         url        = html_module.escape(p[2] or "")
         created    = html_module.escape(p[3] or "—")
         synced     = html_module.escape(p[4] or "—")
         vis_status = p[6] if len(p) > 6 else ""
-        badge      = _badge_html(p[5] or "", vis_status or "")
+        status_val = p[5] or ""
+        display_status = "公開停止中" if (status_val == "出品中" and vis_status == "stopped") else status_val
+        badge = _badge_html(status_val, vis_status or "")
         rows += f"""
         <tr>
           <td style="color:var(--muted);font-size:12px">{i}</td>
           <td>{title}</td>
-          <td class="price">{price}</td>
-          <td>{badge}</td>
+          <td class="price" data-sort="{price_sort}">{price}</td>
+          <td data-sort="{html_module.escape(display_status)}">{badge}</td>
           <td style="color:var(--muted)">{created}</td>
           <td style="color:var(--muted)">{synced}</td>
-          <td><a class="link-btn" href="{url}" target="_blank">開く ↗</a></td>
+          <td><a class="link-btn open-link" data-url="{url}">開く ↗</a></td>
         </tr>"""
     return rows
 
@@ -407,11 +571,11 @@ def home():
               <thead>
                 <tr>
                   <th style="width:40px">#</th>
-                  <th>商品名</th>
-                  <th>価格</th>
-                  <th>状態</th>
-                  <th>商品登録時間</th>
-                  <th>抓取時間</th>
+                  <th data-sortable data-col="1">商品名</th>
+                  <th data-sortable data-col="2">価格</th>
+                  <th data-sortable data-col="3">状態</th>
+                  <th data-sortable data-col="4">商品登録時間</th>
+                  <th data-sortable data-col="5">抓取時間</th>
                   <th>リンク</th>
                 </tr>
               </thead>
@@ -519,6 +683,8 @@ def home():
 <script>
 {_STICKY_JS}
 {_SHUTDOWN_JS}
+{_SORT_JS}
+{_OPEN_LINK_JS}
 {export_js}
 </script>
 </body>
@@ -527,11 +693,52 @@ def home():
 
 @app.route("/sync", methods=["POST"])
 def sync():
-    selected = request.form.getlist("statuses")
-    if not selected:
-        selected = list(STATUSES)
-    run_scraper(selected_statuses=selected)
+    global _sync_running
+    if _sync_running:
+        return redirect("/?error=sync_running")
+    _sync_running = True
+    try:
+        selected = request.form.getlist("statuses")
+        if not selected:
+            selected = list(STATUSES)
+        run_scraper(selected_statuses=selected)
+    finally:
+        _sync_running = False
     return redirect("/?summary=1")
+
+
+@app.route("/open")
+def open_url():
+    """Open a Mercari product page in Chrome with the saved session injected.
+
+    Launches a new (non-headless) Chrome window, injects the saved Mercari
+    cookies, then navigates to the requested URL. The window stays open for the
+    user to browse. The detach option keeps Chrome alive after the driver is GC'd.
+    """
+    url = request.args.get("url", "")
+    if not url.startswith("https://jp.mercari.com/"):
+        return Response("Invalid URL", status=400)
+
+    def _launch():
+        try:
+            driver = _make_chrome_driver(headless=False, detach=True)
+            if not _inject_saved_cookies(driver):
+                # No saved cookies — navigate directly; user may need to log in
+                driver.get(url)
+            else:
+                driver.get(url)
+        except Exception as exc:
+            print(f"[open] Chrome起動失敗 — fallback to webbrowser: {exc}")
+            webbrowser.open(url)
+
+    threading.Thread(target=_launch, daemon=True).start()
+    # Return a page that closes itself so the /open tab disappears immediately
+    return Response(
+        '<!DOCTYPE html><html><head>'
+        '<script>window.close();setTimeout(function(){window.close();},300);</script>'
+        '</head><body></body></html>',
+        mimetype="text/html",
+    )
 
 
 @app.route("/shutdown", methods=["POST"])
@@ -959,8 +1166,12 @@ def scrape_item_detail(driver, url):
 # Parallel detail fetching
 # ---------------------------------------------------------------------------
 
-def _make_chrome_driver(headless=False):
-    """Create a configured Chrome driver. Workers use headless mode."""
+def _make_chrome_driver(headless=False, detach=False):
+    """Create a configured Chrome driver. Workers use headless mode.
+
+    detach=True keeps the Chrome window open after the Python driver is GC'd
+    (used by the /open route so the browser stays up for the user).
+    """
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
@@ -972,6 +1183,8 @@ def _make_chrome_driver(headless=False):
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2
     })
+    if detach:
+        opts.add_experimental_option("detach", True)
 
     # Scrub PATH of any Homebrew/system chromedriver to force Selenium Manager
     original_path = os.environ.get("PATH", "")
@@ -1110,9 +1323,17 @@ def run_scraper(selected_statuses=None):
     # Phase 1: login with main (visible) driver, collect all listings
     # ------------------------------------------------------------------
     main_driver = _make_chrome_driver(headless=False)
-    main_driver.get("https://jp.mercari.com/login")
-    click_login_button_if_exists(main_driver)
-    wait_for_login(main_driver)
+
+    # Try to restore saved session first; only prompt for login if expired
+    session_restored = _try_restore_session(main_driver)
+    if not session_restored:
+        main_driver.get("https://jp.mercari.com/login")
+        click_login_button_if_exists(main_driver)
+        wait_for_login(main_driver)
+        _save_session_cookies(main_driver)
+    else:
+        # Refresh cookies even on a restored session so the file stays current
+        _save_session_cookies(main_driver)
 
     phase1_start = time.time()
     items, per_status_counts = load_all_listings(main_driver, selected_statuses)
