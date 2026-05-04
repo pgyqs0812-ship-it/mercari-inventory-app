@@ -24,8 +24,14 @@ from selenium.webdriver.support import expected_conditions as EC
 DB_NAME          = "products.db"
 COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
 CHROME_PROFILE_DIR = ""                    # patched to absolute path by main.py
+LICENSE_FILE     = "license.json"          # patched to absolute path by main.py
 MAX_WORKERS = 4
 MAX_RETRY   = 3
+
+# Monetization constants
+_TRIAL_DAYS     = 7
+_LICENSE_SECRET = b"mi-inventory-license-v1-secret"
+_license_cache: dict = {}   # in-memory; cleared on every write to license.json
 
 _JST = timezone(timedelta(hours=9))
 
@@ -269,6 +275,154 @@ STATUS_URLS = {
     "売却済み": "https://jp.mercari.com/mypage/listings/completed",
     "販売履歴": "https://jp.mercari.com/mypage/listings/sold",
 }
+
+
+# ---------------------------------------------------------------------------
+# License / monetization helpers
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import hmac as _hmac_mod
+
+
+def _get_license() -> dict:
+    """Read license.json into _license_cache (or return cached value)."""
+    global _license_cache
+    if _license_cache:
+        return _license_cache
+    try:
+        if LICENSE_FILE and os.path.exists(LICENSE_FILE):
+            with open(LICENSE_FILE, "r", encoding="utf-8") as f:
+                _license_cache = json.load(f)
+    except Exception:
+        _license_cache = {}
+    return _license_cache
+
+
+def _save_license(state: dict) -> None:
+    """Write license.json and refresh in-memory cache."""
+    global _license_cache
+    _license_cache = {}          # clear first so next _get_license re-reads
+    _license_cache = state.copy()
+    if LICENSE_FILE:
+        try:
+            with open(LICENSE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"[license] 保存失敗: {exc}")
+
+
+def init_license() -> None:
+    """Create license.json on first launch (records trial start).
+    Called once from main.py after paths are patched."""
+    global _license_cache
+    _license_cache = {}          # force re-read from (possibly newly patched) path
+    state = _get_license()
+    if not state.get("first_launch"):
+        state = {
+            "first_launch":    datetime.now(_JST).isoformat(),
+            "plan":            "trial",
+            "activated_at":    None,
+            "last_sync_date":  None,
+        }
+        _save_license(state)
+        print(f"[license] トライアル開始: {state['first_launch']}")
+    else:
+        plan = _check_plan()
+        days = _trial_days_remaining()
+        print(f"[license] プラン: {plan}, トライアル残り: {days} 日")
+
+
+def _check_plan() -> str:
+    """Return the effective plan: trial | expired | free | monthly | lifetime."""
+    state = _get_license()
+    plan  = state.get("plan", "trial")
+    if plan == "trial":
+        first = state.get("first_launch")
+        if first:
+            try:
+                launched = datetime.fromisoformat(first)
+                if (datetime.now(_JST) - launched).days >= _TRIAL_DAYS:
+                    return "expired"
+            except Exception:
+                pass
+    return plan
+
+
+def _trial_days_remaining() -> int:
+    """Return days left in the trial (0 if expired or not in trial)."""
+    state = _get_license()
+    if state.get("plan") not in ("trial", None):
+        return 0
+    first = state.get("first_launch")
+    if not first:
+        return _TRIAL_DAYS
+    try:
+        launched = datetime.fromisoformat(first)
+        elapsed  = (datetime.now(_JST) - launched).days
+        return max(0, _TRIAL_DAYS - elapsed)
+    except Exception:
+        return 0
+
+
+def _is_paid() -> bool:
+    return _check_plan() in ("monthly", "lifetime")
+
+
+def _validate_license_key(key: str) -> tuple:
+    """Validate a license key and return (plan_str, error_str).
+
+    Key format:  MONTHLY-<16 HEX>   or   LIFETIME-<16 HEX>
+    The hex suffix is the first 16 chars of
+    HMAC-SHA256(_LICENSE_SECRET, plan_prefix.lower().encode()).hexdigest().upper()
+    """
+    key = key.strip().upper()
+    for prefix, plan_name in (("MONTHLY", "monthly"), ("LIFETIME", "lifetime")):
+        expected_hex = _hmac_mod.new(
+            _LICENSE_SECRET,
+            prefix.lower().encode(),
+            _hashlib.sha256,
+        ).hexdigest()[:16].upper()
+        expected_key = f"{prefix}-{expected_hex}"
+        if key == expected_key:
+            return plan_name, ""
+    return "", "無効なライセンスキーです。キーを確認してもう一度お試しください。"
+
+
+def _license_badge_html() -> str:
+    """Return an HTML pill showing current plan status for the Main page."""
+    plan = _check_plan()
+    if plan == "trial":
+        days = _trial_days_remaining()
+        bg, fg = "#fef3c7", "#92400e"
+        label  = f"トライアル: 残り {days} 日"
+    elif plan == "expired":
+        bg, fg = "#fee2e2", "#991b1b"
+        label  = "トライアル終了 — アップグレードが必要です"
+    elif plan == "free":
+        bg, fg = "#f3f4f6", "#374151"
+        label  = "無料版"
+    elif plan == "monthly":
+        bg, fg = "#dcfce7", "#166534"
+        label  = "Pro 月額プラン"
+    elif plan == "lifetime":
+        bg, fg = "#dcfce7", "#166534"
+        label  = "Pro 買い切り"
+    else:
+        bg, fg = "#f3f4f6", "#374151"
+        label  = plan
+    return (
+        f'<span class="badge" style="background:{bg};color:{fg};'
+        f'font-size:13px;padding:5px 14px;border-radius:20px">'
+        f'{html_module.escape(label)}</span>'
+    )
+
+
+def _record_sync_date() -> None:
+    """Save today's date as last_sync_date in license.json (for free-plan limit)."""
+    state = _get_license()
+    state["last_sync_date"] = datetime.now(_JST).strftime("%Y-%m-%d")
+    _save_license(state)
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +727,37 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
                     border-radius: 20px; padding: 2px 10px; }
 .suggestion-tip { font-size: 13px; color: var(--muted);
                   padding: 10px 20px 4px; line-height: 1.5; }
+/* Upgrade / pricing page */
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+             gap: 20px; margin-top: 4px; }
+.plan-card { background: #fff; border: 2px solid var(--border); border-radius: 16px;
+             padding: 28px 24px; display: flex; flex-direction: column;
+             align-items: center; text-align: center; transition: border-color .2s; }
+.plan-card:hover { border-color: var(--primary); }
+.plan-card.featured { border-color: var(--primary);
+                      box-shadow: 0 4px 20px rgba(37,99,235,.15); }
+.plan-name  { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+.plan-price { font-size: 28px; font-weight: 800; color: var(--primary);
+              letter-spacing: -.5px; margin-bottom: 4px; }
+.plan-price small { font-size: 14px; font-weight: 500; color: var(--muted); }
+.plan-features { font-size: 13px; color: var(--muted); line-height: 1.7;
+                 margin-bottom: 20px; flex: 1; }
+.plan-cta { width: 100%; padding: 11px; font-size: 14px; font-weight: 600;
+            border-radius: 10px; cursor: pointer; border: none;
+            transition: background .15s; }
+.plan-cta-primary { background: var(--primary); color: #fff; }
+.plan-cta-primary:hover { background: var(--primary-h); }
+.plan-cta-outline { background: #fff; color: var(--text);
+                    border: 1.5px solid var(--border); }
+.plan-cta-outline:hover { border-color: var(--primary); color: var(--primary); }
+.upgrade-banner { background: #fef3c7; border: 1px solid #fde68a;
+                  border-radius: 12px; padding: 16px 20px; margin-bottom: 4px;
+                  font-size: 14px; color: #92400e; line-height: 1.6; }
+.upgrade-banner strong { font-weight: 700; }
+/* License key input */
+.license-wrap { max-width: 480px; }
+.license-note { font-size: 13px; color: var(--muted); line-height: 1.7;
+                margin-bottom: 20px; }
 /* Settings */
 .settings-row { display: flex; align-items: flex-start;
                 justify-content: space-between; gap: 16px;
@@ -931,7 +1116,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.3.0</div>
+  <div class="sidebar-footer">v1.4.0</div>
 </nav>"""
 
 
@@ -987,8 +1172,14 @@ def home():
     if _session_state != "valid":
         return redirect("/login")
 
+    # Plan gate: redirect to upgrade screen when trial has expired
+    plan = _check_plan()
+    if plan == "expired":
+        return redirect("/upgrade")
+
     show_summary = request.args.get("summary") == "1" and bool(_last_sync_summary)
     error_param  = request.args.get("error", "")
+    licensed     = request.args.get("licensed") == "1"
     syncing      = request.args.get("syncing") == "1" or _sync_running
 
     stats = _get_kpi_stats()
@@ -1125,8 +1316,19 @@ def home():
     else:
         summary_modal = ""
 
+    licensed_banner = (
+        '<div class="error-banner" style="background:#dcfce7;border-color:#86efac;color:#166534">'
+        '&#10003; ライセンスが有効化されました。すべての機能が利用可能です。'
+        '</div>'
+    ) if licensed else ""
+
     content = f"""
+    {licensed_banner}
     {error_banner}
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <div></div>
+      {_license_badge_html()}
+    </div>
     {kpi_html}
     {sync_card}
     {summary_modal}"""
@@ -1153,6 +1355,13 @@ def sync():
     if _sync_running:
         return redirect("/?error=sync_running")
 
+    # Free-plan daily sync limit
+    if _check_plan() == "free":
+        today = datetime.now(_JST).strftime("%Y-%m-%d")
+        last  = _get_license().get("last_sync_date", "")
+        if last == today:
+            return redirect("/?error=" + "無料版は1日1回の同期制限があります。プランをアップグレードすると無制限に同期できます。")
+
     selected = request.form.getlist("statuses") or list(STATUSES)
     _sync_running = True
     _sync_progress = {
@@ -1169,6 +1378,8 @@ def sync():
         global _sync_running, _sync_progress
         try:
             run_scraper(selected_statuses=selected)
+            if _check_plan() == "free":
+                _record_sync_date()
         except Exception as exc:
             import traceback
             print("[sync] 同期エラー:")
@@ -1447,6 +1658,141 @@ def export_xlsx():
 
 
 # ---------------------------------------------------------------------------
+# Upgrade / pricing page
+# ---------------------------------------------------------------------------
+
+@app.route("/upgrade")
+def upgrade_page():
+    if _session_state != "valid":
+        return redirect("/login")
+
+    plan    = _check_plan()
+    from_pg = request.args.get("from", "")
+
+    if from_pg == "sales":
+        banner_msg = "売上分析は月額プランまたは買い切りプランでご利用いただけます。"
+    elif from_pg == "ai":
+        banner_msg = "AI分析は月額プランまたは買い切りプランでご利用いただけます。"
+    elif plan in ("expired", "free"):
+        banner_msg = "7日間のトライアル期間が終了しました。引き続きご利用にはプランを選択してください。"
+    else:
+        banner_msg = ""
+
+    banner_html = (
+        f'<div class="upgrade-banner"><strong>&#9888; </strong>{html_module.escape(banner_msg)}</div>'
+        if banner_msg else ""
+    )
+
+    free_features = "同期: 1日1回<br>商品管理: ○<br>売上分析: ✗<br>AI分析: ✗"
+    monthly_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○"
+    lifetime_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
+
+    plan_grid = f"""
+    <div class="plan-grid">
+      <div class="plan-card">
+        <div class="plan-name">無料版</div>
+        <div class="plan-price">¥0</div>
+        <div class="plan-features">{free_features}</div>
+        <form method="POST" action="/license/choose-free" style="width:100%">
+          <button class="plan-cta plan-cta-outline" type="submit">無料版で続ける</button>
+        </form>
+      </div>
+      <div class="plan-card featured">
+        <div class="plan-name">月額プラン</div>
+        <div class="plan-price">¥480<small>/月</small></div>
+        <div class="plan-features">{monthly_features}</div>
+        <a class="plan-cta plan-cta-primary" href="/license?plan=monthly"
+           style="display:block;text-decoration:none">
+          月額プランに登録
+        </a>
+      </div>
+      <div class="plan-card">
+        <div class="plan-name">買い切り</div>
+        <div class="plan-price">¥1,980</div>
+        <div class="plan-features">{lifetime_features}</div>
+        <a class="plan-cta plan-cta-primary" href="/license?plan=lifetime"
+           style="display:block;text-decoration:none">
+          今すぐ購入
+        </a>
+      </div>
+    </div>"""
+
+    content = f"{banner_html}\n{plan_grid}"
+    return _page_shell("プランを選択", "main", content,
+                       subtitle="お使いのプランをアップグレードしてすべての機能を利用できます")
+
+
+@app.route("/license/choose-free", methods=["POST"])
+def license_choose_free():
+    """User opts into the free plan (persists so upgrade screen is not shown again)."""
+    state = _get_license()
+    state["plan"] = "free"
+    _save_license(state)
+    return redirect("/")
+
+
+@app.route("/license", methods=["GET", "POST"])
+def license_page():
+    if _session_state != "valid":
+        return redirect("/login")
+
+    plan_hint = request.args.get("plan", "")
+    error_msg = ""
+    success   = False
+
+    if request.method == "POST":
+        key = request.form.get("key", "").strip()
+        plan_name, err = _validate_license_key(key)
+        if err:
+            error_msg = err
+        else:
+            state = _get_license()
+            state["plan"]         = plan_name
+            state["activated_at"] = datetime.now(_JST).isoformat()
+            _save_license(state)
+            return redirect("/?licensed=1")
+
+    plan_label = {"monthly": "月額プラン", "lifetime": "買い切り"}.get(plan_hint, "ライセンス")
+    error_html = (
+        f'<div class="error-banner" style="margin-bottom:16px">'
+        f'<strong>エラー:</strong> {html_module.escape(error_msg)}</div>'
+        if error_msg else ""
+    )
+    note = (
+        "ご購入後、届いたライセンスキーを以下に入力してください。<br>"
+        "キーの形式: <code>MONTHLY-XXXXXXXXXXXXXXXX</code>"
+        " または <code>LIFETIME-XXXXXXXXXXXXXXXX</code>"
+    )
+
+    content = f"""
+    <div class="card license-wrap">
+      <div class="card-header">
+        <span class="card-title">{html_module.escape(plan_label)}のアクティベーション</span>
+      </div>
+      <div class="card-body">
+        {error_html}
+        <p class="license-note">{note}</p>
+        <form method="POST" action="/license">
+          <input type="hidden" name="plan" value="{html_module.escape(plan_hint)}">
+          <div class="search-row" style="margin-bottom:0">
+            <input class="text-input" type="text" name="key"
+                   placeholder="MONTHLY-XXXXXXXXXXXXXXXX"
+                   style="font-family:monospace;letter-spacing:.05em">
+            <button class="btn btn-primary" type="submit">アクティベート</button>
+          </div>
+        </form>
+        <p style="margin-top:16px;font-size:12px;color:var(--muted)">
+          ライセンスキーをお持ちでない場合は
+          <a href="/upgrade" style="color:var(--primary)">プラン選択ページ</a>へ。
+        </p>
+      </div>
+    </div>"""
+
+    return _page_shell(f"{plan_label}のアクティベーション", "settings",
+                       content, subtitle="ライセンスキーを入力して機能を解放します")
+
+
+# ---------------------------------------------------------------------------
 # Product Management page
 # ---------------------------------------------------------------------------
 
@@ -1594,6 +1940,8 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
 def sales_page():
     if _session_state != "valid":
         return redirect("/login")
+    if _check_plan() in ("expired", "free"):
+        return redirect("/upgrade?from=sales")
 
     range_param = request.args.get("range", "all")
 
@@ -1732,6 +2080,8 @@ def sales_page():
 def ai_page():
     if _session_state != "valid":
         return redirect("/login")
+    if _check_plan() in ("expired", "free"):
+        return redirect("/upgrade?from=ai")
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -1930,18 +2280,69 @@ def settings_page():
       </div>
     </div>"""
 
+    # ── Plan info card ────────────────────────────────────────────────────
+    lic          = _get_license()
+    cur_plan     = _check_plan()
+    days_left    = _trial_days_remaining()
+    activated_at = lic.get("activated_at") or "–"
+    if activated_at and activated_at != "–":
+        activated_at = activated_at[:16]
+
+    plan_label_map = {
+        "trial":    f"トライアル（残り {days_left} 日）",
+        "expired":  "トライアル終了",
+        "free":     "無料版",
+        "monthly":  "Pro 月額プラン",
+        "lifetime": "Pro 買い切り",
+    }
+    plan_label = plan_label_map.get(cur_plan, cur_plan)
+    upgrade_link = (
+        '<a href="/upgrade" class="btn btn-primary" '
+        'style="padding:8px 16px;font-size:13px;text-decoration:none">アップグレード</a>'
+        if cur_plan in ("trial", "expired", "free") else ""
+    )
+
+    plan_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">プラン情報</span></div>
+      <div class="card-body">
+        <div class="settings-row">
+          <span class="settings-label">現在のプラン</span>
+          <div style="display:flex;align-items:center;gap:12px">
+            {_license_badge_html()}
+            {upgrade_link}
+          </div>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">プラン詳細</span>
+          <span class="settings-value">{html_module.escape(plan_label)}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">ライセンス有効化日時</span>
+          <span class="settings-value">{html_module.escape(str(activated_at))}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">ライセンスキーを入力</span>
+          <a href="/license" class="btn btn-outline"
+             style="padding:7px 14px;font-size:13px;text-decoration:none">
+            キーを入力
+          </a>
+        </div>
+      </div>
+    </div>"""
+
     app_card = """
     <div class="card">
       <div class="card-header"><span class="card-title">アプリ情報</span></div>
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.3.0</span>
+          <span class="settings-value">v1.4.0</span>
         </div>
       </div>
     </div>"""
 
-    content = f"{info_card}\n{actions_card}\n{app_card}"
+    content = f"{info_card}\n{plan_card}\n{actions_card}\n{app_card}"
     return _page_shell("設定", "settings", content,
                        subtitle="セッション管理・アプリ情報")
 

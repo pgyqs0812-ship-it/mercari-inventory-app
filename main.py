@@ -99,8 +99,10 @@ def main() -> None:
     _ms.DB_NAME          = os.path.join(data_dir, "products.db")
     _ms.COOKIE_FILE      = os.path.join(data_dir, "mercari_session.json")
     _ms.CHROME_PROFILE_DIR = os.path.join(data_dir, "chrome-profile")
-    flask_app = _ms.app
-    init_db = _ms.init_db
+    _ms.LICENSE_FILE     = os.path.join(data_dir, "license.json")
+    flask_app  = _ms.app
+    init_db    = _ms.init_db
+    init_license = _ms.init_license
 
     print("=" * 54)
     print("  Mercari Inventory App")
@@ -117,6 +119,7 @@ def main() -> None:
         return
 
     init_db()
+    init_license()
 
     server = threading.Thread(
         target=lambda: flask_app.run(
