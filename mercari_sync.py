@@ -139,13 +139,26 @@ def _is_driver_alive(driver) -> bool:
 def _get_or_create_driver() -> "webdriver.Chrome":
     """Return the long-lived singleton visible Chrome driver.
 
-    Creates a new instance (with the persistent profile) if one does not exist
-    or if the previous Chrome window was closed by the user.
+    Reuses the existing driver when it is still alive. If it is dead (user
+    closed the Chrome window, or a transient error), the old driver is quit
+    gracefully, stale profile lock files are removed, and a new driver is
+    created. This prevents the 'ChromeDriver setup failed' error on re-sync.
     """
     global _singleton_driver
     with _driver_lock:
-        if _singleton_driver is None or not _is_driver_alive(_singleton_driver):
+        if _singleton_driver is not None and not _is_driver_alive(_singleton_driver):
+            print("[driver] Driver無効 — 再生成します")
+            try:
+                _singleton_driver.quit()
+            except Exception:
+                pass
+            _singleton_driver = None
+            time.sleep(0.5)          # let Chrome release file handles
+            _clear_profile_lock()    # remove any stale lock files
+
+        if _singleton_driver is None:
             _singleton_driver = _make_chrome_driver(headless=False)
+
         return _singleton_driver
 
 
@@ -164,9 +177,11 @@ INVALID_TITLES = {
 # Statuses that have dedicated scraping URLs (sync targets)
 STATUSES = ["出品中", "取引中", "売却済み", "販売履歴"]
 
-# Statuses shown in the search filter UI
-# 公開停止中 is a sub-filter of 出品中 (stored as visibility_status='stopped')
-FILTER_STATUSES = ["出品中", "公開停止中", "取引中", "売却済み", "販売履歴"]
+# Statuses shown in the search filter UI.
+# 販売履歴 is intentionally excluded — it is a sync target and DB value but
+# not useful as a search filter in normal usage.
+# 公開停止中 is a sub-filter of 出品中 (stored as visibility_status='stopped').
+FILTER_STATUSES = ["出品中", "公開停止中", "取引中", "売却済み"]
 
 # Badge texts that can appear on cards (superset of STATUSES for detection)
 _DETECT_STATUSES = set(STATUSES) | {"公開停止中", "出品停止中"}
@@ -769,6 +784,10 @@ def open_url():
             return
         try:
             driver = _get_or_create_driver()
+            try:
+                driver.maximize_window()
+            except Exception:
+                pass
             # Open the product URL in a new tab within the existing Chrome window
             driver.execute_script("window.open(arguments[0], '_blank');", url)
         except Exception as exc:
@@ -868,8 +887,10 @@ def parse_listing_text(text):
 
         if line == "¥" and i + 1 < len(lines) and lines[i + 1].replace(",", "").isdigit():
             price = "¥" + lines[i + 1]
-        elif line.startswith("¥") and not price:
-            price = line
+        elif line.startswith("¥") and len(line) > 1 and not price:
+            m = re.search(r"¥([\d,]+)", line)
+            if m and int(m.group(1).replace(",", "")) > 0:
+                price = "¥" + m.group(1)
 
         for kw in TIME_KEYWORDS:
             if kw in line:
@@ -895,6 +916,33 @@ def parse_listing_text(text):
 
 def is_valid_title(title):
     return bool(title) and title not in INVALID_TITLES and not title.replace(",", "").isdigit()
+
+
+def _is_valid_price(price: str) -> bool:
+    """Return True when price contains an actual number (not just '¥' or empty)."""
+    if not price:
+        return False
+    digits = re.sub(r"[¥,\s]", "", price)
+    return digits.isdigit() and int(digits) > 0
+
+
+def _clear_profile_lock() -> None:
+    """Remove stale Chrome singleton lock files so a new instance can start.
+
+    Chrome writes lock files (SingletonLock, SingletonCookie, SingletonSocket)
+    into the user-data-dir. If Chrome crashes or is force-killed these remain
+    and prevent a new Chrome process from using the same profile directory.
+    """
+    if not CHROME_PROFILE_DIR:
+        return
+    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        lock_path = os.path.join(CHROME_PROFILE_DIR, lock_name)
+        try:
+            if os.path.exists(lock_path) or os.path.islink(lock_path):
+                os.remove(lock_path)
+                print(f"[driver] プロファイルロック削除: {lock_name}")
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1193,8 +1241,9 @@ def scrape_item_detail(driver, url):
             title = h1s[0].text.strip()
 
         for line in (l.strip() for l in raw_text.split("\n") if l.strip()):
-            if line.startswith("¥"):
-                price = line
+            m = re.search(r"¥([\d,]+)", line)
+            if m and int(m.group(1).replace(",", "")) > 0:
+                price = "¥" + m.group(1)
                 break
 
         if price:
@@ -1242,6 +1291,8 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
         })
     else:
         opts.add_argument("--start-maximized")
+        opts.add_argument("--no-first-run")
+        opts.add_argument("--no-default-browser-check")
         # Persistent profile: Mercari session and cookies survive across runs
         if CHROME_PROFILE_DIR:
             os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
@@ -1329,12 +1380,14 @@ def classify_items(items, existing_map):
             new_status = item.get("status") or ""
             new_vis    = item.get("visibility_status") or ""
             # Skip only when everything including visibility_status matches
+            # and the existing price is valid (re-fetch if price was "¥ only")
             if (is_valid_title(old_title) and old_cat == item["created_at"]
-                    and old_status == new_status and old_vis == new_vis):
+                    and old_status == new_status and old_vis == new_vis
+                    and _is_valid_price(existing.get("price", ""))):
                 to_skip.append(item)
                 continue
 
-        if is_valid_title(item["title"]) and item["price"]:
+        if is_valid_title(item["title"]) and _is_valid_price(item.get("price", "")):
             to_save_direct.append(item)
         else:
             to_fetch_detail.append(item)
@@ -1404,6 +1457,12 @@ def run_scraper(selected_statuses=None):
         click_login_button_if_exists(main_driver)
         wait_for_login(main_driver)
         _save_session_cookies(main_driver)
+
+    # Minimize Chrome during background sync so it doesn't stay in the foreground
+    try:
+        main_driver.minimize_window()
+    except Exception:
+        pass
 
     phase1_start = time.time()
     items, per_status_counts = load_all_listings(main_driver, selected_statuses)
