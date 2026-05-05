@@ -1,0 +1,24 @@
+MIA Inventory -- Installation Guide
+=====================================
+
+INSTALL
+-------
+1. Drag MIAInventory into the Applications folder.
+2. Open Applications (or Launchpad) and launch MIAInventory.
+
+IF macOS BLOCKS THE APP
+-----------------------
+Right-click the app -> Open -> Open.
+This is only required once.
+
+REQUIREMENTS
+------------
+- macOS 12 Monterey or later
+- Google Chrome installed
+
+UNINSTALL
+---------
+Move /Applications/MIAInventory.app to Trash.
+
+---
+Independent third-party tool. Not affiliated with Mercari Inc.

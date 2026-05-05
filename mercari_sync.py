@@ -1312,7 +1312,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.6</div>
+  <div class="sidebar-footer">v1.4.7</div>
 </nav>"""
 
 
@@ -2643,7 +2643,7 @@ def settings_page():
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.6</span>
+          <span class="settings-value">v1.4.7</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
