@@ -1,4 +1,6 @@
+import collections
 import json
+import logging
 import os
 import re
 import queue
@@ -20,6 +22,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
+try:
+    from _version import APP_VERSION
+except ImportError:
+    APP_VERSION = "dev"
 
 DB_NAME          = "products.db"
 COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
@@ -77,6 +84,38 @@ _sync_progress: dict = {
 # Singleton visible-Chrome driver shared by sync and link-open
 _singleton_driver = None
 _driver_lock = threading.Lock()   # guards singleton creation only
+
+# ---------------------------------------------------------------------------
+# Runtime log system
+# ---------------------------------------------------------------------------
+_LOG_RING: collections.deque = collections.deque(maxlen=200)  # last 200 entries
+_LOG_SEQ: int = 0
+_LOG_LOCK = threading.Lock()
+_LOG_FILE_PATH: str = ""   # set by init_log_file()
+
+
+def init_log_file(data_dir: str) -> None:
+    """Create logs dir inside data_dir and configure file + ring-buffer logging."""
+    global _LOG_FILE_PATH
+    logs_dir = os.path.join(data_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    _LOG_FILE_PATH = os.path.join(logs_dir, "app.log")
+    handler = logging.FileHandler(_LOG_FILE_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+
+
+def app_log(level: str, message: str) -> None:
+    """Append to ring buffer and file logger. level: INFO | WARN | ERROR"""
+    global _LOG_SEQ
+    ts = datetime.now(tz=_JST).strftime("%Y-%m-%d %H:%M:%S")
+    with _LOG_LOCK:
+        _LOG_SEQ += 1
+        entry = {"seq": _LOG_SEQ, "ts": ts, "level": level, "msg": message}
+        _LOG_RING.append(entry)
+    getattr(logging, level.lower(), logging.info)(message)
 
 
 def jst_now() -> str:
@@ -762,6 +801,8 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
             gap: 14px; }
 .kpi-card { background: #fff; border-radius: 12px; padding: 18px 20px;
             box-shadow: var(--shadow-md); }
+a.kpi-card { cursor: pointer; transition: box-shadow .15s, transform .15s; }
+a.kpi-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.12); transform: translateY(-2px); }
 .kpi-value { font-size: 26px; font-weight: 700; color: var(--text);
              letter-spacing: -.5px; }
 .kpi-value.green { color: #16a34a; }
@@ -770,19 +811,21 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .kpi-value.red   { color: #dc2626; }
 .kpi-label { font-size: 11px; font-weight: 600; color: var(--muted);
              margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
+/* Runtime log panel */
+.log-panel { background: #0f172a; border-radius: 10px; padding: 12px 14px;
+             max-height: 220px; overflow-y: auto; font-family: monospace;
+             font-size: 12px; line-height: 1.6; }
+.log-entry { display: flex; gap: 8px; }
+.log-ts  { color: #64748b; white-space: nowrap; flex-shrink: 0; }
+.log-lvl-INFO  { color: #38bdf8; }
+.log-lvl-WARN  { color: #fbbf24; }
+.log-lvl-ERROR { color: #f87171; }
+.log-msg { color: #e2e8f0; word-break: break-all; }
+.log-path { font-size: 11px; color: var(--muted); margin-top: 6px; word-break: break-all; }
 /* Sync warning banner */
 .sync-warning { background: #fffbeb; border: 1px solid #fde68a;
                 border-radius: 8px; color: #92400e;
                 padding: 12px 16px; font-size: 13px; margin-bottom: 12px; }
-/* Sales page */
-.sales-kpi-grid { display: grid;
-                  grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
-                  gap: 14px; }
-.chart-wrap { display: flex; align-items: center; justify-content: center;
-              gap: 32px; flex-wrap: wrap; padding: 16px; }
-.chart-legend { display: flex; flex-direction: column; gap: 10px; }
-.legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-.legend-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
 /* AI analysis */
 .suggestion-card { background: #fff; border-radius: 12px;
                    box-shadow: var(--shadow-md); overflow: clip; }
@@ -1029,47 +1072,6 @@ _SYNC_POLL_JS = """
 """
 
 
-_SALES_PIE_JS = """
-(function() {
-  var data = (typeof _PIE_DATA !== 'undefined') ? _PIE_DATA : [];
-  var canvas = document.getElementById('pie-chart');
-  if (!canvas) return;
-  var ctx = canvas.getContext('2d');
-  var cx = 100, cy = 100, r = 90;
-  if (!data || !data.length) {
-    ctx.fillStyle = '#e5e7eb';
-    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle = '#6b7280'; ctx.font = '13px sans-serif';
-    ctx.textAlign = 'center'; ctx.fillText('データなし', cx, cy+5);
-    return;
-  }
-  var total = data.reduce(function(s, d) { return s + (d.value || 0); }, 0);
-  if (total <= 0) return;
-  var start = -Math.PI / 2;
-  data.forEach(function(d) {
-    var angle = (d.value / total) * Math.PI * 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, r, start, start + angle);
-    ctx.closePath();
-    ctx.fillStyle = d.color;
-    ctx.fill();
-    start += angle;
-  });
-  var legend = document.getElementById('pie-legend');
-  if (legend) {
-    data.forEach(function(d) {
-      var pct = Math.round(d.value / total * 100);
-      var item = document.createElement('div');
-      item.className = 'legend-item';
-      item.innerHTML = '<span class="legend-dot" style="background:' + d.color + '"></span>'
-        + '<span>' + d.label + ' &nbsp;<strong>¥' + d.value.toLocaleString()
-        + '</strong> (' + pct + '%)</span>';
-      legend.appendChild(item);
-    });
-  }
-})();
-"""
 
 
 def _badge_html(status, visibility_status=""):
@@ -1173,7 +1175,6 @@ def _get_kpi_stats() -> dict:
 _NAV_ITEMS = [
     ("main",     "/",         "🏠", "メイン"),
     ("products", "/products", "📦", "商品管理"),
-    ("sales",    "/sales",    "📊", "売上分析"),
     ("ai",       "/ai",       "🤖", "AI 分析"),
     ("settings", "/settings", "⚙️",  "設定"),
 ]
@@ -1286,25 +1287,29 @@ def home():
 
     stats = _get_kpi_stats()
 
-    # ── KPI cards ─────────────────────────────────────────────────────────
+    # ── KPI cards (clickable — navigate to product list with filter) ─────────
+    _q_all     = "/products?searched=1"
+    _q_listed  = "/products?searched=1&statuses=%E5%87%BA%E5%93%81%E4%B8%AD&statuses=%E5%85%AC%E9%96%8B%E5%81%9C%E6%AD%A2%E4%B8%AD"
+    _q_trading = "/products?searched=1&statuses=%E5%8F%96%E5%BC%95%E4%B8%AD"
+    _q_sold    = "/products?searched=1&statuses=%E5%A3%B2%E5%8D%B4%E6%B8%88%E3%81%BF&statuses=%E8%B2%A9%E5%A3%B2%E5%B1%A5%E6%AD%B4"
     kpi_html = f"""
     <div class="kpi-grid">
-      <div class="kpi-card">
+      <a class="kpi-card" href="{_q_all}" style="text-decoration:none;color:inherit">
         <div class="kpi-value">{stats['total']}</div>
         <div class="kpi-label">総商品数</div>
-      </div>
-      <div class="kpi-card">
+      </a>
+      <a class="kpi-card" href="{_q_listed}" style="text-decoration:none;color:inherit">
         <div class="kpi-value green">{stats['active']}</div>
         <div class="kpi-label">出品中</div>
-      </div>
-      <div class="kpi-card">
+      </a>
+      <a class="kpi-card" href="{_q_trading}" style="text-decoration:none;color:inherit">
         <div class="kpi-value amber">{stats['trading']}</div>
         <div class="kpi-label">取引中</div>
-      </div>
-      <div class="kpi-card">
+      </a>
+      <a class="kpi-card" href="{_q_sold}" style="text-decoration:none;color:inherit">
         <div class="kpi-value blue">{stats['sold']}</div>
         <div class="kpi-label">売却済み</div>
-      </div>
+      </a>
       <div class="kpi-card">
         <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
         <div class="kpi-label">推定売上合計</div>
@@ -1435,6 +1440,23 @@ def home():
         '</div>'
     ) if licensed else ""
 
+    log_path_display = html_module.escape(_LOG_FILE_PATH) if _LOG_FILE_PATH else "(未設定)"
+    log_panel_html = f"""
+    <div class="card" style="margin-top:18px">
+      <div class="card-header" style="justify-content:space-between">
+        <span class="card-title">ランタイムログ</span>
+        <button onclick="document.getElementById('log-box').innerHTML=''"
+                style="font-size:11px;padding:3px 10px;border:1px solid var(--border);
+                       background:#fff;border-radius:6px;cursor:pointer;color:var(--muted)">
+          クリア
+        </button>
+      </div>
+      <div class="card-body" style="padding:10px 14px">
+        <div class="log-panel" id="log-box"></div>
+        <p class="log-path">ログファイル: {log_path_display}</p>
+      </div>
+    </div>"""
+
     content = f"""
     {licensed_banner}
     {error_banner}
@@ -1444,7 +1466,38 @@ def home():
     </div>
     {kpi_html}
     {sync_card}
+    {log_panel_html}
     {summary_modal}"""
+
+    _LOG_POLL_JS = """
+(function() {
+  var _lastSeq = 0;
+  var _box = document.getElementById('log-box');
+  function _levelClass(l) {
+    return 'log-lvl-' + (l || 'INFO');
+  }
+  function poll() {
+    fetch('/log/entries?since=' + _lastSeq)
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var entries = d.entries || [];
+        entries.forEach(function(e) {
+          if (e.seq > _lastSeq) _lastSeq = e.seq;
+          var row = document.createElement('div');
+          row.className = 'log-entry';
+          row.innerHTML = '<span class="log-ts">' + e.ts.slice(11) + '</span>'
+            + '<span class="' + _levelClass(e.level) + '">[' + e.level + ']</span>'
+            + '<span class="log-msg">' + e.msg.replace(/</g,'&lt;') + '</span>';
+          _box.appendChild(row);
+        });
+        if (entries.length) _box.scrollTop = _box.scrollHeight;
+        setTimeout(poll, 2000);
+      })
+      .catch(function() { setTimeout(poll, 4000); });
+  }
+  poll();
+})();
+"""
 
     extra_js = f"""
 (function() {{
@@ -1456,6 +1509,7 @@ def home():
     }});
   }}
 }})();
+{_LOG_POLL_JS}
 {"" if not syncing else _SYNC_POLL_JS}"""
 
     return _page_shell("メインダッシュボード", "main", content, extra_js,
@@ -1487,22 +1541,27 @@ def sync():
         "error":       "",
         "stopped":     False,
     }
+    app_log("INFO", f"同期開始 — ステータス: {', '.join(selected)}")
 
     def _bg_sync():
         global _sync_running, _sync_progress, _sync_stop_requested
-        _sync_stop_requested = False   # clear any leftover stop flag from previous run
+        _sync_stop_requested = False
         try:
             run_scraper(selected_statuses=selected)
             if _check_plan() == "free":
                 _record_sync_date()
+            app_log("INFO", "同期完了")
         except _SyncStopped:
             print("[sync] 強制停止されました")
+            app_log("WARN", "同期が手動停止されました")
             _sync_progress["stopped"] = True
         except Exception as exc:
             import traceback
             print("[sync] 同期エラー:")
             traceback.print_exc()
-            _sync_progress["error"] = str(exc).split("\n")[0][:200]
+            err = str(exc).split("\n")[0][:200]
+            app_log("ERROR", f"同期エラー: {err}")
+            _sync_progress["error"] = err
         finally:
             _sync_running = False
             _sync_progress["running"] = False
@@ -1731,6 +1790,15 @@ def login_status():
                     "error_msg": _login_error_msg})
 
 
+@app.route("/log/entries")
+def log_entries():
+    from flask import jsonify
+    since = int(request.args.get("since", 0))
+    with _LOG_LOCK:
+        entries = [e for e in _LOG_RING if e["seq"] > since]
+    return jsonify({"entries": entries})
+
+
 @app.route("/open")
 def open_url():
     """Open a Mercari product URL in a new tab of the singleton Chrome driver.
@@ -1784,6 +1852,8 @@ def shutdown():
 
 @app.route("/export/csv")
 def export_csv():
+    if _check_plan() in ("free", "expired"):
+        return redirect("/upgrade?from=export")
     q            = request.args.get("q", "").strip()
     sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
@@ -1807,6 +1877,8 @@ def export_csv():
 
 @app.route("/export/xlsx")
 def export_xlsx():
+    if _check_plan() in ("free", "expired"):
+        return redirect("/upgrade?from=export")
     q            = request.args.get("q", "").strip()
     sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
@@ -1844,8 +1916,8 @@ def upgrade_page():
     plan    = _check_plan()
     from_pg = request.args.get("from", "")
 
-    if from_pg == "sales":
-        banner_msg = "売上分析は月額プランまたは買い切りプランでご利用いただけます。"
+    if from_pg == "export":
+        banner_msg = "CSV / Excel エクスポートは月額プランまたは買い切りプランでご利用いただけます。"
     elif from_pg == "ai":
         banner_msg = "AI分析は月額プランまたは買い切りプランでご利用いただけます。"
     elif plan in ("expired", "free"):
@@ -1858,9 +1930,9 @@ def upgrade_page():
         if banner_msg else ""
     )
 
-    free_features = "同期: 1日1回<br>商品管理: ○<br>売上分析: ✗<br>AI分析: ✗"
-    monthly_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○"
-    lifetime_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
+    free_features = "ログイン: ○<br>同期: ○<br>商品管理: ○<br>AI分析: ○<br>CSVエクスポート: ✗<br>Excelエクスポート: ✗"
+    monthly_features = "ログイン: ○<br>同期: ○<br>商品管理: ○<br>AI分析: ○<br>CSVエクスポート: ○<br>Excelエクスポート: ○"
+    lifetime_features = "ログイン: ○<br>同期: ○<br>商品管理: ○<br>AI分析: ○<br>CSVエクスポート: ○<br>Excelエクスポート: ○<br>将来のアップデート: ○"
 
     plan_grid = f"""
     <div class="plan-grid">
@@ -2050,146 +2122,6 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
     extra_js = f"{_STICKY_JS}\n{_SORT_JS}\n{_OPEN_LINK_JS}\n{export_js}"
     return _page_shell("商品管理", "products", content, extra_js,
                        subtitle="商品の検索・エクスポート")
-
-
-# ---------------------------------------------------------------------------
-# Sales Performance page
-# ---------------------------------------------------------------------------
-
-@app.route("/sales")
-def sales_page():
-    if _session_state != "valid":
-        return redirect("/login")
-    if _check_plan() in ("expired", "free"):
-        return redirect("/upgrade?from=sales")
-
-    range_param = request.args.get("range", "all")
-
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    if range_param == "30d":
-        cutoff = (datetime.now(tz=_JST) - timedelta(days=30)).strftime("%Y-%m-%d")
-        cursor.execute(
-            "SELECT title, price, status, created_at, synced_at "
-            "FROM mercari_products "
-            "WHERE status IN ('売却済み','販売履歴') AND synced_at >= ?",
-            (cutoff,),
-        )
-    else:
-        cursor.execute(
-            "SELECT title, price, status, created_at, synced_at "
-            "FROM mercari_products WHERE status IN ('売却済み','販売履歴')"
-        )
-    rows = cursor.fetchall()
-    conn.close()
-
-    valid_prices = [_parse_price_int(r[1]) for r in rows if _parse_price_int(r[1]) > 0]
-    total_sales  = sum(valid_prices)
-    sold_count   = len(rows)
-    avg_price    = (sum(valid_prices) // len(valid_prices)) if valid_prices else 0
-    est_fee      = int(total_sales * 0.10)
-    est_profit   = total_sales - est_fee
-
-    kpi_html = f"""
-    <div class="sales-kpi-grid">
-      <div class="kpi-card">
-        <div class="kpi-value red" style="font-size:20px">¥{total_sales:,}</div>
-        <div class="kpi-label">売上合計（推定）</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value blue">{sold_count}</div>
-        <div class="kpi-label">売却件数</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value" style="font-size:20px">¥{avg_price:,}</div>
-        <div class="kpi-label">平均単価</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value amber" style="font-size:20px">¥{est_fee:,}</div>
-        <div class="kpi-label">推定手数料（10%）</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value green" style="font-size:20px">¥{est_profit:,}</div>
-        <div class="kpi-label">推定利益（手数料後）</div>
-      </div>
-    </div>"""
-
-    pie_data = json.dumps([
-        {"label": "推定利益 (90%)", "value": est_profit, "color": "#22c55e"},
-        {"label": "手数料 (10%)",   "value": est_fee,    "color": "#f59e0b"},
-    ]) if total_sales > 0 else "[]"
-
-    range_all = "btn btn-primary" if range_param != "30d" else "btn btn-outline"
-    range_30d = "btn btn-primary" if range_param == "30d" else "btn btn-outline"
-    filter_html = f"""
-    <div style="display:flex;gap:8px">
-      <a class="{range_all}" href="/sales?range=all">全期間</a>
-      <a class="{range_30d}" href="/sales?range=30d">過去30日</a>
-    </div>"""
-
-    chart_card = f"""
-    <div class="card">
-      <div class="card-header"><span class="card-title">売上内訳（推定）</span></div>
-      <div class="card-body">
-        <div class="chart-wrap">
-          <canvas id="pie-chart" width="200" height="200"></canvas>
-          <div class="chart-legend" id="pie-legend"></div>
-        </div>
-        <p style="font-size:12px;color:var(--muted);text-align:center;margin-top:4px">
-          ※ 手数料はMercari標準（10%）で推定。送料データは現在非対応です。
-        </p>
-      </div>
-    </div>"""
-
-    table_rows = ""
-    for r in rows:
-        title, price, status, created_at, synced_at = r
-        badge = _badge_html(status)
-        table_rows += (
-            f"<tr>"
-            f"<td>{html_module.escape(title or '')}</td>"
-            f"<td class='price'>{html_module.escape(price or '')}</td>"
-            f"<td>{badge}</td>"
-            f"<td style='color:var(--muted)'>{html_module.escape(created_at or '')}</td>"
-            f"<td style='font-size:12px;color:var(--muted)'>"
-            f"{html_module.escape((synced_at or '')[:16])}</td>"
-            f"</tr>"
-        )
-    if not table_rows:
-        table_rows = (
-            '<tr><td colspan="5"><div class="empty-state">'
-            '<div class="es-icon">📊</div>'
-            '<p>売却済み商品がありません</p>'
-            '</div></td></tr>'
-        )
-
-    table_card = f"""
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">売却商品一覧
-          <span class="count-badge">{sold_count} 件</span>
-        </span>
-      </div>
-      <div class="card-body" style="padding:0">
-        <table>
-          <thead>
-            <tr>
-              <th data-sortable data-col="0">商品名</th>
-              <th data-sortable data-col="1">価格</th>
-              <th data-sortable data-col="2">状態</th>
-              <th data-sortable data-col="3">商品登録日</th>
-              <th data-sortable data-col="4">最終確認</th>
-            </tr>
-          </thead>
-          <tbody>{table_rows}</tbody>
-        </table>
-      </div>
-    </div>"""
-
-    content  = f"{filter_html}\n{kpi_html}\n{chart_card}\n{table_card}"
-    extra_js = f"var _PIE_DATA = {pie_data};\n{_SALES_PIE_JS}\n{_SORT_JS}"
-    return _page_shell("売上分析", "sales", content, extra_js,
-                       subtitle="売却済み商品の実績")
 
 
 # ---------------------------------------------------------------------------
@@ -2500,13 +2432,18 @@ def settings_page():
       </div>
     </div>"""
 
-    app_card = """
+    log_path_html = html_module.escape(_LOG_FILE_PATH) if _LOG_FILE_PATH else "（未設定）"
+    app_card = f"""
     <div class="card">
       <div class="card-header"><span class="card-title">アプリ情報</span></div>
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.2</span>
+          <span class="settings-value">{html_module.escape(APP_VERSION)}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">ログファイル</span>
+          <span class="settings-path">{log_path_html}</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
@@ -3298,17 +3235,19 @@ def _do_login(force_relogin: bool = False) -> None:
     so the existing session cannot silently bypass the login form.
     """
     global _session_state, _login_error_msg
+    app_log("INFO", "ログイン処理を開始します…")
     try:
         try:
             driver = _get_or_create_driver()
         except Exception as exc:
-            # Chrome failed to start — surface as "error" with a message
             msg = str(exc).split("\n")[0]
             print(f"[login] Chrome起動失敗: {exc}")
+            app_log("ERROR", f"Chrome 起動失敗: {msg}")
             _login_error_msg = f"Chrome の起動に失敗しました: {msg}"
             _session_state = "error"
             return
 
+        app_log("INFO", "Chrome を起動しました — Mercari ログインページを開きます")
         try:
             driver.maximize_window()
             driver.set_window_position(0, 0)
@@ -3316,7 +3255,6 @@ def _do_login(force_relogin: bool = False) -> None:
             pass
 
         if force_relogin:
-            # Wipe in-session cookies so Chrome doesn't auto-restore the old login.
             try:
                 driver.get("https://jp.mercari.com")
                 driver.delete_all_cookies()
@@ -3326,6 +3264,7 @@ def _do_login(force_relogin: bool = False) -> None:
 
         driver.get("https://jp.mercari.com/login")
         click_login_button_if_exists(driver)
+        app_log("INFO", "ブラウザでログイン完了をお待ちしています…")
         wait_for_login(driver)
         _save_session_cookies(driver)
         try:
@@ -3333,13 +3272,16 @@ def _do_login(force_relogin: bool = False) -> None:
         except Exception:
             pass
         _session_state = "valid"
+        app_log("INFO", "ログイン完了 — セッション有効")
         print("[login] ログイン完了 — セッション有効")
     except Exception as exc:
         print(f"[login] ログイン失敗: {exc}")
+        app_log("ERROR", f"ログイン失敗: {str(exc).split(chr(10))[0]}")
         _session_state = "invalid"
     finally:
         if _session_state == "logging_in":
             print("[login] 警告: ログインスレッドが logging_in のまま終了 — invalid にリセット")
+            app_log("WARN", "ログインスレッドが異常終了 — 状態をリセットしました")
             _session_state = "invalid"
 
 
@@ -3372,15 +3314,22 @@ def _clear_session() -> None:
             print(f"[session] クッキーファイル削除失敗: {exc}")
 
     # Delete the app-specific Chrome profile directory.
-    # Guard: the path must be inside ~/Library/Application Support/MercariInventory/
-    _app_support = os.path.join(
+    # Guard: the path must be inside the app's Application Support directory
+    _app_support_mia  = os.path.join(
+        os.path.expanduser("~"), "Library", "Application Support", "MIAInventory"
+    )
+    _app_support_legacy = os.path.join(
         os.path.expanduser("~"), "Library", "Application Support", "MercariInventory"
+    )
+    _app_support = _app_support_mia
+    _profile_realpath = os.path.realpath(CHROME_PROFILE_DIR) if CHROME_PROFILE_DIR else ""
+    _allowed = (
+        _profile_realpath.startswith(os.path.realpath(_app_support_mia))
+        or _profile_realpath.startswith(os.path.realpath(_app_support_legacy))
     )
     if (CHROME_PROFILE_DIR
             and os.path.isdir(CHROME_PROFILE_DIR)
-            and os.path.realpath(CHROME_PROFILE_DIR).startswith(
-                os.path.realpath(_app_support)
-            )):
+            and _allowed):
         import shutil
         try:
             shutil.rmtree(CHROME_PROFILE_DIR, ignore_errors=False)

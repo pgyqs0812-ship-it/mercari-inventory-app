@@ -5,8 +5,10 @@ Starts the Flask web server in a background thread, then opens the
 browser automatically. Runs as a windowed .app bundle (no terminal window);
 errors and status are surfaced via macOS dialogs and notifications.
 """
+import atexit
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -15,7 +17,7 @@ import time
 import webbrowser
 
 PORT = 5050
-_APP_NAME = "MercariInventory"
+_APP_NAME = "MIAInventory"
 
 
 # ---------------------------------------------------------------------------
@@ -80,26 +82,99 @@ def get_data_dir() -> str:
     """
     Return the directory where user data (products.db, .env) should live.
 
-    PyInstaller frozen binary  → ~/Library/Application Support/MercariInventory/
+    PyInstaller frozen binary  → ~/Library/Application Support/MIAInventory/
                                  Survives app updates (new dist.zip extracts never
                                  touch this path).
     Normal Python script       → project root.
     """
     if getattr(sys, "frozen", False):
         app_support = os.path.expanduser("~/Library/Application Support")
-        data_dir = os.path.join(app_support, _APP_NAME)
+        data_dir    = os.path.join(app_support, _APP_NAME)
+        # One-time migration: move legacy MercariInventory/ → MIAInventory/
+        legacy_dir  = os.path.join(app_support, "MercariInventory")
+        if os.path.isdir(legacy_dir) and not os.path.exists(data_dir):
+            import shutil as _shutil
+            try:
+                _shutil.move(legacy_dir, data_dir)
+                print(f"[data-dir] マイグレーション完了: {legacy_dir} → {data_dir}")
+            except Exception as _e:
+                print(f"[data-dir] マイグレーション失敗: {_e}")
         os.makedirs(data_dir, exist_ok=True)
         return data_dir
     return os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
-# Port check
+# Port / process helpers
 # ---------------------------------------------------------------------------
 
 def is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _app_is_responding(port: int, timeout: float = 2.0) -> bool:
+    """Return True if our Flask app answers a GET / on this port."""
+    try:
+        import urllib.request
+        req = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/", timeout=timeout
+        )
+        return req.status == 200
+    except Exception:
+        return False
+
+
+def _pid_owning_port(port: int):
+    """Return the PID (int) that holds the given TCP port, or None."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-ti", f":{port}"], timeout=5
+        ).decode().strip()
+        return int(out.splitlines()[0]) if out else None
+    except Exception:
+        return None
+
+
+def _pid_is_our_app(pid: int) -> bool:
+    """Return True if the process with this PID is an MIAInventory process."""
+    try:
+        cmdline = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "args="], timeout=5
+        ).decode()
+        markers = (
+            "mercari_sync",
+            "MIAInventory",
+            "MIAInvent",        # macOS 15-char truncation
+            "MercariInventory",
+            "MercariIn",        # macOS 15-char truncation of legacy name
+            "mia_inventory",
+            "main.py",
+        )
+        return any(m in cmdline for m in markers)
+    except Exception:
+        return False
+
+
+def _kill_pid_wait(pid: int, port: int, timeout: float = 5.0) -> bool:
+    """Send SIGTERM to pid, wait up to timeout s for the port to free up."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if not is_port_in_use(port):
+            return True
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    return not is_port_in_use(port)
 
 
 # ---------------------------------------------------------------------------
@@ -113,11 +188,7 @@ _CHROME_CANDIDATES = [
 
 
 def check_chrome_browser() -> None:
-    """Exit with a user-visible dialog if Google Chrome is not installed.
-
-    Selenium Manager (bundled with Selenium 4.6+) handles ChromeDriver
-    automatically, so only the Chrome browser itself is required.
-    """
+    """Exit with a user-visible dialog if Google Chrome is not installed."""
     if not any(os.path.exists(p) for p in _CHROME_CANDIDATES):
         msg = (
             "Google Chrome が見つかりません。\n\n"
@@ -134,15 +205,10 @@ def check_chrome_browser() -> None:
 # ---------------------------------------------------------------------------
 
 def _migrate_db_if_needed(data_dir: str) -> None:
-    """One-time migration: copy products.db from the old location (next to the
-    executable) to the new persistent app data directory, so existing users do
-    not lose their sync history after updating the app."""
     import shutil  # noqa: PLC0415
-
     new_db = os.path.join(data_dir, "products.db")
     if os.path.exists(new_db):
         return
-
     old_db = os.path.join(os.path.dirname(sys.executable), "products.db")
     if os.path.exists(old_db):
         _log(f"[migration] データを新しい保存先にコピーします: {new_db}")
@@ -172,23 +238,95 @@ def main() -> None:
     os.chdir(data_dir)
     os.environ.setdefault("FLASK_ENV", "production")
 
+    lock_file = os.path.join(data_dir, "app.lock")
+
+    # ── Single-instance check via lock file ──────────────────────────────────
+    if os.path.exists(lock_file):
+        try:
+            stored_pid = int(open(lock_file).read().strip())
+        except Exception:
+            stored_pid = None
+
+        if stored_pid:
+            pid_alive = False
+            try:
+                os.kill(stored_pid, 0)
+                pid_alive = True
+            except (ProcessLookupError, PermissionError):
+                pid_alive = False
+
+            if pid_alive:
+                if _app_is_responding(PORT):
+                    _log(f"[startup] アプリは既に起動中 (PID={stored_pid}) — ブラウザを開きます")
+                    webbrowser.open(f"http://127.0.0.1:{PORT}")
+                    return
+                _log(f"[startup] 古いプロセスを検出 (PID={stored_pid}) — 終了させます")
+                if _kill_pid_wait(stored_pid, PORT):
+                    _log(f"[startup] 古いプロセスを終了しました (PID={stored_pid})")
+                else:
+                    _log(f"[startup] 警告: 古いプロセスの終了に失敗しました (PID={stored_pid})")
+            else:
+                _log(f"[startup] 古いロックファイルを削除します (PID={stored_pid} はすでに存在しません)")
+
+        try:
+            os.remove(lock_file)
+        except Exception:
+            pass
+
+    # ── Port conflict check (no lock file, but port is in use) ───────────────
+    if is_port_in_use(PORT):
+        if _app_is_responding(PORT):
+            _log(f"[startup] ポート {PORT} は使用中 (応答あり) — ブラウザを開きます")
+            webbrowser.open(f"http://127.0.0.1:{PORT}")
+            return
+
+        stale_pid = _pid_owning_port(PORT)
+        _log(f"[startup] ポート {PORT} は応答なし (所有PID={stale_pid})")
+
+        if stale_pid and _pid_is_our_app(stale_pid):
+            _log(f"[startup] 自アプリのプロセスを検出 (PID={stale_pid}) — 終了させます")
+            if _kill_pid_wait(stale_pid, PORT):
+                _log(f"[startup] ポート {PORT} を解放しました")
+            else:
+                msg = (
+                    f"ポート {PORT} が解放できませんでした。\n"
+                    "ターミナルで以下を実行してください:\n"
+                    f"  kill -9 {stale_pid}"
+                )
+                _log(f"ERROR: ポート {PORT} を解放できませんでした")
+                _show_dialog("起動エラー", msg)
+                sys.exit(1)
+        elif stale_pid:
+            msg = (
+                f"ポート {PORT} は別のアプリ (PID={stale_pid}) が使用中です。\n"
+                "そのアプリを終了してから、もう一度起動してください。"
+            )
+            _log(f"ERROR: ポート {PORT} は別プロセス (PID={stale_pid}) が使用中")
+            _show_dialog("起動エラー", msg)
+            sys.exit(1)
+        else:
+            msg = (
+                f"ポート {PORT} はすでに使用中です。\n"
+                "他のアプリを終了してから再起動してください。"
+            )
+            _show_dialog("起動エラー", msg)
+            sys.exit(1)
+
+    # ── Start app ─────────────────────────────────────────────────────────────
     import mercari_sync as _ms  # noqa: PLC0415
-    _ms.DB_NAME           = os.path.join(data_dir, "products.db")
-    _ms.COOKIE_FILE       = os.path.join(data_dir, "mercari_session.json")
+    _ms.DB_NAME            = os.path.join(data_dir, "products.db")
+    _ms.COOKIE_FILE        = os.path.join(data_dir, "mercari_session.json")
     _ms.CHROME_PROFILE_DIR = os.path.join(data_dir, "chrome-profile")
-    _ms.LICENSE_FILE      = os.path.join(data_dir, "license.json")
+    _ms.LICENSE_FILE       = os.path.join(data_dir, "license.json")
     flask_app    = _ms.app
     init_db      = _ms.init_db
     init_license = _ms.init_license
 
-    # If a server is already listening, just open the browser and exit.
-    if is_port_in_use(PORT):
-        _log(f"ポート {PORT} はすでに使用中です — ブラウザを開きます")
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
-        return
+    _ms.init_log_file(data_dir)   # initialise ring buffer + file logger
 
     init_db()
     init_license()
+    _ms.app_log("INFO", f"アプリ起動 — バージョン {_ms.APP_VERSION}  データ: {data_dir}")
 
     _notify("起動中…")
 
@@ -213,6 +351,30 @@ def main() -> None:
             _show_dialog("起動エラー", msg)
             sys.exit(1)
         time.sleep(0.2)
+
+    # Write PID lock file now that Flask is confirmed running.
+    try:
+        with open(lock_file, "w") as _f:
+            _f.write(str(os.getpid()))
+        _log(f"[startup] ロックファイルを作成しました: {lock_file} (PID={os.getpid()})")
+    except Exception as _e:
+        _log(f"[startup] ロックファイル作成失敗（無視）: {_e}")
+
+    def _remove_lock():
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+                _log(f"[shutdown] ロックファイルを削除しました: {lock_file}")
+        except Exception:
+            pass
+
+    atexit.register(_remove_lock)
+
+    def _signal_handler(signum, frame):
+        _remove_lock()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     webbrowser.open(f"http://127.0.0.1:{PORT}")
     _notify("アプリが起動しました")
