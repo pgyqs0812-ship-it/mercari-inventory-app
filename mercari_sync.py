@@ -7,7 +7,7 @@ import time
 import webbrowser
 import sqlite3
 import html as html_module
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -62,9 +62,11 @@ _sync_stop_requested = False
 # Login session state machine:
 #   "unknown" → "checking" → "found_session" / "invalid"
 #   "found_session" → "valid" / "logging_in" / "clearing" → "invalid"
-#   "logging_in" → "valid" / "invalid"
+#   "logging_in" → "valid" / "invalid" / "error"
+#   "error"     → "logging_in" (retry) / "invalid" (cancel)
 _session_state: str = "unknown"
-_session_last_login: str = ""  # "YYYY-MM-DD HH:MM" — set on save or check
+_session_last_login: str = ""    # "YYYY-MM-DD HH:MM" — set on save or check
+_login_error_msg:   str = ""    # set when _session_state == "error"
 
 # Live progress state updated by the background sync thread; read by /sync_status
 _sync_progress: dict = {
@@ -81,6 +83,11 @@ _sync_progress: dict = {
 # Singleton visible-Chrome driver shared by sync and link-open
 _singleton_driver = None
 _driver_lock = threading.Lock()   # guards singleton creation only
+
+# Single-worker executor used to time-limit webdriver.Chrome() calls.
+# concurrent.futures.TimeoutError is raised if Chrome doesn't start within the
+# allotted window, preventing an indefinite hang in the login thread.
+_chrome_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chrome-launch")
 
 
 def jst_now() -> str:
@@ -1094,7 +1101,21 @@ document.addEventListener('click', function(e) {
 #   (page re-renders with the correct UI for the new state).
 _LOGIN_POLL_JS = """
 (function() {
+  var pollStart = Date.now();
+  var CLIENT_TIMEOUT_MS = 60000; // 60 s — stop spinning if server stays stuck
+
+  function showTimeoutUI() {
+    var spinner = document.querySelector('.spinner');
+    var status  = document.querySelector('.login-status');
+    if (spinner) spinner.style.display = 'none';
+    if (status)  status.textContent = 'ブラウザが起動しませんでした。キャンセルして再試行してください。';
+  }
+
   function poll() {
+    if (Date.now() - pollStart >= CLIENT_TIMEOUT_MS) {
+      showTimeoutUI();
+      return; // stop polling — user must hit Cancel / retry manually
+    }
     fetch('/login/status')
       .then(function(r) { return r.json(); })
       .then(function(d) {
@@ -1102,7 +1123,10 @@ _LOGIN_POLL_JS = """
           window.location = '/';
           return;
         }
-        if (d.state === 'found_session' || d.state === 'invalid' || d.state === 'unknown') {
+        if (d.state === 'error' ||
+            d.state === 'found_session' ||
+            d.state === 'invalid' ||
+            d.state === 'unknown') {
           window.location = '/login';
           return;
         }
@@ -1718,7 +1742,21 @@ def sync_stop():
 def login_page():
     state = _session_state
 
-    if state in ("checking", "logging_in", "clearing"):
+    if state == "error":
+        _err = html_module.escape(_login_error_msg or "ブラウザを起動できませんでした。")
+        body_content = f"""
+      <p class="login-error">{_err}</p>
+      <div class="login-btn-group" style="margin-top:20px">
+        <form method="POST" action="/login/start">
+          <button class="btn btn-primary login-btn" type="submit">再試行する</button>
+        </form>
+        <form method="POST" action="/login/cancel">
+          <button class="btn btn-outline login-btn" type="submit">キャンセル</button>
+        </form>
+      </div>"""
+        poll_js = ""
+
+    elif state in ("checking", "logging_in", "clearing"):
         if state == "logging_in":
             status_label = "ログイン中... ブラウザで Mercari にログインしてください"
         elif state == "clearing":
@@ -1727,7 +1765,11 @@ def login_page():
             status_label = "セッションを確認中..."
         body_content = f"""
       <p class="login-status">{status_label}</p>
-      <div class="spinner"></div>"""
+      <div class="spinner"></div>
+      <form method="POST" action="/login/cancel" style="margin-top:18px">
+        <button class="btn btn-outline" type="submit"
+                style="font-size:13px;padding:6px 18px">キャンセル</button>
+      </form>"""
         poll_js = _LOGIN_POLL_JS
 
     elif state == "found_session":
@@ -1789,6 +1831,9 @@ def login_page():
   .login-btn {{ width: 100%; padding: 13px; font-size: 15px; justify-content: center; }}
   .btn-danger {{ background: #ef4444; color: #fff; border: none; }}
   .btn-danger:hover {{ background: #dc2626; }}
+  .login-error {{ font-size: 14px; color: #b91c1c; background: #fef2f2;
+                 border: 1px solid #fca5a5; border-radius: 8px;
+                 padding: 14px 18px; margin-bottom: 8px; text-align: center; }}
   .spinner {{ width: 36px; height: 36px; border: 4px solid var(--border);
              border-top-color: var(--primary); border-radius: 50%;
              animation: spin .8s linear infinite; margin: 0 auto; }}
@@ -1821,9 +1866,10 @@ def login_page():
 
 @app.route("/login/start", methods=["POST"])
 def login_start():
-    global _session_state
+    global _session_state, _login_error_msg
     if _session_state == "logging_in":
         return redirect("/login")
+    _login_error_msg = ""
     _session_state = "logging_in"
     threading.Thread(target=_do_login, daemon=True, name="login-thread").start()
     return redirect("/login")
@@ -1841,15 +1887,26 @@ def login_use():
 @app.route("/login/relogin", methods=["POST"])
 def login_relogin():
     """Discard the existing session and force a fresh interactive login."""
-    global _session_state
+    global _session_state, _login_error_msg
     if _session_state == "logging_in":
         return redirect("/login")
+    _login_error_msg = ""
     _session_state = "logging_in"
     threading.Thread(
         target=lambda: _do_login(force_relogin=True),
         daemon=True,
         name="login-relogin",
     ).start()
+    return redirect("/login")
+
+
+@app.route("/login/cancel", methods=["POST"])
+def login_cancel():
+    """Reset a stuck or errored login attempt so the user can retry."""
+    global _session_state, _login_error_msg
+    if _session_state in ("logging_in", "error"):
+        _session_state = "invalid"
+        _login_error_msg = ""
     return redirect("/login")
 
 
@@ -1867,7 +1924,11 @@ def login_clear():
 @app.route("/login/status")
 def login_status():
     from flask import jsonify
-    return jsonify({"state": _session_state, "last_login": _session_last_login})
+    return jsonify({
+        "state":      _session_state,
+        "last_login": _session_last_login,
+        "error_msg":  _login_error_msg,
+    })
 
 
 @app.route("/open")
@@ -3229,11 +3290,24 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
     _ensure_selenium_manager()
 
     # Attempt to start Chrome; retry once with extra cleanup for visible driver.
+    # Each attempt is capped at LAUNCH_TIMEOUT seconds so selenium-manager
+    # download hangs do not block the login thread forever.
+    LAUNCH_TIMEOUT = 45
     max_attempts = 2 if not headless else 1
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
+        print(f"[driver] Chrome起動中 (attempt {attempt + 1}/{max_attempts}) …")
         try:
-            driver = webdriver.Chrome(options=opts)
+            # Run webdriver.Chrome() in a thread so we can time-limit it.
+            # selenium-manager can hang indefinitely on slow/blocked networks.
+            future = _chrome_executor.submit(webdriver.Chrome, opts)
+            try:
+                driver = future.result(timeout=LAUNCH_TIMEOUT)
+            except FuturesTimeoutError:
+                raise RuntimeError(
+                    f"Chrome の起動が {LAUNCH_TIMEOUT} 秒以内に完了しませんでした。"
+                    " selenium-manager がネットワークに接続できない可能性があります。"
+                ) from None
             break
         except Exception as exc:
             last_exc = exc
@@ -3249,6 +3323,13 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
             "Google Chrome がインストールされていることを確認してください。\n"
             "https://www.google.com/chrome/"
         ) from last_exc
+
+    # Limit how long driver.get() will wait for a page to load (protects against
+    # Mercari pages that hang on a slow/stuck resource).
+    try:
+        driver.set_page_load_timeout(30)
+    except Exception:
+        pass
 
     # Remove navigator.webdriver fingerprint so Mercari does not detect Selenium
     try:
@@ -3351,21 +3432,29 @@ def click_login_button_if_exists(driver):
     print("没有找到可自动点击的ログイン按钮，请手动点击。")
 
 
-def wait_for_login(driver, timeout=300):
-    """Poll until the browser URL leaves the login page."""
-    print("ブラウザで Mercari にログインしてください。")
-    print("ログイン完了後、自動的に同期を開始します（最大 5 分待機）...")
+def wait_for_login(driver, timeout=120):
+    """Poll until the browser URL indicates a completed Mercari login.
+
+    Login is considered complete when the URL is on mercari.com AND is no
+    longer on a login or auth page.  This handles redirects through
+    intermediate auth subdomains (e.g. auth.mercari.com) that do not contain
+    the word "login".
+    """
+    print("[login] ブラウザで Mercari にログインしてください（最大 2 分待機）")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            if "login" not in driver.current_url:
+            url = driver.current_url
+            if ("mercari.com" in url
+                    and "/login" not in url
+                    and "/auth"  not in url):
                 time.sleep(1)
-                print("ログイン確認完了。同期を開始します...")
+                print(f"[login] ログイン確認完了: {url}")
                 return
         except Exception:
             pass
         time.sleep(2)
-    raise TimeoutError("ログインがタイムアウトしました（5 分）。アプリを再起動してください。")
+    raise TimeoutError("ログインがタイムアウトしました（2 分）。再試行してください。")
 
 
 def _check_session_background() -> None:
@@ -3401,14 +3490,19 @@ def _do_login(force_relogin: bool = False) -> None:
 
     Brings Chrome to screen, navigates to the login page, waits for the user
     to complete login, saves cookies, then moves Chrome off-screen.
-    Sets _session_state to "valid" on success, "invalid" on failure/timeout.
 
-    force_relogin=True: deletes browser cookies before opening the login page
-    so the existing session cannot silently bypass the login form.
+    State transitions:
+      success             → "valid"
+      Chrome launch error → "error"  (shows retry UI)
+      user timeout        → "invalid" (login button reappears)
     """
-    global _session_state
+    global _session_state, _login_error_msg
+    print(f"[login] ログインスレッド開始 (force_relogin={force_relogin})")
     try:
+        print("[login] Chrome / Selenium 起動中…")
         driver = _get_or_create_driver()
+        print(f"[login] Chrome 起動完了 (session_id={driver.session_id})")
+
         try:
             driver.maximize_window()
             driver.set_window_position(0, 0)
@@ -3416,16 +3510,17 @@ def _do_login(force_relogin: bool = False) -> None:
             pass
 
         if force_relogin:
-            # Wipe in-session cookies so Chrome doesn't auto-restore the old login.
-            # delete_all_cookies() flushes through to the profile's SQLite DB.
             try:
                 driver.get("https://jp.mercari.com")
                 driver.delete_all_cookies()
                 time.sleep(0.5)
+                print("[login] クッキーを削除しました（再ログイン）")
             except Exception:
                 pass
 
+        print("[login] Mercari ログインページへ移動中…")
         driver.get("https://jp.mercari.com/login")
+        print(f"[login] ページ読み込み完了: {driver.current_url}")
         click_login_button_if_exists(driver)
         wait_for_login(driver)
         _save_session_cookies(driver)
@@ -3435,9 +3530,29 @@ def _do_login(force_relogin: bool = False) -> None:
             pass
         _session_state = "valid"
         print("[login] ログイン完了 — セッション有効")
-    except Exception as exc:
-        print(f"[login] ログイン失敗: {exc}")
+
+    except RuntimeError as exc:
+        # Chrome failed to start — show actionable error UI
+        msg = str(exc)
+        print(f"[login] Chrome起動エラー: {msg}")
+        _login_error_msg = "ブラウザを起動できませんでした。Google Chrome がインストールされていることを確認して再試行してください。"
+        _session_state = "error"
+
+    except TimeoutError as exc:
+        # wait_for_login timed out — user did not complete login; show retry button
+        print(f"[login] ログインタイムアウト: {exc}")
         _session_state = "invalid"
+
+    except Exception as exc:
+        msg = str(exc)
+        print(f"[login] ログイン失敗: {msg}")
+        # Distinguish browser-launch failures from other errors
+        if any(k in msg for k in ("Chrome", "chromedriver", "selenium", "WebDriver",
+                                   "session not created", "cannot find", "Timeout")):
+            _login_error_msg = f"ブラウザの起動に失敗しました: {msg}"
+            _session_state = "error"
+        else:
+            _session_state = "invalid"
 
 
 def _clear_session() -> None:
