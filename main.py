@@ -136,12 +136,25 @@ def _pid_owning_port(port: int):
 
 
 def _pid_is_our_app(pid: int) -> bool:
-    """Return True if the process with this PID is an MIAInventory process."""
+    """Return True if the process with this PID is an MIAInventory process.
+
+    Checks all historical bundle names and macOS 15-char process name truncations:
+      MIAInventory (current) → truncates to "MIAInvent" in ps COMMAND column
+      MercariInventory (legacy) → truncates to "MercariIn"
+    """
     try:
         cmdline = subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "args="], timeout=5
         ).decode()
-        markers = ("mercari_sync", "MIAInventory", "mia_inventory", "main.py")
+        markers = (
+            "mercari_sync",
+            "MIAInventory",
+            "MIAInvent",        # macOS 15-char truncation
+            "MercariInventory",
+            "MercariIn",        # macOS 15-char truncation of legacy name
+            "mia_inventory",
+            "main.py",
+        )
         return any(m in cmdline for m in markers)
     except Exception:
         return False

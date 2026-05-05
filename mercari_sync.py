@@ -83,7 +83,8 @@ _sync_progress: dict = {
 
 # Singleton visible-Chrome driver shared by sync and link-open
 _singleton_driver = None
-_driver_lock = threading.Lock()   # guards singleton creation only
+_driver_lock = threading.Lock()       # guards singleton creation only
+_login_start_lock = threading.Lock()  # prevents concurrent /login/start calls
 
 # Single-worker executor used to time-limit webdriver.Chrome() calls.
 # concurrent.futures.TimeoutError is raised if Chrome doesn't start within the
@@ -248,6 +249,84 @@ def cleanup_app_processes() -> None:
             print(f"[cleanup] ロックファイル削除失敗（無視）: {_e}")
 
     print("[cleanup] クリーンアップ完了")
+
+
+# Process-name fragments used to identify our own app across all historical
+# bundle names (MercariInventory → MIAInventory) and macOS 15-char truncations.
+_OWN_APP_MARKERS = (
+    "mercari_sync",
+    "MIAInventory",
+    "MIAInvent",       # 15-char truncated macOS process name
+    "MercariInventory",
+    "MercariIn",        # 15-char truncation of legacy name
+    "mia_inventory",
+    "main.py",          # dev / script run
+)
+
+
+def _cleanup_stale_port_owner(port: int = 5050) -> None:
+    """Kill any app-owned process on *port* that is NOT the current process.
+
+    Called from /login/start before launching the Selenium login thread, so a
+    stale app process left over from a previous crash cannot interfere with the
+    new login flow.
+
+    Safety: only kills processes whose cmdline matches _OWN_APP_MARKERS.
+    Never kills unrelated user processes.
+    """
+    import signal as _sig
+    my_pid = os.getpid()
+    try:
+        import subprocess as _sp
+        raw = _sp.check_output(
+            ["lsof", "-ti", f":{port}"], timeout=5
+        ).decode().strip()
+    except Exception:
+        return  # lsof unavailable or no process — nothing to do
+
+    for line in raw.splitlines():
+        try:
+            pid = int(line.strip())
+        except ValueError:
+            continue
+        if pid == my_pid:
+            continue  # that's us — leave alone
+
+        try:
+            cmdline = _sp.check_output(
+                ["ps", "-p", str(pid), "-o", "args="], timeout=5
+            ).decode()
+        except Exception:
+            continue
+
+        if not any(m in cmdline for m in _OWN_APP_MARKERS):
+            print(f"[login] ポート{port} の PID {pid} は別アプリ — スキップ")
+            continue
+
+        print(f"[login] ポート{port} に古いアプリプロセスを検出 (PID={pid}) — 終了させます")
+        try:
+            os.kill(pid, _sig.SIGTERM)
+        except ProcessLookupError:
+            print(f"[login] PID {pid} はすでに終了していました")
+            continue
+        except Exception as _e:
+            print(f"[login] SIGTERM 送信失敗 (PID={pid}): {_e}")
+            continue
+
+        # Wait up to 3 s for the process to exit, then SIGKILL.
+        for _ in range(15):
+            time.sleep(0.2)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                print(f"[login] PID {pid} 終了確認")
+                break
+        else:
+            try:
+                os.kill(pid, _sig.SIGKILL)
+                print(f"[login] PID {pid} を SIGKILL で強制終了しました")
+            except Exception:
+                pass
 
 
 def _ensure_selenium_manager() -> None:
@@ -1805,7 +1884,8 @@ def login_page():
       <p class="login-error">{_err}</p>
       <div class="login-btn-group" style="margin-top:20px">
         <form method="POST" action="/login/start">
-          <button class="btn btn-primary login-btn" type="submit">再試行する</button>
+          <button class="btn btn-primary login-btn" type="submit"
+                  onclick="this.disabled=true;this.textContent='起動中…'">再試行する</button>
         </form>
         <form method="POST" action="/login/cancel">
           <button class="btn btn-outline login-btn" type="submit">キャンセル</button>
@@ -1861,8 +1941,9 @@ def login_page():
         # "invalid" or anything unexpected — show the login button
         body_content = """
       <p class="login-desc">Mercari の在庫を同期するには、<br>Mercari アカウントでログインが必要です。</p>
-      <form method="POST" action="/login/start">
-        <button class="btn btn-primary login-btn" type="submit">
+      <form method="POST" action="/login/start" id="login-start-form">
+        <button class="btn btn-primary login-btn" type="submit" id="login-start-btn"
+                onclick="this.disabled=true;this.textContent='起動中…'">
           ログインを開始
         </button>
       </form>"""
@@ -1924,10 +2005,16 @@ def login_page():
 @app.route("/login/start", methods=["POST"])
 def login_start():
     global _session_state, _login_error_msg
-    if _session_state == "logging_in":
-        return redirect("/login")
-    _login_error_msg = ""
-    _session_state = "logging_in"
+    print("[login] ログイン開始リクエスト受信")
+    with _login_start_lock:
+        if _session_state == "logging_in":
+            print("[login] すでにログイン中のため重複リクエストを無視します")
+            return redirect("/login")
+        print("[login] ログインフローを開始します — ブラウザ起動準備中")
+        _login_error_msg = ""
+        _session_state = "logging_in"
+    # Pre-login: kill any stale app process still holding port 5050
+    _cleanup_stale_port_owner(5050)
     threading.Thread(target=_do_login, daemon=True, name="login-thread").start()
     return redirect("/login")
 
@@ -1945,10 +2032,15 @@ def login_use():
 def login_relogin():
     """Discard the existing session and force a fresh interactive login."""
     global _session_state, _login_error_msg
-    if _session_state == "logging_in":
-        return redirect("/login")
-    _login_error_msg = ""
-    _session_state = "logging_in"
+    print("[login] 再ログインリクエスト受信")
+    with _login_start_lock:
+        if _session_state == "logging_in":
+            print("[login] すでにログイン中のため重複リクエストを無視します")
+            return redirect("/login")
+        print("[login] 再ログインフローを開始します — ブラウザ起動準備中")
+        _login_error_msg = ""
+        _session_state = "logging_in"
+    _cleanup_stale_port_owner(5050)
     threading.Thread(
         target=lambda: _do_login(force_relogin=True),
         daemon=True,
