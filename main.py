@@ -15,7 +15,7 @@ import time
 import webbrowser
 
 PORT = 5050
-_APP_NAME = "MercariInventory"
+_APP_NAME = "MIAInventory"
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +80,23 @@ def get_data_dir() -> str:
     """
     Return the directory where user data (products.db, .env) should live.
 
-    PyInstaller frozen binary  → ~/Library/Application Support/MercariInventory/
+    PyInstaller frozen binary  → ~/Library/Application Support/MIAInventory/
                                  Survives app updates (new dist.zip extracts never
                                  touch this path).
     Normal Python script       → project root.
     """
     if getattr(sys, "frozen", False):
         app_support = os.path.expanduser("~/Library/Application Support")
-        data_dir = os.path.join(app_support, _APP_NAME)
+        data_dir    = os.path.join(app_support, _APP_NAME)
+        # One-time migration: move legacy MercariInventory/ → MIAInventory/
+        legacy_dir  = os.path.join(app_support, "MercariInventory")
+        if os.path.isdir(legacy_dir) and not os.path.exists(data_dir):
+            import shutil as _shutil
+            try:
+                _shutil.move(legacy_dir, data_dir)
+                print(f"[data-dir] マイグレーション完了: {legacy_dir} → {data_dir}")
+            except Exception as _e:
+                print(f"[data-dir] マイグレーション失敗: {_e}")
         os.makedirs(data_dir, exist_ok=True)
         return data_dir
     return os.path.dirname(os.path.abspath(__file__))

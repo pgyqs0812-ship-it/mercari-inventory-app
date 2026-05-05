@@ -2,7 +2,7 @@
 # build_mac.sh — Build Mercari Inventory as a macOS .app bundle + DMG installer.
 #
 # Produces:
-#   dist/MercariInventory.app            Standard macOS .app bundle
+#   dist/MIAInventory.app                Standard macOS .app bundle
 #   dist/MIAInventory_Mac_<version>.dmg  Drag-and-drop DMG installer
 #
 # Optional signing (set env vars before running):
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-APP_NAME="MercariInventory"
+APP_NAME="MIAInventory"
 ENTRY="main.py"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARIZE="${NOTARIZE:-0}"
@@ -160,7 +160,7 @@ pyinstaller \
     "${ENTRY}"
 
 # ── Code signing (.app) ───────────────────────────────────────────────────────
-# --windowed produces dist/MercariInventory.app — sign the whole bundle.
+# --windowed produces dist/MIAInventory.app — sign the whole bundle.
 # --deep signs the top-level bundle and all nested binaries/frameworks in one pass.
 
 if [ -n "${SIGN_IDENTITY}" ]; then

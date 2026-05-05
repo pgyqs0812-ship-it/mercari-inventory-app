@@ -1312,7 +1312,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.5</div>
+  <div class="sidebar-footer">v1.4.6</div>
 </nav>"""
 
 
@@ -2643,7 +2643,7 @@ def settings_page():
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.5</span>
+          <span class="settings-value">v1.4.6</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
@@ -3464,9 +3464,9 @@ def _clear_session() -> None:
             print(f"[session] クッキーファイル削除失敗: {exc}")
 
     # Delete the app-specific Chrome profile directory.
-    # Guard: the path must be inside ~/Library/Application Support/MercariInventory/
+    # Guard: the path must be inside ~/Library/Application Support/MIAInventory/
     _app_support = os.path.join(
-        os.path.expanduser("~"), "Library", "Application Support", "MercariInventory"
+        os.path.expanduser("~"), "Library", "Application Support", "MIAInventory"
     )
     if (CHROME_PROFILE_DIR
             and os.path.isdir(CHROME_PROFILE_DIR)

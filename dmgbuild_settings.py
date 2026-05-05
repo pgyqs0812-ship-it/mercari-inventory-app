@@ -3,7 +3,7 @@
 # Called by build_mac.sh and the CI "Create DMG" step:
 #
 #   dmgbuild -s dmgbuild_settings.py \
-#     -D app_path="dist/MercariInventory.app" \
+#     -D app_path="dist/MIAInventory.app" \
 #     -D bg_path="dmg_background.png" \
 #     "MIA Inventory Installer" \
 #     "dist/MIAInventory_Mac_v1.4.x.dmg"
@@ -14,7 +14,7 @@
 import os
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-_app_path     = defines.get("app_path",  "dist/MercariInventory.app")  # noqa: F821
+_app_path     = defines.get("app_path",  "dist/MIAInventory.app")  # noqa: F821
 _bg_path      = defines.get("bg_path",   "dmg_background.png")
 
 # Resolve relative paths against cwd (project root, where dmgbuild is invoked).
@@ -23,7 +23,7 @@ _app_path = os.path.abspath(os.path.join(_cwd, _app_path))
 _bg_path  = os.path.abspath(os.path.join(_cwd, _bg_path))
 _guide    = os.path.abspath(os.path.join(_cwd, "INSTALL.md"))
 
-_appname = os.path.basename(_app_path)   # "MercariInventory.app"
+_appname = os.path.basename(_app_path)   # "MIAInventory.app"
 
 # ── DMG contents ──────────────────────────────────────────────────────────────
 files    = [_app_path, _guide]
