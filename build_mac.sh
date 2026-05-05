@@ -207,7 +207,7 @@ dmgbuild \
     -s dmgbuild_settings.py \
     -D app_path="${APP_BUNDLE}" \
     -D bg_path="dmg_background.png" \
-    "MIA Inventory Installer" \
+    "MIA Inventory Installer ${VERSION}" \
     "dist/${DMG_NAME}"
 
 # ── DMG signing ──────────────────────────────────────────────────────────────
