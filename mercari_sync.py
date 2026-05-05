@@ -25,6 +25,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException as SeleniumTimeoutException
 
 DB_NAME          = "products.db"
 COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
@@ -3418,42 +3419,84 @@ def classify_items(items, existing_map):
 # ---------------------------------------------------------------------------
 
 def click_login_button_if_exists(driver):
+    """Click the login button on the Mercari login page, if present.
+
+    Only acts when a login form (email/password input) is actually visible —
+    prevents accidentally clicking account-menu "ログイン" links when the user
+    is already logged in and the avatar is shown at /login.
+    """
     time.sleep(2)
+    # Guard: only proceed when the login form is actually on the page
+    form_inputs = driver.find_elements(
+        By.CSS_SELECTOR, "input[type='email'], input[type='password']"
+    )
+    if not form_inputs:
+        print("[login] ログインフォームなし — ボタンクリックをスキップ")
+        return
     for el in driver.find_elements(By.TAG_NAME, "button") + driver.find_elements(By.TAG_NAME, "a"):
         text = el.text.strip()
         if "ログイン" in text or "login" in text.lower():
             try:
                 driver.execute_script("arguments[0].click();", el)
-                print("ログイン按钮已自动点击")
+                print("[login] ログインボタンをクリックしました")
                 time.sleep(1)
                 return
             except Exception:
                 pass
-    print("没有找到可自动点击的ログイン按钮，请手动点击。")
+    print("[login] ログインボタンが見つかりません — 手動でクリックしてください")
 
 
 def wait_for_login(driver, timeout=120):
-    """Poll until the browser URL indicates a completed Mercari login.
+    """Poll until Mercari login is detected, using URL and DOM checks.
 
-    Login is considered complete when the URL is on mercari.com AND is no
-    longer on a login or auth page.  This handles redirects through
-    intermediate auth subdomains (e.g. auth.mercari.com) that do not contain
-    the word "login".
+    Primary check: URL has left the login/auth pages.
+    Fallback check: URL is still /login but the login form inputs are gone
+        (Mercari shows the logged-in state at /login without redirecting).
+
+    Logs progress every 10 seconds so packaged-app logs remain useful.
     """
     print("[login] ブラウザで Mercari にログインしてください（最大 2 分待機）")
-    deadline = time.time() + timeout
+    deadline   = time.time() + timeout
+    last_log   = time.time()
+    iteration  = 0
     while time.time() < deadline:
         try:
             url = driver.current_url
+
+            # ── Primary: URL left the login/auth pages ──────────────────────
             if ("mercari.com" in url
                     and "/login" not in url
                     and "/auth"  not in url):
                 time.sleep(1)
-                print(f"[login] ログイン確認完了: {url}")
+                print(f"[login] ログイン確認（URL）: {url}")
                 return
+
+            # ── Fallback: URL still /login but login form is absent ──────────
+            # Mercari sometimes shows the logged-in avatar at /login without
+            # redirecting; absence of email/password inputs is a reliable signal.
+            try:
+                form_inputs = driver.find_elements(
+                    By.CSS_SELECTOR, "input[type='email'], input[type='password']"
+                )
+                if not form_inputs and "mercari.com" in url:
+                    time.sleep(1)
+                    print(f"[login] ログイン確認（DOM）: フォームなし at {url}")
+                    return
+            except Exception:
+                pass
+
+            # ── Periodic progress log ────────────────────────────────────────
+            if time.time() - last_log >= 10:
+                remaining = int(deadline - time.time())
+                print(f"[login] 待機中… URL={url} (残り {remaining}s)")
+                last_log = time.time()
+
         except Exception:
             pass
+
+        iteration += 1
         time.sleep(2)
+
     raise TimeoutError("ログインがタイムアウトしました（2 分）。再試行してください。")
 
 
@@ -3515,12 +3558,37 @@ def _do_login(force_relogin: bool = False) -> None:
                 driver.delete_all_cookies()
                 time.sleep(0.5)
                 print("[login] クッキーを削除しました（再ログイン）")
-            except Exception:
+            except (Exception, SeleniumTimeoutException):
                 pass
+        else:
+            # ── Fast-path: check if already logged in before opening /login ──
+            # Navigate to mypage — if the session is valid, Mercari keeps us
+            # there; if not, it redirects to /login.
+            print("[login] 既存セッション確認中 (mypage/listings)…")
+            try:
+                driver.get("https://jp.mercari.com/mypage/listings")
+                time.sleep(2)
+                url = driver.current_url
+                print(f"[login] セッション確認 URL: {url}")
+                if "login" not in url and "auth" not in url:
+                    print("[login] 既にログイン済み — セッション有効")
+                    _save_session_cookies(driver)
+                    try:
+                        driver.set_window_position(-3000, 0)
+                    except Exception:
+                        pass
+                    _session_state = "valid"
+                    return
+                print("[login] セッション無効 → ログインページへ移動します")
+            except SeleniumTimeoutException:
+                print("[login] mypage 読み込みタイムアウト — ログインページへ進みます")
 
         print("[login] Mercari ログインページへ移動中…")
-        driver.get("https://jp.mercari.com/login")
-        print(f"[login] ページ読み込み完了: {driver.current_url}")
+        try:
+            driver.get("https://jp.mercari.com/login")
+        except SeleniumTimeoutException:
+            print("[login] ログインページ読み込みタイムアウト — 部分読み込みで継続")
+        print(f"[login] 現在のURL: {driver.current_url}")
         click_login_button_if_exists(driver)
         wait_for_login(driver)
         _save_session_cookies(driver)
