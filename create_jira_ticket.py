@@ -167,16 +167,23 @@ def _build_release_adf(version: str, summary: str, release_url: str) -> dict:
     return {"type": "doc", "version": 1, "content": content}
 
 
-def _build_close_comment_adf(version: str, release_url: str) -> dict:
+def _build_close_comment_adf(
+    version: str,
+    release_url: str,
+    artifacts: list = None,
+) -> dict:
     """ADF comment body confirming a successful release."""
     lines = []
     if version:
         lines.append(f"バージョン       : {version}")
     if release_url:
         lines.append(f"GitHub Release   : {release_url}")
-    lines.append("dist.zip         : 生成済み ✓")
-    lines.append("download-qr.png  : 生成済み ✓")
     lines.append("CI ステータス    : success ✓")
+    lines.append("")
+    lines.append("== リリースアーティファクト ==")
+    if artifacts:
+        for name in artifacts:
+            lines.append(f"  {name} ✓")
     return {
         "type": "doc",
         "version": 1,
@@ -344,11 +351,12 @@ def add_comment(
     issue_key: str,
     version: str = "",
     release_url: str = "",
+    artifacts: list = None,
 ) -> None:
     """Add a release-success comment to a Jira issue. Exits on failure."""
     validate_config()
     _log("INFO", f"コメントを追加: {issue_key} ...")
-    adf_body = _build_close_comment_adf(version, release_url)
+    adf_body = _build_close_comment_adf(version, release_url, artifacts=artifacts)
     try:
         r = requests.post(
             f"{JIRA_URL}/rest/api/3/issue/{issue_key}/comment",
@@ -411,6 +419,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="完了に移行してリリースコメントを追加 (例: KAN-31)")
     p.add_argument("--update-description", metavar="ISSUE_KEY",
                    help="既存イシューの説明を更新 (例: KAN-31)")
+    p.add_argument("--artifact", dest="artifacts", action="append", default=[],
+                   metavar="NAME",
+                   help="リリースアーティファクト名（繰り返し指定可）。コメントに記載される。")
     return p
 
 
@@ -424,8 +435,14 @@ if __name__ == "__main__":
         _log("INFO", f"バージョン        : {args.version or '(未指定)'}")
         _log("INFO", f"GitHub Release URL: {args.release_url or '(未指定)'}")
         _log("INFO", "=" * 60)
+        _log("INFO", f"アーティファクト  : {args.artifacts or '(未指定)'}")
         transition_to_done(args.done)
-        add_comment(args.done, version=args.version, release_url=args.release_url)
+        add_comment(
+            args.done,
+            version=args.version,
+            release_url=args.release_url,
+            artifacts=args.artifacts or None,
+        )
 
     elif args.update_description:
         _log("INFO", "=" * 60)

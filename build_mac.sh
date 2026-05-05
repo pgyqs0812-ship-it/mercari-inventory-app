@@ -1,8 +1,9 @@
 #!/bin/bash
-# build_mac.sh — Build Mercari Inventory as a macOS .app bundle.
+# build_mac.sh — Build Mercari Inventory as a macOS .app bundle + DMG installer.
 #
 # Produces:
-#   dist/MercariInventory.app    Standard macOS app bundle (double-click to launch)
+#   dist/MercariInventory.app            Standard macOS .app bundle
+#   dist/MIAInventory_Mac_<version>.dmg  Drag-and-drop DMG installer
 #
 # Optional signing (set env vars before running):
 #   SIGN_IDENTITY  — "Developer ID Application: Your Name (TEAMID)"
@@ -11,6 +12,7 @@
 #   NOTARIZE_PROFILE — keychain profile name created via:
 #                       xcrun notarytool store-credentials ...
 #                      (only needed when NOTARIZE=1)
+#   VERSION        — override the version tag (default: latest git tag)
 #
 # Usage:
 #   chmod +x build_mac.sh
@@ -25,14 +27,18 @@ ENTRY="main.py"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARIZE="${NOTARIZE:-0}"
 NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-notarytool-profile}"
+VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)}"
 
 APP_BUNDLE="dist/${APP_NAME}.app"
+DMG_NAME="MIAInventory_Mac_${VERSION}.dmg"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════╗"
 echo "║   Mercari Inventory — Mac Build Tool         ║"
 echo "╚══════════════════════════════════════════════╝"
+echo ""
+echo "  Version : ${VERSION}"
 echo ""
 
 # ── Python / venv ─────────────────────────────────────────────────────────────
@@ -58,12 +64,22 @@ if [ "${PY_MAJOR}" -eq 3 ] && [ "${PY_MINOR}" -ge 13 ]; then
     echo ""
 fi
 
-# ── Install PyInstaller ───────────────────────────────────────────────────────
+# ── Install build dependencies ────────────────────────────────────────────────
 if ! python3 -c "import PyInstaller" &>/dev/null; then
     echo "Installing PyInstaller..."
     pip install --quiet pyinstaller
 fi
 echo "✓ PyInstaller $(python3 -c "import PyInstaller; print(PyInstaller.__version__)")"
+
+if ! python3 -c "import PIL" &>/dev/null; then
+    echo "Installing Pillow..."
+    pip install --quiet pillow
+fi
+
+if ! python3 -c "import dmgbuild" &>/dev/null; then
+    echo "Installing dmgbuild..."
+    pip install --quiet dmgbuild
+fi
 
 # ── Check entry point ─────────────────────────────────────────────────────────
 if [ ! -f "${ENTRY}" ]; then
@@ -74,6 +90,11 @@ fi
 # ── Clean previous build ──────────────────────────────────────────────────────
 echo "Cleaning previous build artifacts..."
 rm -rf build/ dist/ "${APP_NAME}.spec"
+
+# ── App icon ──────────────────────────────────────────────────────────────────
+echo "Generating app icon..."
+python3 create_icon.py
+echo "✓ AppIcon.icns"
 
 # ── selenium-manager binary path ─────────────────────────────────────────────
 # Resolved at build time so execute permissions are preserved inside the bundle.
@@ -95,6 +116,7 @@ pyinstaller \
     --name "${APP_NAME}" \
     --onedir \
     --windowed \
+    --icon "AppIcon.icns" \
     --noconfirm \
     \
     `# Flask and its runtime deps` \
@@ -137,13 +159,13 @@ pyinstaller \
     \
     "${ENTRY}"
 
-# ── Code signing ──────────────────────────────────────────────────────────────
+# ── Code signing (.app) ───────────────────────────────────────────────────────
 # --windowed produces dist/MercariInventory.app — sign the whole bundle.
 # --deep signs the top-level bundle and all nested binaries/frameworks in one pass.
 
 if [ -n "${SIGN_IDENTITY}" ]; then
     echo ""
-    echo "Signing with Developer ID: ${SIGN_IDENTITY}"
+    echo "Signing .app with Developer ID: ${SIGN_IDENTITY}"
 
     ENTITLEMENTS="entitlements.plist"
     SIGN_ARGS=(--sign "${SIGN_IDENTITY}" --force --options runtime)
@@ -154,11 +176,11 @@ if [ -n "${SIGN_IDENTITY}" ]; then
     fi
 
     codesign "${SIGN_ARGS[@]}" --deep "${APP_BUNDLE}"
-    echo "✓ Signed (Developer ID)"
+    echo "✓ .app signed (Developer ID)"
 
     # ── Notarization ─────────────────────────────────────────────────────────
     if [ "${NOTARIZE}" = "1" ]; then
-        echo "Submitting to Apple notarization service (this takes a few minutes)..."
+        echo "Submitting .app to Apple notarization service (this takes a few minutes)..."
         NOTARIZE_ZIP="notarize_submit.zip"
         ditto -c -k --keepParent "${APP_BUNDLE}" "${NOTARIZE_ZIP}"
         xcrun notarytool submit "${NOTARIZE_ZIP}" \
@@ -166,14 +188,35 @@ if [ -n "${SIGN_IDENTITY}" ]; then
             --wait
         rm -f "${NOTARIZE_ZIP}"
         xcrun stapler staple "${APP_BUNDLE}"
-        echo "✓ Notarized and stapled"
+        echo "✓ .app notarized and stapled"
     fi
 
 else
-    # Ad-hoc sign the bundle for local dev runs.
-    # Prevents Killed:9 on the same machine; does NOT satisfy Gatekeeper on other Macs.
     codesign --sign - --force --deep "${APP_BUNDLE}" 2>/dev/null || true
-    echo "✓ Ad-hoc signed (dev build — see SIGNING.md for distribution signing)"
+    echo "✓ .app ad-hoc signed (dev build — see SIGNING.md for distribution signing)"
+fi
+
+# ── DMG background image ──────────────────────────────────────────────────────
+echo ""
+echo "Generating DMG background..."
+VERSION="${VERSION}" python3 create_dmg_bg.py
+
+# ── DMG creation ─────────────────────────────────────────────────────────────
+echo "Creating DMG installer: dist/${DMG_NAME} ..."
+dmgbuild \
+    -s dmgbuild_settings.py \
+    -D app_path="${APP_BUNDLE}" \
+    -D bg_path="dmg_background.png" \
+    "MIA Inventory Installer" \
+    "dist/${DMG_NAME}"
+
+# ── DMG signing ──────────────────────────────────────────────────────────────
+if [ -n "${SIGN_IDENTITY}" ]; then
+    codesign --sign "${SIGN_IDENTITY}" --force "dist/${DMG_NAME}"
+    echo "✓ DMG signed (Developer ID)"
+else
+    codesign --sign - --force "dist/${DMG_NAME}" 2>/dev/null || true
+    echo "✓ DMG ad-hoc signed"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -182,13 +225,14 @@ echo "╔═══════════════════════�
 echo "║   Build complete!                            ║"
 echo "╠══════════════════════════════════════════════╣"
 echo "║                                              ║"
-printf "║  App bundle: dist/%-26s║\n" "${APP_NAME}.app"
+printf "║  App bundle : dist/%-25s║\n" "${APP_NAME}.app"
+printf "║  DMG        : dist/%-25s║\n" "${DMG_NAME}"
 echo "║                                              ║"
-echo "║  Launch:                                     ║"
+echo "║  Install:                                    ║"
+printf "║    open dist/%-31s║\n" "${DMG_NAME}"
+echo "║                                              ║"
+echo "║  Or launch directly:                         ║"
 printf "║    open dist/%-31s║\n" "${APP_NAME}.app"
-echo "║                                              ║"
-echo "║  Distribute:                                 ║"
-printf "║    zip -r %s.zip dist/%s  ║\n" "${APP_NAME}" "${APP_NAME}.app"
 echo "║                                              ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
@@ -198,8 +242,7 @@ echo "      https://www.google.com/chrome/"
 echo ""
 if [ -z "${SIGN_IDENTITY}" ]; then
     echo "NOTE: This is an unsigned (ad-hoc) build."
-    echo "      Downloaded builds may trigger Gatekeeper on other Macs."
-    echo "      Right-click → Open on first launch, or see SIGNING.md for"
-    echo "      Developer ID signing + notarization setup."
+    echo "      Right-click → Open on first launch for Gatekeeper bypass."
+    echo "      See SIGNING.md for Developer ID signing + notarization setup."
     echo ""
 fi

@@ -10,6 +10,11 @@ __pycache__/
 dist/
 build/
 *.spec
+
+# Generated build assets (created at build time by create_icon.py / create_dmg_bg.py)
+AppIcon.icns
+AppIcon.iconset/
+dmg_background.png
 venv312/
 venv/
 .claude/
