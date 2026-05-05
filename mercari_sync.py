@@ -3421,18 +3421,12 @@ def classify_items(items, existing_map):
 def click_login_button_if_exists(driver):
     """Click the login button on the Mercari login page, if present.
 
-    Only acts when a login form (email/password input) is actually visible —
-    prevents accidentally clicking account-menu "ログイン" links when the user
-    is already logged in and the avatar is shown at /login.
+    Called only after the fast-path in _do_login() has already confirmed the
+    user is NOT logged in, so we do not need a form-inputs guard here.
+    Mercari's React SPA may use custom elements that don't expose standard
+    input[type='email'] in the DOM, so the guard was causing a false skip.
     """
     time.sleep(2)
-    # Guard: only proceed when the login form is actually on the page
-    form_inputs = driver.find_elements(
-        By.CSS_SELECTOR, "input[type='email'], input[type='password']"
-    )
-    if not form_inputs:
-        print("[login] ログインフォームなし — ボタンクリックをスキップ")
-        return
     for el in driver.find_elements(By.TAG_NAME, "button") + driver.find_elements(By.TAG_NAME, "a"):
         text = el.text.strip()
         if "ログイン" in text or "login" in text.lower():
@@ -3447,13 +3441,14 @@ def click_login_button_if_exists(driver):
 
 
 def wait_for_login(driver, timeout=120):
-    """Poll until Mercari login is detected, using URL and DOM checks.
+    """Poll until Mercari login is detected via URL change.
 
-    Primary check: URL has left the login/auth pages.
-    Fallback check: URL is still /login but the login form inputs are gone
-        (Mercari shows the logged-in state at /login without redirecting).
-
-    Logs progress every 10 seconds so packaged-app logs remain useful.
+    Success: URL navigates away from /login and /auth pages.
+    The DOM-fallback (absence of form inputs) was removed because Mercari's
+    React SPA does not render standard input[type='email'] immediately after
+    driver.get(), causing a false positive on the first poll iteration.
+    The fast-path in _do_login() already handles the "already logged in" case,
+    so by the time this function runs the user definitely needs to log in.
     """
     print("[login] ブラウザで Mercari にログインしてください（最大 2 分待機）")
     deadline   = time.time() + timeout
@@ -3463,7 +3458,6 @@ def wait_for_login(driver, timeout=120):
         try:
             url = driver.current_url
 
-            # ── Primary: URL left the login/auth pages ──────────────────────
             if ("mercari.com" in url
                     and "/login" not in url
                     and "/auth"  not in url):
@@ -3471,21 +3465,6 @@ def wait_for_login(driver, timeout=120):
                 print(f"[login] ログイン確認（URL）: {url}")
                 return
 
-            # ── Fallback: URL still /login but login form is absent ──────────
-            # Mercari sometimes shows the logged-in avatar at /login without
-            # redirecting; absence of email/password inputs is a reliable signal.
-            try:
-                form_inputs = driver.find_elements(
-                    By.CSS_SELECTOR, "input[type='email'], input[type='password']"
-                )
-                if not form_inputs and "mercari.com" in url:
-                    time.sleep(1)
-                    print(f"[login] ログイン確認（DOM）: フォームなし at {url}")
-                    return
-            except Exception:
-                pass
-
-            # ── Periodic progress log ────────────────────────────────────────
             if time.time() - last_log >= 10:
                 remaining = int(deadline - time.time())
                 print(f"[login] 待機中… URL={url} (残り {remaining}s)")
@@ -3567,7 +3546,7 @@ def _do_login(force_relogin: bool = False) -> None:
             print("[login] 既存セッション確認中 (mypage/listings)…")
             try:
                 driver.get("https://jp.mercari.com/mypage/listings")
-                time.sleep(2)
+                time.sleep(3)
                 url = driver.current_url
                 print(f"[login] セッション確認 URL: {url}")
                 if "login" not in url and "auth" not in url:
