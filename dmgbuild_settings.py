@@ -21,12 +21,11 @@ _bg_path      = defines.get("bg_path",   "dmg_background.png")
 _cwd = os.getcwd()
 _app_path = os.path.abspath(os.path.join(_cwd, _app_path))
 _bg_path  = os.path.abspath(os.path.join(_cwd, _bg_path))
-_guide    = os.path.abspath(os.path.join(_cwd, "INSTALL.md"))
 
 _appname = os.path.basename(_app_path)   # "MercariInventory.app"
 
 # ── DMG contents ──────────────────────────────────────────────────────────────
-files    = [_app_path, _guide]
+files    = [_app_path]
 symlinks = {"Applications": "/Applications"}
 
 # ── Window appearance ─────────────────────────────────────────────────────────
@@ -60,7 +59,6 @@ text_size       = 12
 # (x, y) are the centre coordinates of each icon within the window.
 # These must match the visual guides drawn in create_dmg_bg.py.
 icon_locations = {
-    _appname:       (170, 175),    # app — left drop-zone
-    "Applications": (490, 175),    # symlink — right drop-zone
-    "INSTALL.md":   (330, 310),    # guide — bottom centre
+    _appname:       (170, 175),    # app — left
+    "Applications": (490, 175),    # symlink — right
 }
