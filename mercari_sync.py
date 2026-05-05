@@ -1,5 +1,8 @@
 import json
+import logging
+import logging.handlers
 import os
+import platform
 import re
 import queue
 import threading
@@ -25,6 +28,53 @@ DB_NAME          = "products.db"
 COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
 CHROME_PROFILE_DIR = ""                    # patched to absolute path by main.py
 LICENSE_FILE     = "license.json"          # patched to absolute path by main.py
+
+# ---------------------------------------------------------------------------
+# App version
+# ---------------------------------------------------------------------------
+try:
+    from _version import APP_VERSION  # generated at build time by CI
+except ImportError:
+    APP_VERSION = "dev"
+
+# ---------------------------------------------------------------------------
+# Diagnostic logging
+# ---------------------------------------------------------------------------
+# Module-level logger — configured by setup_app_logging() called from main.py.
+# Falls back to a no-op NullHandler so imports in tests never raise errors.
+_logger = logging.getLogger("mia")
+_logger.addHandler(logging.NullHandler())
+
+_LOG_DIR: str = ""   # absolute path to logs/ dir; set by setup_app_logging()
+
+
+def setup_app_logging(logs_dir: str) -> None:
+    """Attach a RotatingFileHandler to the 'mia' logger.
+
+    Called once from main.py after the data directory is known.
+    The root logger already has handlers (set up in main._setup_logging);
+    this adds a second handler so mia.* events also appear in app-runtime.log.
+    """
+    global _LOG_DIR
+    _LOG_DIR = logs_dir
+    os.makedirs(logs_dir, exist_ok=True)
+    log_path = os.path.join(logs_dir, "app-runtime.log")
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+
+    _logger.setLevel(logging.INFO)
+    _logger.addHandler(fh)
+    _logger.propagate = False   # root already writes to the same file
+    _logger.info("[setup] app logging initialised — log dir: %s", logs_dir)
+    _logger.info("[setup] app version: %s | OS: %s %s",
+                 APP_VERSION, platform.system(), platform.release())
 
 
 class _SyncStopped(Exception):
@@ -1191,7 +1241,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.2</div>
+  <div class="sidebar-footer">{html_module.escape(APP_VERSION)}</div>
 </nav>"""
 
 
@@ -1491,17 +1541,21 @@ def sync():
     def _bg_sync():
         global _sync_running, _sync_progress, _sync_stop_requested
         _sync_stop_requested = False   # clear any leftover stop flag from previous run
+        _logger.info("[sync] 同期開始 — 対象ステータス: %s", selected)
         try:
             run_scraper(selected_statuses=selected)
             if _check_plan() == "free":
                 _record_sync_date()
+            _logger.info("[sync] 同期完了")
         except _SyncStopped:
             print("[sync] 強制停止されました")
+            _logger.info("[sync] 強制停止されました")
             _sync_progress["stopped"] = True
         except Exception as exc:
             import traceback
             print("[sync] 同期エラー:")
             traceback.print_exc()
+            _logger.error("[sync] 同期エラー: %s\n%s", exc, traceback.format_exc())
             _sync_progress["error"] = str(exc).split("\n")[0][:200]
         finally:
             _sync_running = False
@@ -1663,13 +1717,16 @@ def login_page():
 @app.route("/login/start", methods=["POST"])
 def login_start():
     global _session_state, _login_error_msg, _login_start_time
+    _logger.info("[login] ログインボタンが押されました (state=%s)", _session_state)
     with _login_start_lock:
         stuck = (_session_state == "logging_in" and time.time() - _login_start_time > 120)
         if _session_state == "logging_in" and not stuck:
+            _logger.info("[login] 重複リクエストを無視 (logging_in 進行中)")
             return redirect("/login")
         _login_error_msg = ""
         _session_state = "logging_in"
         _login_start_time = time.time()
+    _logger.info("[login] ログイン開始 — バックグラウンドスレッド起動")
     threading.Thread(target=_do_login, daemon=True, name="login-thread").start()
     return redirect("/login")
 
@@ -1687,13 +1744,16 @@ def login_use():
 def login_relogin():
     """Discard the existing session and force a fresh interactive login."""
     global _session_state, _login_error_msg, _login_start_time
+    _logger.info("[login] 再ログインリクエスト (state=%s)", _session_state)
     with _login_start_lock:
         stuck = (_session_state == "logging_in" and time.time() - _login_start_time > 120)
         if _session_state == "logging_in" and not stuck:
+            _logger.info("[login] 重複リクエストを無視 (logging_in 進行中)")
             return redirect("/login")
         _login_error_msg = ""
         _session_state = "logging_in"
         _login_start_time = time.time()
+    _logger.info("[login] 強制再ログイン開始")
     threading.Thread(
         target=lambda: _do_login(force_relogin=True),
         daemon=True,
@@ -1773,7 +1833,7 @@ def open_url():
 
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
-    # Give the browser enough time to receive this response before the process exits
+    _logger.info("[shutdown] シャットダウンリクエスト受信 — 0.8 秒後に終了")
     threading.Thread(
         target=lambda: (time.sleep(0.8), os._exit(0)),
         daemon=True,
@@ -2499,13 +2559,13 @@ def settings_page():
       </div>
     </div>"""
 
-    app_card = """
+    app_card = f"""
     <div class="card">
       <div class="card-header"><span class="card-title">アプリ情報</span></div>
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.2</span>
+          <span class="settings-value">{html_module.escape(APP_VERSION)}</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
@@ -2517,9 +2577,129 @@ def settings_page():
       </div>
     </div>"""
 
-    content = f"{info_card}\n{plan_card}\n{actions_card}\n{app_card}"
+    diag_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">診断・サポート</span></div>
+      <div class="card-body">
+        <div class="settings-row">
+          <span class="settings-label">ログ保存先</span>
+          <span class="settings-path">{html_module.escape(_LOG_DIR or app_data_dir + "/logs")}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:16px">
+          <form method="POST" action="/support/open-logs">
+            <button class="btn btn-outline" type="submit">
+              ログフォルダを開く
+            </button>
+          </form>
+          <a class="btn btn-outline" href="/support/export-logs"
+             style="text-decoration:none">
+            診断ログをエクスポート
+          </a>
+          <button class="btn btn-outline" type="button"
+                  onclick="(function(){{
+                    var s = 'MIA Inventory 診断サマリー\\n'
+                          + '========================\\n'
+                          + 'バージョン: {html_module.escape(APP_VERSION)}\\n'
+                          + 'データ保存先: {html_module.escape(app_data_dir)}\\n'
+                          + 'ログ保存先: {html_module.escape(_LOG_DIR or app_data_dir + '/logs')}\\n'
+                          + 'ポート: 5050\\n'
+                          + '取得日時: ' + new Date().toLocaleString('ja-JP');
+                    navigator.clipboard.writeText(s).then(function(){{
+                      alert('診断サマリーをクリップボードにコピーしました');
+                    }});
+                  }})()">
+            診断サマリーをコピー
+          </button>
+        </div>
+        <p style="margin-top:12px;font-size:12px;color:var(--muted)">
+          問題が発生した場合は「診断ログをエクスポート」で ZIP を作成し、
+          サポートにお送りください。パスワード・Cookie などの個人情報は含まれません。
+        </p>
+      </div>
+    </div>"""
+
+    content = f"{info_card}\n{plan_card}\n{actions_card}\n{app_card}\n{diag_card}"
     return _page_shell("設定", "settings", content,
                        subtitle="セッション管理・アプリ情報")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic support routes
+# ---------------------------------------------------------------------------
+
+@app.route("/support/open-logs", methods=["POST"])
+def support_open_logs():
+    """Open the logs directory in Finder."""
+    if _session_state != "valid":
+        return redirect("/login")
+    logs_dir = _LOG_DIR or os.path.join(
+        os.path.dirname(os.path.abspath(DB_NAME)), "logs"
+    )
+    os.makedirs(logs_dir, exist_ok=True)
+    try:
+        import subprocess as _sp
+        _sp.Popen(["open", logs_dir])
+        _logger.info("[support] ログフォルダを Finder で開きました: %s", logs_dir)
+    except Exception as exc:
+        _logger.error("[support] ログフォルダを開けませんでした: %s", exc)
+    return redirect("/settings")
+
+
+@app.route("/support/export-logs")
+def support_export_logs():
+    """Stream a zip of recent log files as a download.
+
+    Privacy: includes only log files and a plain-text summary.
+    Never includes products.db, license.json, mercari_session.json,
+    or chrome-profile/.
+    """
+    if _session_state != "valid":
+        return redirect("/login")
+
+    import zipfile
+    import glob
+
+    logs_dir = _LOG_DIR or os.path.join(
+        os.path.dirname(os.path.abspath(DB_NAME)), "logs"
+    )
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"MIAInventory_DiagnosticLogs_{ts}.zip"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # Include all rotated log files
+        for log_path in sorted(glob.glob(os.path.join(logs_dir, "app-runtime.log*"))):
+            zf.write(log_path, os.path.basename(log_path))
+
+        # Include plain-text diagnostic summary
+        import platform as _pl
+        summary_lines = [
+            "MIA Inventory — 診断サマリー",
+            "=" * 40,
+            f"バージョン    : {APP_VERSION}",
+            f"OS            : {_pl.system()} {_pl.release()} ({_pl.machine()})",
+            f"Python        : {_pl.python_version()}",
+            f"データ保存先  : {os.path.dirname(os.path.abspath(DB_NAME)) if DB_NAME else 'unknown'}",
+            f"ログ保存先    : {logs_dir}",
+            f"ポート        : 5050",
+            f"ログイン状態  : {_session_state}",
+            f"最終ログイン  : {_session_last_login or '不明'}",
+            f"エクスポート時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "注意: このファイルには認証情報・パスワード・Cookie は含まれません。",
+        ]
+        zf.writestr("diagnostic_summary.txt", "\n".join(summary_lines))
+
+    buf.seek(0)
+    _logger.info("[support] 診断ログ ZIP を生成しました: %s", zip_name)
+    return Response(
+        buf.getvalue(),
+        status=200,
+        headers={
+            "Content-Type": "application/zip",
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3105,6 +3285,8 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
         _t = threading.Thread(target=_chrome_worker, daemon=True,
                               name=f"chrome-launch-{attempt}")
         _t.start()
+        _logger.info("[selenium] Chrome 起動試行 %d/%d (headless=%s)",
+                     attempt + 1, max_attempts, headless)
         try:
             _status, _val = _result_q.get(timeout=LAUNCH_TIMEOUT)
         except _q.Empty:
@@ -3114,6 +3296,8 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
                 "もう一度試すか、PC を再起動してください。"
             )
             print(f"[driver] Chrome起動タイムアウト (attempt {attempt + 1}/{max_attempts})")
+            _logger.error("[selenium] Chrome 起動タイムアウト (attempt %d, timeout=%ds)",
+                          attempt + 1, LAUNCH_TIMEOUT)
             if attempt == 0 and not headless:
                 _kill_orphan_chromedriver()
                 _clear_profile_lock()
@@ -3122,12 +3306,15 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
         if _status == "err":
             last_exc = _val
             print(f"[driver] Chrome起動失敗 (attempt {attempt + 1}/{max_attempts}): {_val}")
+            _logger.error("[selenium] Chrome 起動失敗 (attempt %d): %s",
+                          attempt + 1, _val)
             if attempt == 0 and not headless:
                 _kill_orphan_chromedriver()
                 _clear_profile_lock()
                 time.sleep(1.0)
             continue
         driver = _val
+        _logger.info("[selenium] Chrome 起動成功 (attempt %d)", attempt + 1)
         break
 
     if driver is None:
@@ -3290,12 +3477,15 @@ def _do_login(force_relogin: bool = False) -> None:
     "invalid" on login timeout or other errors.
     """
     global _session_state, _login_error_msg
+    _logger.info("[login] _do_login 開始 (force_relogin=%s, profile=%s)",
+                 force_relogin, CHROME_PROFILE_DIR)
     try:
         try:
             driver = _get_or_create_driver()
         except Exception as exc:
             msg = str(exc).split("\n")[0]
             print(f"[login] Chrome起動失敗: {exc}")
+            _logger.error("[login] Chrome 起動失敗: %s", exc)
             _login_error_msg = f"Chrome の起動に失敗しました: {msg}"
             _session_state = "error"
             return
@@ -3314,6 +3504,7 @@ def _do_login(force_relogin: bool = False) -> None:
             except Exception:
                 pass
 
+        _logger.info("[login] Mercari ログインページに移動")
         driver.get("https://jp.mercari.com/login")
         click_login_button_if_exists(driver)
         wait_for_login(driver)
@@ -3323,13 +3514,17 @@ def _do_login(force_relogin: bool = False) -> None:
         except Exception:
             pass
         _session_state = "valid"
+        _logger.info("[login] ログイン完了 — セッション有効")
         print("[login] ログイン完了 — セッション有効")
     except Exception as exc:
+        import traceback
         print(f"[login] ログイン失敗: {exc}")
+        _logger.error("[login] ログイン失敗: %s\n%s", exc, traceback.format_exc())
         _session_state = "invalid"
     finally:
         if _session_state == "logging_in":
             print("[login] 警告: ログインスレッドが logging_in のまま終了 — invalid にリセット")
+            _logger.warning("[login] logging_in のまま終了 — invalid にリセット")
             _session_state = "invalid"
 
 

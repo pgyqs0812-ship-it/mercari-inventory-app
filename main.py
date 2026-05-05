@@ -6,6 +6,7 @@ browser automatically. Runs as a windowed .app bundle (no terminal window);
 errors and status are surfaced via macOS dialogs and notifications.
 """
 import logging
+import logging.handlers
 import os
 import socket
 import subprocess
@@ -23,20 +24,41 @@ _APP_NAME_LEGACY = "MercariInventory"   # old bundle name — migration source o
 # Logging
 # ---------------------------------------------------------------------------
 
-def _setup_logging(data_dir: str) -> None:
-    log_path = os.path.join(data_dir, "app.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+def _setup_logging(data_dir: str) -> str:
+    """Configure root logger with a rotating file handler.
+
+    Returns the logs directory path so callers can pass it to sub-modules.
+    """
+    logs_dir = os.path.join(data_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    log_path = os.path.join(logs_dir, "app-runtime.log")
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=5 * 1024 * 1024,   # 5 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+
+    return logs_dir
 
 
 def _log(msg: str) -> None:
-    logging.info(msg)
+    logging.getLogger("mia.startup").info(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +75,7 @@ def _show_dialog(title: str, message: str) -> None:
         )
         subprocess.run(["osascript", "-e", script], timeout=30)
     except Exception:
-        pass  # fall back silently — error is also in app.log
+        pass  # fall back silently — error is also in app-runtime.log
 
 
 def _notify(message: str) -> None:
@@ -195,15 +217,17 @@ def _migrate_app_support_dir(data_dir: str) -> None:
 
 def main() -> None:
     data_dir = get_data_dir()
-    _setup_logging(data_dir)
+    logs_dir = _setup_logging(data_dir)
 
     _log("=" * 54)
     _log("  MIA Inventory App")
     _log(f"  データ保存先: {data_dir}")
+    _log(f"  ログ保存先:   {logs_dir}")
     _log(f"  URL:          http://127.0.0.1:{PORT}")
     _log("=" * 54)
 
     check_chrome_browser()
+    _log("[startup] Chrome browser found")
 
     if getattr(sys, "frozen", False):
         _migrate_app_support_dir(data_dir)
@@ -213,17 +237,20 @@ def main() -> None:
     os.environ.setdefault("FLASK_ENV", "production")
 
     import mercari_sync as _ms  # noqa: PLC0415
-    _ms.DB_NAME           = os.path.join(data_dir, "products.db")
-    _ms.COOKIE_FILE       = os.path.join(data_dir, "mercari_session.json")
+    _ms.DB_NAME            = os.path.join(data_dir, "products.db")
+    _ms.COOKIE_FILE        = os.path.join(data_dir, "mercari_session.json")
     _ms.CHROME_PROFILE_DIR = os.path.join(data_dir, "chrome-profile")
-    _ms.LICENSE_FILE      = os.path.join(data_dir, "license.json")
+    _ms.LICENSE_FILE       = os.path.join(data_dir, "license.json")
+    _ms.setup_app_logging(logs_dir)   # hand logs dir to Flask/sync module
     flask_app    = _ms.app
     init_db      = _ms.init_db
     init_license = _ms.init_license
 
-    # If a server is already listening, just open the browser and exit.
-    if is_port_in_use(PORT):
-        _log(f"ポート {PORT} はすでに使用中です — ブラウザを開きます")
+    port_busy = is_port_in_use(PORT)
+    _log(f"[startup] ポート {PORT} 使用中: {port_busy}")
+
+    if port_busy:
+        _log(f"[startup] 既存インスタンスを検出 — ブラウザを開きます")
         webbrowser.open(f"http://127.0.0.1:{PORT}")
         return
 
@@ -243,25 +270,26 @@ def main() -> None:
         name="flask-server",
     )
     server.start()
+    _log("[startup] Flask サーバースレッド開始")
 
     # Poll until Flask is accepting connections (max 10 s).
     deadline = time.time() + 10
     while not is_port_in_use(PORT):
         if time.time() > deadline:
-            msg = "Flask サーバーが 10 秒以内に起動しませんでした。\napp.log を確認してください。"
-            _log("ERROR: Flask did not start within 10 seconds")
+            msg = "Flask サーバーが 10 秒以内に起動しませんでした。\napp-runtime.log を確認してください。"
+            _log("[startup] ERROR: Flask did not start within 10 seconds")
             _show_dialog("起動エラー", msg)
             sys.exit(1)
         time.sleep(0.2)
 
     webbrowser.open(f"http://127.0.0.1:{PORT}")
     _notify("アプリが起動しました")
-    _log("アプリが起動しました。ブラウザ画面から操作してください。")
+    _log("[startup] アプリが起動しました。ブラウザ画面から操作してください。")
 
     try:
         server.join()
     except KeyboardInterrupt:
-        _log("アプリを終了します。")
+        _log("[startup] アプリを終了します。")
 
 
 if __name__ == "__main__":
