@@ -204,6 +204,52 @@ def _kill_orphan_chromedriver() -> None:
         pass
 
 
+# Path for the PID lock file — set by main.py or __main__ block at startup.
+_LOCK_FILE: str = ""
+
+
+def cleanup_app_processes() -> None:
+    """Stop sync, quit Selenium/ChromeDriver, and remove the PID lock file.
+
+    Called from: /shutdown route, atexit, SIGTERM/SIGINT handlers.
+    Safe to call multiple times (all steps are guarded with try/except).
+    """
+    global _sync_stop_requested, _singleton_driver
+
+    print("[cleanup] 終了クリーンアップ開始")
+
+    # 1. Stop active sync
+    if _sync_running:
+        print("[cleanup] アクティブな同期を停止中…")
+        _sync_stop_requested = True
+
+    # 2. Quit Selenium driver
+    drv = _singleton_driver
+    if drv is not None:
+        print("[cleanup] Seleniumドライバーを終了中…")
+        try:
+            drv.quit()
+            print("[cleanup] Seleniumドライバー終了完了")
+        except Exception as _e:
+            print(f"[cleanup] Seleniumドライバー終了失敗（無視）: {_e}")
+        _singleton_driver = None
+
+    # 3. Kill orphan ChromeDriver processes
+    print("[cleanup] ChromeDriverプロセスを終了中…")
+    _kill_orphan_chromedriver()
+
+    # 4. Remove PID lock file
+    if _LOCK_FILE:
+        try:
+            if os.path.exists(_LOCK_FILE):
+                os.remove(_LOCK_FILE)
+                print(f"[cleanup] ロックファイルを削除しました: {_LOCK_FILE}")
+        except Exception as _e:
+            print(f"[cleanup] ロックファイル削除失敗（無視）: {_e}")
+
+    print("[cleanup] クリーンアップ完了")
+
+
 def _ensure_selenium_manager() -> None:
     """Locate the Selenium Manager binary and ensure it is executable.
 
@@ -813,6 +859,10 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
             gap: 14px; }
 .kpi-card { background: #fff; border-radius: 12px; padding: 18px 20px;
             box-shadow: var(--shadow-md); }
+a.kpi-card { display: block; text-decoration: none; color: inherit;
+             cursor: pointer; transition: box-shadow .15s, transform .15s; }
+a.kpi-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,.13);
+                   transform: translateY(-2px); }
 .kpi-value { font-size: 26px; font-weight: 700; color: var(--text);
              letter-spacing: -.5px; }
 .kpi-value.green { color: #16a34a; }
@@ -1459,24 +1509,30 @@ def home():
     stats = _get_kpi_stats()
 
     # ── KPI cards ─────────────────────────────────────────────────────────
+    # Clickable cards link to Product Management with the correct status filter.
+    # 出品中 includes 公開停止中 (stored as 出品中 + visibility_status='stopped').
+    _q_all     = "/products?searched=1"
+    _q_listed  = "/products?searched=1&statuses=%E5%87%BA%E5%93%81%E4%B8%AD&statuses=%E5%85%AC%E9%96%8B%E5%81%9C%E6%AD%A2%E4%B8%AD"
+    _q_trading = "/products?searched=1&statuses=%E5%8F%96%E5%BC%95%E4%B8%AD"
+    _q_sold    = "/products?searched=1&statuses=%E5%A3%B2%E5%8D%B4%E6%B8%88%E3%81%BF"
     kpi_html = f"""
     <div class="kpi-grid">
-      <div class="kpi-card">
+      <a class="kpi-card" href="{_q_all}">
         <div class="kpi-value">{stats['total']}</div>
         <div class="kpi-label">総商品数</div>
-      </div>
-      <div class="kpi-card">
+      </a>
+      <a class="kpi-card" href="{_q_listed}">
         <div class="kpi-value green">{stats['active']}</div>
         <div class="kpi-label">出品中</div>
-      </div>
-      <div class="kpi-card">
+      </a>
+      <a class="kpi-card" href="{_q_trading}">
         <div class="kpi-value amber">{stats['trading']}</div>
         <div class="kpi-label">取引中</div>
-      </div>
-      <div class="kpi-card">
+      </a>
+      <a class="kpi-card" href="{_q_sold}">
         <div class="kpi-value blue">{stats['sold']}</div>
         <div class="kpi-label">売却済み</div>
-      </div>
+      </a>
       <div class="kpi-card">
         <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
         <div class="kpi-label">推定売上合計</div>
@@ -1975,11 +2031,14 @@ def open_url():
 
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
-    # Give the browser enough time to receive this response before the process exits
-    threading.Thread(
-        target=lambda: (time.sleep(0.8), os._exit(0)),
-        daemon=True,
-    ).start()
+    print("[shutdown] 終了ボタンが押されました")
+    def _do_exit():
+        time.sleep(0.5)   # let response reach the browser
+        cleanup_app_processes()
+        time.sleep(0.3)
+        print("[shutdown] プロセスを終了します")
+        os._exit(0)
+    threading.Thread(target=_do_exit, daemon=True).start()
     return Response("ok", status=200, headers={"Content-Type": "text/plain"})
 
 
@@ -3833,6 +3892,25 @@ def run_scraper(selected_statuses=None):
         "db_total":     db_total,
     }
     # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
+
+
+# ── Cleanup hooks ─────────────────────────────────────────────────────────────
+# Registered at module load so they fire regardless of entry point (main.py or
+# direct script run).  All handlers are safe to call multiple times.
+import atexit as _atexit
+import signal as _signal
+
+_atexit.register(cleanup_app_processes)
+
+
+def _signal_handler(signum, frame):
+    print(f"[signal] シグナル {signum} を受信 — クリーンアップ後に終了します")
+    cleanup_app_processes()
+    os._exit(0)
+
+
+_signal.signal(_signal.SIGTERM, _signal_handler)
+_signal.signal(_signal.SIGINT,  _signal_handler)
 
 
 if __name__ == "__main__":

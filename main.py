@@ -111,6 +111,65 @@ def is_port_in_use(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _app_is_responding(port: int, timeout: float = 2.0) -> bool:
+    """Return True if our Flask app answers a GET / on this port."""
+    try:
+        import urllib.request
+        req = urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/", timeout=timeout
+        )
+        return req.status == 200
+    except Exception:
+        return False
+
+
+def _pid_owning_port(port: int):
+    """Return the PID (int) that holds the given TCP port, or None."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-ti", f":{port}"], timeout=5
+        ).decode().strip()
+        # lsof may return multiple lines; take the first
+        return int(out.splitlines()[0]) if out else None
+    except Exception:
+        return None
+
+
+def _pid_is_our_app(pid: int) -> bool:
+    """Return True if the process with this PID is an MIAInventory process."""
+    try:
+        cmdline = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "args="], timeout=5
+        ).decode()
+        markers = ("mercari_sync", "MIAInventory", "mia_inventory", "main.py")
+        return any(m in cmdline for m in markers)
+    except Exception:
+        return False
+
+
+def _kill_pid_wait(pid: int, port: int, timeout: float = 5.0) -> bool:
+    """Send SIGTERM to pid, wait up to timeout s for the port to free up."""
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True  # already gone
+    except Exception:
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.3)
+        if not is_port_in_use(port):
+            return True
+    # Force kill if still alive
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+    except Exception:
+        pass
+    return not is_port_in_use(port)
+
+
 # ---------------------------------------------------------------------------
 # Chrome check
 # ---------------------------------------------------------------------------
@@ -181,20 +240,95 @@ def main() -> None:
     os.chdir(data_dir)
     os.environ.setdefault("FLASK_ENV", "production")
 
+    lock_file = os.path.join(data_dir, "app.lock")
+
+    # ── Single-instance check via lock file ───────────────────────────────────
+    if os.path.exists(lock_file):
+        try:
+            stored_pid = int(open(lock_file).read().strip())
+        except Exception:
+            stored_pid = None
+
+        if stored_pid:
+            pid_alive = False
+            try:
+                os.kill(stored_pid, 0)   # 0 = existence check, no signal sent
+                pid_alive = True
+            except (ProcessLookupError, PermissionError):
+                pid_alive = False
+
+            if pid_alive:
+                # Same app instance already running — just open the browser.
+                if _app_is_responding(PORT):
+                    _log(f"[startup] アプリは既に起動中 (PID={stored_pid}) — ブラウザを開きます")
+                    webbrowser.open(f"http://127.0.0.1:{PORT}")
+                    return
+                # PID alive but not serving — stale process from a crash.
+                _log(f"[startup] 古いプロセスを検出 (PID={stored_pid}) — 終了させます")
+                if _kill_pid_wait(stored_pid, PORT):
+                    _log(f"[startup] 古いプロセスを終了しました (PID={stored_pid})")
+                else:
+                    _log(f"[startup] 警告: 古いプロセスの終了に失敗しました (PID={stored_pid})")
+            else:
+                _log(f"[startup] 古いロックファイルを削除します (PID={stored_pid} はすでに存在しません)")
+
+        try:
+            os.remove(lock_file)
+        except Exception:
+            pass
+
+    # ── Port conflict check (no lock file, but port is in use) ────────────────
+    if is_port_in_use(PORT):
+        if _app_is_responding(PORT):
+            # Healthy app on this port — open and exit (another window / instance).
+            _log(f"[startup] ポート {PORT} は使用中 (応答あり) — ブラウザを開きます")
+            webbrowser.open(f"http://127.0.0.1:{PORT}")
+            return
+
+        # Port in use but not responding — find who owns it.
+        stale_pid = _pid_owning_port(PORT)
+        _log(f"[startup] ポート {PORT} は応答なし (所有PID={stale_pid})")
+
+        if stale_pid and _pid_is_our_app(stale_pid):
+            _log(f"[startup] 自アプリのプロセスを検出 (PID={stale_pid}) — 終了させます")
+            if _kill_pid_wait(stale_pid, PORT):
+                _log(f"[startup] ポート {PORT} を解放しました")
+            else:
+                msg = (
+                    f"ポート {PORT} が解放できませんでした。\n"
+                    "ターミナルで以下を実行してください:\n"
+                    f"  kill -9 {stale_pid}"
+                )
+                _log(f"ERROR: ポート {PORT} を解放できませんでした")
+                _show_dialog("起動エラー", msg)
+                sys.exit(1)
+        elif stale_pid:
+            msg = (
+                f"ポート {PORT} は別のアプリ (PID={stale_pid}) が使用中です。\n"
+                "そのアプリを終了してから、もう一度起動してください。"
+            )
+            _log(f"ERROR: ポート {PORT} は別プロセス (PID={stale_pid}) が使用中")
+            _show_dialog("起動エラー", msg)
+            sys.exit(1)
+        else:
+            # Can't determine owner — show generic error.
+            msg = (
+                f"ポート {PORT} はすでに使用中です。\n"
+                "他のアプリを終了してから再起動してください。"
+            )
+            _show_dialog("起動エラー", msg)
+            sys.exit(1)
+
+    # ── Start app ─────────────────────────────────────────────────────────────
     import mercari_sync as _ms  # noqa: PLC0415
-    _ms.DB_NAME           = os.path.join(data_dir, "products.db")
-    _ms.COOKIE_FILE       = os.path.join(data_dir, "mercari_session.json")
+    _ms.DB_NAME            = os.path.join(data_dir, "products.db")
+    _ms.COOKIE_FILE        = os.path.join(data_dir, "mercari_session.json")
     _ms.CHROME_PROFILE_DIR = os.path.join(data_dir, "chrome-profile")
-    _ms.LICENSE_FILE      = os.path.join(data_dir, "license.json")
+    _ms.LICENSE_FILE       = os.path.join(data_dir, "license.json")
+    _ms._LOCK_FILE         = lock_file   # tell mercari_sync where to remove lock
     flask_app    = _ms.app
     init_db      = _ms.init_db
     init_license = _ms.init_license
-
-    # If a server is already listening, just open the browser and exit.
-    if is_port_in_use(PORT):
-        _log(f"ポート {PORT} はすでに使用中です — ブラウザを開きます")
-        webbrowser.open(f"http://127.0.0.1:{PORT}")
-        return
 
     init_db()
     init_license()
@@ -222,6 +356,27 @@ def main() -> None:
             _show_dialog("起動エラー", msg)
             sys.exit(1)
         time.sleep(0.2)
+
+    # Write PID lock file now that Flask is confirmed running.
+    try:
+        with open(lock_file, "w") as _f:
+            _f.write(str(os.getpid()))
+        _log(f"[startup] ロックファイルを作成しました: {lock_file} (PID={os.getpid()})")
+    except Exception as _e:
+        _log(f"[startup] ロックファイル作成失敗（無視）: {_e}")
+
+    # Remove lock file when this process exits normally.
+    import atexit as _atexit
+
+    def _remove_lock():
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+                _log(f"[shutdown] ロックファイルを削除しました: {lock_file}")
+        except Exception:
+            pass
+
+    _atexit.register(_remove_lock)
 
     webbrowser.open(f"http://127.0.0.1:{PORT}")
     _notify("アプリが起動しました")
