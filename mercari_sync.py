@@ -3362,15 +3362,18 @@ def _clear_session() -> None:
             print(f"[session] クッキーファイル削除失敗: {exc}")
 
     # Delete the app-specific Chrome profile directory.
-    # Guard: the path must be inside ~/Library/Application Support/MercariInventory/
-    _app_support = os.path.join(
-        os.path.expanduser("~"), "Library", "Application Support", "MercariInventory"
-    )
+    # Guard: the path must be inside the app's Application Support folder.
+    # Accept both the current name (MIA Inventory) and the legacy name
+    # (MercariInventory) so cleanup works for users upgrading from old builds.
+    _lib = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    _allowed_roots = [
+        os.path.realpath(os.path.join(_lib, "MIA Inventory")),
+        os.path.realpath(os.path.join(_lib, "MercariInventory")),
+    ]
+    _profile_real = os.path.realpath(CHROME_PROFILE_DIR) if CHROME_PROFILE_DIR else ""
     if (CHROME_PROFILE_DIR
             and os.path.isdir(CHROME_PROFILE_DIR)
-            and os.path.realpath(CHROME_PROFILE_DIR).startswith(
-                os.path.realpath(_app_support)
-            )):
+            and any(_profile_real.startswith(r) for r in _allowed_roots)):
         import shutil
         try:
             shutil.rmtree(CHROME_PROFILE_DIR, ignore_errors=False)

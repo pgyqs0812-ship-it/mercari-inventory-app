@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-APP_NAME="MercariInventory"
+APP_NAME="MIA Inventory"
 ENTRY="main.py"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARIZE="${NOTARIZE:-0}"

@@ -26,7 +26,7 @@ ARROW = "#B0BEC5"   # neutral gray arrow
 # Icon centre positions — must mirror icon_locations in dmgbuild_settings.py
 APP_X  = 170
 APPS_X = 490
-ICON_Y = 175
+ICON_Y = 200
 
 
 def _draw_arrow(draw):

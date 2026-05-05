@@ -14,7 +14,7 @@
 import os
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-_app_path     = defines.get("app_path",  "dist/MercariInventory.app")  # noqa: F821
+_app_path     = defines.get("app_path",  "dist/MIA Inventory.app")  # noqa: F821
 _bg_path      = defines.get("bg_path",   "dmg_background.png")
 
 # Resolve relative paths against cwd (project root, where dmgbuild is invoked).
@@ -59,6 +59,6 @@ text_size       = 12
 # (x, y) are the centre coordinates of each icon within the window.
 # These must match the visual guides drawn in create_dmg_bg.py.
 icon_locations = {
-    _appname:       (170, 175),    # app — left
-    "Applications": (490, 175),    # symlink — right
+    _appname:       (170, 200),    # app — left
+    "Applications": (490, 200),    # symlink — right
 }

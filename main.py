@@ -1,5 +1,5 @@
 """
-Entry point for the Mercari Inventory desktop app.
+Entry point for the MIA Inventory desktop app.
 
 Starts the Flask web server in a background thread, then opens the
 browser automatically. Runs as a windowed .app bundle (no terminal window);
@@ -15,7 +15,8 @@ import time
 import webbrowser
 
 PORT = 5050
-_APP_NAME = "MercariInventory"
+_APP_NAME = "MIA Inventory"
+_APP_NAME_LEGACY = "MercariInventory"   # old bundle name — migration source only
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ def get_data_dir() -> str:
     """
     Return the directory where user data (products.db, .env) should live.
 
-    PyInstaller frozen binary  → ~/Library/Application Support/MercariInventory/
+    PyInstaller frozen binary  → ~/Library/Application Support/MIA Inventory/
                                  Survives app updates (new dist.zip extracts never
                                  touch this path).
     Normal Python script       → project root.
@@ -130,13 +131,12 @@ def check_chrome_browser() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DB migration (one-time, .command → .app path update)
+# Data migrations (one-time, run only from frozen .app bundle)
 # ---------------------------------------------------------------------------
 
 def _migrate_db_if_needed(data_dir: str) -> None:
-    """One-time migration: copy products.db from the old location (next to the
-    executable) to the new persistent app data directory, so existing users do
-    not lose their sync history after updating the app."""
+    """One-time: copy products.db from the old .command-era location (next to
+    the executable) to the persistent app-support directory."""
     import shutil  # noqa: PLC0415
 
     new_db = os.path.join(data_dir, "products.db")
@@ -150,6 +150,45 @@ def _migrate_db_if_needed(data_dir: str) -> None:
         _log("[migration] 完了")
 
 
+def _migrate_app_support_dir(data_dir: str) -> None:
+    """One-time: move all user data from the legacy MercariInventory app-support
+    dir to the new MIA Inventory dir so existing users keep their DB, Chrome
+    profile, and license after the bundle rename."""
+    import shutil  # noqa: PLC0415
+
+    app_support = os.path.expanduser("~/Library/Application Support")
+    old_dir = os.path.join(app_support, _APP_NAME_LEGACY)
+    if not os.path.isdir(old_dir):
+        return
+
+    files_to_copy = [
+        "products.db",
+        "mercari_session.json",
+        "license.json",
+    ]
+    dirs_to_copy = ["chrome-profile"]
+
+    migrated = False
+    for fname in files_to_copy:
+        src = os.path.join(old_dir, fname)
+        dst = os.path.join(data_dir, fname)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+            _log(f"[migration] {fname} を移行しました")
+            migrated = True
+
+    for dname in dirs_to_copy:
+        src = os.path.join(old_dir, dname)
+        dst = os.path.join(data_dir, dname)
+        if os.path.isdir(src) and not os.path.exists(dst):
+            shutil.copytree(src, dst)
+            _log(f"[migration] {dname}/ を移行しました")
+            migrated = True
+
+    if migrated:
+        _log(f"[migration] {_APP_NAME_LEGACY} → {_APP_NAME} データ移行完了")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -159,7 +198,7 @@ def main() -> None:
     _setup_logging(data_dir)
 
     _log("=" * 54)
-    _log("  Mercari Inventory App")
+    _log("  MIA Inventory App")
     _log(f"  データ保存先: {data_dir}")
     _log(f"  URL:          http://127.0.0.1:{PORT}")
     _log("=" * 54)
@@ -167,6 +206,7 @@ def main() -> None:
     check_chrome_browser()
 
     if getattr(sys, "frozen", False):
+        _migrate_app_support_dir(data_dir)
         _migrate_db_if_needed(data_dir)
 
     os.chdir(data_dir)
