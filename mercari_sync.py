@@ -86,10 +86,10 @@ _singleton_driver = None
 _driver_lock = threading.Lock()       # guards singleton creation only
 _login_start_lock = threading.Lock()  # prevents concurrent /login/start calls
 
-# Single-worker executor used to time-limit webdriver.Chrome() calls.
-# concurrent.futures.TimeoutError is raised if Chrome doesn't start within the
-# allotted window, preventing an indefinite hang in the login thread.
-_chrome_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chrome-launch")
+# Timestamp of the most recent login start — used to detect stuck "logging_in"
+# states that were never resolved (e.g. a thread that died without setting state).
+# Protected by _login_start_lock.
+_login_start_time: float = 0.0
 
 
 def jst_now() -> str:
@@ -2004,17 +2004,25 @@ def login_page():
 
 @app.route("/login/start", methods=["POST"])
 def login_start():
-    global _session_state, _login_error_msg
+    global _session_state, _login_error_msg, _login_start_time
     print("[login] ログイン開始リクエスト受信")
     with _login_start_lock:
-        if _session_state == "logging_in":
+        # Allow override if the "logging_in" state is older than the login timeout
+        # (120 s = wait_for_login timeout).  This handles threads that died without
+        # updating the state.
+        stuck = (
+            _session_state == "logging_in"
+            and time.time() - _login_start_time > 120
+        )
+        if _session_state == "logging_in" and not stuck:
             print("[login] すでにログイン中のため重複リクエストを無視します")
             return redirect("/login")
+        if stuck:
+            print("[login] ログイン状態がスタック — 強制リセットして再試行します")
         print("[login] ログインフローを開始します — ブラウザ起動準備中")
         _login_error_msg = ""
         _session_state = "logging_in"
-    # Pre-login: kill any stale app process still holding port 5050
-    _cleanup_stale_port_owner(5050)
+        _login_start_time = time.time()
     threading.Thread(target=_do_login, daemon=True, name="login-thread").start()
     return redirect("/login")
 
@@ -2034,13 +2042,19 @@ def login_relogin():
     global _session_state, _login_error_msg
     print("[login] 再ログインリクエスト受信")
     with _login_start_lock:
-        if _session_state == "logging_in":
+        stuck = (
+            _session_state == "logging_in"
+            and time.time() - _login_start_time > 120
+        )
+        if _session_state == "logging_in" and not stuck:
             print("[login] すでにログイン中のため重複リクエストを無視します")
             return redirect("/login")
+        if stuck:
+            print("[login] ログイン状態がスタック — 強制リセットして再試行します")
         print("[login] 再ログインフローを開始します — ブラウザ起動準備中")
         _login_error_msg = ""
         _session_state = "logging_in"
-    _cleanup_stale_port_owner(5050)
+        _login_start_time = time.time()
     threading.Thread(
         target=lambda: _do_login(force_relogin=True),
         daemon=True,
@@ -3444,22 +3458,41 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
     # Attempt to start Chrome; retry once with extra cleanup for visible driver.
     # Each attempt is capped at LAUNCH_TIMEOUT seconds so selenium-manager
     # download hangs do not block the login thread forever.
+    #
+    # IMPORTANT: we use a fresh threading.Thread + queue.Queue per attempt
+    # instead of a shared ThreadPoolExecutor(max_workers=1).  A shared single-
+    # worker executor causes a permanent deadlock: when a timeout fires, the
+    # worker thread is still running webdriver.Chrome(), so every subsequent
+    # submit() queues behind it and also times out.  A fresh thread starts
+    # immediately and independently each time.
+    import queue as _q
     LAUNCH_TIMEOUT = 45
     max_attempts = 2 if not headless else 1
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         print(f"[driver] Chrome起動中 (attempt {attempt + 1}/{max_attempts}) …")
         try:
-            # Run webdriver.Chrome() in a thread so we can time-limit it.
-            # selenium-manager can hang indefinitely on slow/blocked networks.
-            future = _chrome_executor.submit(webdriver.Chrome, opts)
+            _result_q: _q.Queue = _q.Queue(maxsize=1)
+
+            def _chrome_worker(_o=opts, _rq=_result_q):
+                try:
+                    _rq.put(("ok", webdriver.Chrome(_o)))
+                except Exception as _e:
+                    _rq.put(("err", _e))
+
+            _t = threading.Thread(target=_chrome_worker, daemon=True,
+                                  name=f"chrome-launch-{attempt}")
+            _t.start()
             try:
-                driver = future.result(timeout=LAUNCH_TIMEOUT)
-            except FuturesTimeoutError:
+                _status, _val = _result_q.get(timeout=LAUNCH_TIMEOUT)
+            except _q.Empty:
                 raise RuntimeError(
                     f"Chrome の起動が {LAUNCH_TIMEOUT} 秒以内に完了しませんでした。"
                     " selenium-manager がネットワークに接続できない可能性があります。"
                 ) from None
+            if _status == "err":
+                raise _val
+            driver = _val
             break
         except Exception as exc:
             last_exc = exc
@@ -3668,9 +3701,17 @@ def _do_login(force_relogin: bool = False) -> None:
       success             → "valid"
       Chrome launch error → "error"  (shows retry UI)
       user timeout        → "invalid" (login button reappears)
+
+    The try/finally guarantees that _session_state always leaves "logging_in"
+    even if an unhandled exception escapes all except clauses.
     """
     global _session_state, _login_error_msg
     print(f"[login] ログインスレッド開始 (force_relogin={force_relogin})")
+
+    # Clean up any stale app process on port 5050 BEFORE launching Chrome.
+    # Runs inside the background thread so the HTTP redirect fires immediately.
+    _cleanup_stale_port_owner(5050)
+
     try:
         print("[login] Chrome / Selenium 起動中…")
         driver = _get_or_create_driver()
@@ -3750,6 +3791,14 @@ def _do_login(force_relogin: bool = False) -> None:
             _login_error_msg = f"ブラウザの起動に失敗しました: {msg}"
             _session_state = "error"
         else:
+            _session_state = "invalid"
+
+    finally:
+        # Safety net: if we exit without setting a terminal state (e.g. an
+        # unhandled exception escaped all except clauses above, or the thread
+        # was interrupted), reset to "invalid" so the login button reappears.
+        if _session_state == "logging_in":
+            print("[login] 警告: ログインスレッドが logging_in のまま終了 — invalid にリセット")
             _session_state = "invalid"
 
 
