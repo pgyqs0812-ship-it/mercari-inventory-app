@@ -15,6 +15,7 @@ build/
 AppIcon.icns
 AppIcon.iconset/
 dmg_background.png
+_version.py
 venv312/
 venv/
 .claude/

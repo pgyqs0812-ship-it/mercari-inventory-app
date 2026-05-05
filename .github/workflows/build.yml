@@ -105,9 +105,20 @@ jobs:
             -s dmgbuild_settings.py \
             -D app_path="dist/MIAInventory.app" \
             -D bg_path="dmg_background.png" \
-            "MIA Inventory Installer" \
+            "MIAInventory ${{ github.ref_name }}" \
             "dist/${DMG_NAME}"
           echo "✓ DMG: dist/${DMG_NAME}"
+          # Validation gate: verify volume name matches release version
+          EXPECTED_VOLUME="MIAInventory ${VERSION}"
+          MOUNT_OUT=$(hdiutil attach "dist/${DMG_NAME}" -nobrowse -noverify -noautoopen 2>&1)
+          MOUNT_POINT=$(echo "${MOUNT_OUT}" | tail -1 | awk '{print $NF}')
+          VOLUME_NAME=$(basename "${MOUNT_POINT}")
+          hdiutil detach "${MOUNT_POINT}" -quiet 2>/dev/null || true
+          if [ "${VOLUME_NAME}" != "${EXPECTED_VOLUME}" ]; then
+            echo "ERROR: Volume name mismatch — got '${VOLUME_NAME}', expected '${EXPECTED_VOLUME}'"
+            exit 1
+          fi
+          echo "✓ Version validation passed: volume '${VOLUME_NAME}'"
 
       - name: Sign DMG
         if: env.APPLE_SIGN_IDENTITY != ''

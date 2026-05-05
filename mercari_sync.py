@@ -10,6 +10,11 @@ import html as html_module
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
+try:
+    from _version import __version__ as APP_VERSION
+except ImportError:
+    APP_VERSION = "dev"
+
 import io
 import csv
 
@@ -1312,7 +1317,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.7</div>
+  <div class="sidebar-footer">{APP_VERSION}</div>
 </nav>"""
 
 
@@ -2637,13 +2642,13 @@ def settings_page():
       </div>
     </div>"""
 
-    app_card = """
+    app_card = f"""
     <div class="card">
       <div class="card-header"><span class="card-title">アプリ情報</span></div>
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.7</span>
+          <span class="settings-value">{APP_VERSION}</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>

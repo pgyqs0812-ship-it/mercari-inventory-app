@@ -87,6 +87,12 @@ if [ ! -f "${ENTRY}" ]; then
     exit 1
 fi
 
+# ── Version file (single source of truth for app UI) ─────────────────────────
+# Generates _version.py so mercari_sync.py can display the version at runtime.
+# PyInstaller bundles this file; it is gitignored (build artifact).
+echo "__version__ = '${VERSION}'" > _version.py
+echo "✓ _version.py: ${VERSION}"
+
 # ── Clean previous build ──────────────────────────────────────────────────────
 echo "Cleaning previous build artifacts..."
 rm -rf build/ dist/ "${APP_NAME}.spec"
@@ -207,7 +213,7 @@ dmgbuild \
     -s dmgbuild_settings.py \
     -D app_path="${APP_BUNDLE}" \
     -D bg_path="dmg_background.png" \
-    "MIA Inventory Installer" \
+    "MIAInventory ${VERSION}" \
     "dist/${DMG_NAME}"
 
 # ── DMG signing ──────────────────────────────────────────────────────────────
@@ -218,6 +224,42 @@ else
     codesign --sign - --force "dist/${DMG_NAME}" 2>/dev/null || true
     echo "✓ DMG ad-hoc signed"
 fi
+
+# ── Version validation gate ───────────────────────────────────────────────────
+# Fail the build if the DMG is missing or its Finder volume name does not match
+# the expected "MIAInventory <VERSION>".  Catches any dmgbuild label drift before
+# the artifact is released.
+echo "Validating version consistency..."
+
+EXPECTED_DMG="dist/${DMG_NAME}"
+EXPECTED_VOLUME="MIAInventory ${VERSION}"
+
+if [ ! -f "${EXPECTED_DMG}" ]; then
+    echo "ERROR: DMG not found at: ${EXPECTED_DMG}"
+    exit 1
+fi
+
+_MOUNT_OUT=$(hdiutil attach "${EXPECTED_DMG}" -nobrowse -noverify -noautoopen 2>&1)
+_MOUNT_POINT=$(echo "${_MOUNT_OUT}" | tail -1 | awk '{print $NF}')
+
+if [ ! -d "${_MOUNT_POINT}" ]; then
+    echo "ERROR: Could not mount ${EXPECTED_DMG}"
+    exit 1
+fi
+
+_VOLUME_NAME=$(basename "${_MOUNT_POINT}")
+hdiutil detach "${_MOUNT_POINT}" -quiet 2>/dev/null || true
+
+if [ "${_VOLUME_NAME}" != "${EXPECTED_VOLUME}" ]; then
+    echo "ERROR: Volume name mismatch"
+    echo "  Expected : ${EXPECTED_VOLUME}"
+    echo "  Got      : ${_VOLUME_NAME}"
+    exit 1
+fi
+
+echo "✓ Version validation passed"
+echo "  DMG      : ${EXPECTED_DMG}"
+echo "  Volume   : ${_VOLUME_NAME}"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
