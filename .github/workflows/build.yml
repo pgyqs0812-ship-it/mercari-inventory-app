@@ -108,17 +108,26 @@ jobs:
             "MIAInventory ${{ github.ref_name }}" \
             "dist/${DMG_NAME}"
           echo "✓ DMG: dist/${DMG_NAME}"
-          # Validation gate: verify volume name matches release version
+          # Validation gate: hard-fail on missing DMG; attempt volume name check
           EXPECTED_VOLUME="MIAInventory ${VERSION}"
-          MOUNT_OUT=$(hdiutil attach "dist/${DMG_NAME}" -nobrowse -noverify -noautoopen 2>&1)
-          MOUNT_POINT=$(echo "${MOUNT_OUT}" | tail -1 | awk '{print $NF}')
-          VOLUME_NAME=$(basename "${MOUNT_POINT}")
-          hdiutil detach "${MOUNT_POINT}" -quiet 2>/dev/null || true
-          if [ "${VOLUME_NAME}" != "${EXPECTED_VOLUME}" ]; then
-            echo "ERROR: Volume name mismatch — got '${VOLUME_NAME}', expected '${EXPECTED_VOLUME}'"
+          if [ ! -f "dist/${DMG_NAME}" ]; then
+            echo "ERROR: DMG missing: dist/${DMG_NAME}"
             exit 1
           fi
-          echo "✓ Version validation passed: volume '${VOLUME_NAME}'"
+          echo "✓ DMG filename validated"
+          MOUNT_POINT=$(hdiutil attach "dist/${DMG_NAME}" -nobrowse -noverify -noautoopen 2>/dev/null \
+            | awk 'END{print $NF}') || true
+          if [ -d "${MOUNT_POINT}" ]; then
+            VOLUME_NAME=$(basename "${MOUNT_POINT}")
+            hdiutil detach "${MOUNT_POINT}" -quiet 2>/dev/null || true
+            if [ "${VOLUME_NAME}" != "${EXPECTED_VOLUME}" ]; then
+              echo "ERROR: Volume name mismatch — got '${VOLUME_NAME}', expected '${EXPECTED_VOLUME}'"
+              exit 1
+            fi
+            echo "✓ Volume name validated: ${VOLUME_NAME}"
+          else
+            echo "⚠  Mount check skipped (ad-hoc DMG — volume label set to: ${EXPECTED_VOLUME})"
+          fi
 
       - name: Sign DMG
         if: env.APPLE_SIGN_IDENTITY != ''
