@@ -33,8 +33,10 @@ MAX_WORKERS = 4
 MAX_RETRY   = 3
 
 # Monetization constants
-_TRIAL_DAYS     = 7
-_MONTHLY_DAYS   = 30
+_TRIAL_DAYS      = 3
+_MONTHLY_DAYS    = 30
+_FREE_SYNC_LIMIT = 3    # max syncs per day on free plan
+_FREE_ITEM_LIMIT = 100  # max stored items on free plan
 # v2 secret — keys now use MIA-LIFE-XXXX-XXXX / MIA-MONTH-XXXX-XXXX format.
 # Test keys: MIA-MONTH-7A33-AD8C  |  MIA-LIFE-7114-3540
 _LICENSE_SECRET = b"mia-license-v2-secret"
@@ -346,6 +348,7 @@ def init_license() -> None:
             ("license_schema_version", 2),
             ("expiry_time",     None),
             ("validation_server", None),
+            ("sync_count",      0),
         ):
             if field not in state:
                 state[field] = default
@@ -483,11 +486,49 @@ def _license_badge_html() -> str:
     )
 
 
-def _record_sync_date() -> None:
-    """Save today's date as last_sync_date in license.json (for free-plan limit)."""
+def _get_daily_sync_count() -> int:
+    """Return today's completed sync count for free plan (resets at midnight JST)."""
     state = _get_license()
-    state["last_sync_date"] = datetime.now(_JST).strftime("%Y-%m-%d")
+    today = datetime.now(_JST).strftime("%Y-%m-%d")
+    if state.get("last_sync_date") != today:
+        return 0
+    return int(state.get("sync_count", 0))
+
+
+def _increment_sync_count() -> None:
+    """Record a completed sync for today (free-plan daily limit tracking)."""
+    state = _get_license()
+    today = datetime.now(_JST).strftime("%Y-%m-%d")
+    if state.get("last_sync_date") != today:
+        state["last_sync_date"] = today
+        state["sync_count"] = 1
+    else:
+        state["sync_count"] = int(state.get("sync_count", 0)) + 1
     _save_license(state)
+
+
+def _enforce_free_item_limit() -> int:
+    """Delete items beyond _FREE_ITEM_LIMIT (oldest first). Returns count deleted."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM mercari_products")
+        total = cursor.fetchone()[0]
+        if total > _FREE_ITEM_LIMIT:
+            cursor.execute(
+                "DELETE FROM mercari_products WHERE id NOT IN "
+                "(SELECT id FROM mercari_products ORDER BY id DESC LIMIT ?)",
+                (_FREE_ITEM_LIMIT,)
+            )
+            deleted = cursor.rowcount
+            conn.commit()
+            conn.close()
+            print(f"[license] 無料プラン: 古い {deleted} 件を削除しました (上限 {_FREE_ITEM_LIMIT} 件)")
+            return deleted
+        conn.close()
+    except Exception as exc:
+        print(f"[license] item limit 適用エラー: {exc}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +862,37 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .upgrade-banner strong { font-weight: 700; }
 /* License key input */
 .license-wrap { max-width: 480px; }
+/* Upgrade modal */
+.upm-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex;
+               align-items: center; justify-content: center; z-index: 2000; }
+.upm-box { background: #fff; border-radius: 16px; padding: 32px 36px;
+           min-width: 340px; max-width: 500px; width: calc(100% - 48px);
+           box-shadow: 0 20px 40px rgba(0,0,0,.2); }
+.upm-box h2 { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
+.upm-sub { font-size: 14px; color: var(--muted); margin-bottom: 24px; line-height: 1.5; }
+.upm-feature-table { width: 100%; border-collapse: collapse; margin-bottom: 24px;
+                     font-size: 13px; }
+.upm-feature-table th { text-align: left; padding: 6px 8px; background: #f9fafb;
+                        font-weight: 600; color: var(--muted); font-size: 11px;
+                        text-transform: uppercase; letter-spacing: .04em; }
+.upm-feature-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.upm-feature-table td:not(:first-child) { text-align: center; }
+.upm-check { color: #16a34a; font-weight: 700; }
+.upm-cross { color: #9ca3af; }
+.upm-actions { display: flex; gap: 10px; }
+/* Sort lock */
+.sort-lock { font-size: 11px; color: #d1d5db; margin-left: 4px; }
+thead th[data-locked] { cursor: pointer; user-select: none; white-space: nowrap; }
+thead th[data-locked]:hover { background: #fffbeb; }
+/* Trial expiry banner */
+.trial-banner { background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px;
+                color: #92400e; padding: 10px 16px; font-size: 13px;
+                display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.trial-banner a { color: #92400e; font-weight: 700; white-space: nowrap;
+                  text-decoration: underline; }
+/* Sync remaining info */
+.sync-info { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.sync-info.warn { color: #d97706; font-weight: 600; }
 .license-note { font-size: 13px; color: var(--muted); line-height: 1.7;
                 margin-bottom: 20px; }
 /* Settings */
@@ -932,6 +1004,63 @@ _SORT_JS = """
     });
   });
 })();
+"""
+
+# Upgrade modal — injected by _page_shell() on every page.
+_UPGRADE_MODAL_HTML = """
+<div class="upm-overlay" id="upgrade-modal" style="display:none"
+     onclick="if(event.target===this)closeUpgradeModal()">
+  <div class="upm-box">
+    <h2>&#128274; Pro プランにアップグレード</h2>
+    <p class="upm-sub" id="upm-reason"></p>
+    <table class="upm-feature-table">
+      <thead><tr><th>機能</th><th>無料</th><th>Pro</th></tr></thead>
+      <tbody>
+        <tr><td>同期回数/日</td>
+            <td class="upm-cross">3回</td>
+            <td class="upm-check">無制限</td></tr>
+        <tr><td>保存件数</td>
+            <td class="upm-cross">100件</td>
+            <td class="upm-check">無制限</td></tr>
+        <tr><td>並び替え</td>
+            <td class="upm-cross">&#10005;</td>
+            <td class="upm-check">&#10003;</td></tr>
+        <tr><td>売上分析</td>
+            <td class="upm-cross">&#10005;</td>
+            <td class="upm-check">&#10003;</td></tr>
+        <tr><td>AI 分析</td>
+            <td class="upm-cross">&#10005;</td>
+            <td class="upm-check">&#10003;</td></tr>
+      </tbody>
+    </table>
+    <div class="upm-actions">
+      <a href="/upgrade" class="btn btn-primary"
+         style="flex:1;justify-content:center;text-decoration:none">
+        Pro にアップグレード
+      </a>
+      <button class="btn btn-outline" onclick="closeUpgradeModal()">後で</button>
+    </div>
+  </div>
+</div>"""
+
+_UPGRADE_MODAL_JS = """
+var _UPM_REASONS = {
+  'sync_limit': '1日3回の同期上限に達しました。Proプランは無制限に同期できます。',
+  'item_limit': '無料プランは100件まで保存できます。Proプランは無制限です。',
+  'sort':       '並び替えはProプランの機能です。',
+  'expired':    'トライアルが終了しました。引き続きご利用はProプランへアップグレードしてください。'
+};
+function showUpgradeModal(reason) {
+  var msg = _UPM_REASONS[reason] || reason;
+  var el = document.getElementById('upm-reason');
+  if (el) el.textContent = msg;
+  var overlay = document.getElementById('upgrade-modal');
+  if (overlay) overlay.style.display = 'flex';
+}
+function closeUpgradeModal() {
+  var overlay = document.getElementById('upgrade-modal');
+  if (overlay) overlay.style.display = 'none';
+}
 """
 
 # Open-link handler: sends a fetch to /open so the backend launches Chrome
@@ -1183,7 +1312,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">v1.4.2</div>
+  <div class="sidebar-footer">v1.4.5</div>
 </nav>"""
 
 
@@ -1192,6 +1321,23 @@ def _page_shell(title: str, active: str, content: str,
     """Return a full HTML page with sidebar layout."""
     stats = _get_kpi_stats()
     sub_html = f'<p>{html_module.escape(subtitle)}</p>' if subtitle else ""
+
+    # Trial expiry banner (shown ≤2 days remaining so all 3 trial days get a warning)
+    _plan_shell = _check_plan()
+    if _plan_shell == "trial":
+        _days_left = _trial_days_remaining()
+        if _days_left <= 2:
+            trial_banner_html = (
+                f'<div class="trial-banner">'
+                f'<span>&#9888; トライアルはあと <strong>{_days_left} 日</strong>で終了します。'
+                f'データはそのまま保持されます。</span>'
+                f'<a href="/upgrade">今すぐアップグレード →</a>'
+                f'</div>'
+            )
+        else:
+            trial_banner_html = ""
+    else:
+        trial_banner_html = ""
 
     # Inject sidebar nav-lock when a sync is in progress so users cannot
     # navigate away mid-sync from any page (not just the main sync page).
@@ -1231,12 +1377,15 @@ def _page_shell(title: str, active: str, content: str,
       </div>
     </div>
     <div class="page-body">
+      {trial_banner_html}
       {content}
     </div>
   </div>
 </div>
+{_UPGRADE_MODAL_HTML}
 <script>
 {_SHUTDOWN_JS}
+{_UPGRADE_MODAL_JS}
 {sync_lock_js}
 {extra_js}
 </script>
@@ -1271,10 +1420,11 @@ def home():
     if plan == "expired":
         return redirect("/upgrade")
 
-    show_summary = request.args.get("summary") == "1" and bool(_last_sync_summary)
-    error_param  = request.args.get("error", "")
-    licensed     = request.args.get("licensed") == "1"
-    syncing      = request.args.get("syncing") == "1" or _sync_running
+    show_summary       = request.args.get("summary") == "1" and bool(_last_sync_summary)
+    error_param        = request.args.get("error", "")
+    licensed           = request.args.get("licensed") == "1"
+    syncing            = request.args.get("syncing") == "1" or _sync_running
+    upgrade_modal_param = request.args.get("upgrade_modal", "")
 
     stats = _get_kpi_stats()
 
@@ -1350,6 +1500,36 @@ def home():
           </div>
         </div>"""
     else:
+        # Sync button: disabled with upgrade CTA when free plan is at daily limit
+        if plan == "free":
+            _used = _get_daily_sync_count()
+            _remaining = max(0, _FREE_SYNC_LIMIT - _used)
+            if _remaining == 0:
+                _sync_btn_html = (
+                    '<button class="btn btn-primary" type="button" disabled '
+                    'style="font-size:15px;padding:11px 28px">'
+                    '&#x21BB; 同期を開始</button>'
+                    '<p class="sync-info warn" style="margin-top:8px">'
+                    f'本日の同期上限（{_FREE_SYNC_LIMIT}回）に達しました。'
+                    ' <a href="/upgrade" style="color:#d97706;font-weight:700">'
+                    'Pro にアップグレード →</a></p>'
+                )
+            else:
+                _warn_cls = " warn" if _remaining == 1 else ""
+                _sync_btn_html = (
+                    '<button class="btn btn-primary" type="submit" '
+                    'style="font-size:15px;padding:11px 28px">'
+                    '&#x21BB; 同期を開始</button>'
+                    f'<p class="sync-info{_warn_cls}" style="margin-top:8px">'
+                    f'本日の残り同期回数: {_remaining} / {_FREE_SYNC_LIMIT}</p>'
+                )
+        else:
+            _sync_btn_html = (
+                '<button class="btn btn-primary" type="submit" '
+                'style="font-size:15px;padding:11px 28px">'
+                '&#x21BB; 同期を開始</button>'
+            )
+
         sync_card = f"""
         <div class="card" id="sync-card">
           <div class="card-header">
@@ -1359,10 +1539,7 @@ def home():
             <form method="POST" action="/sync">
               <p class="field-label">同期するステータス</p>
               <div class="cb-row">{sync_cbs}</div>
-              <button class="btn btn-primary" type="submit"
-                      style="font-size:15px;padding:11px 28px">
-                &#x21BB; 同期を開始
-              </button>
+              {_sync_btn_html}
             </form>
           </div>
         </div>"""
@@ -1438,6 +1615,10 @@ def home():
     {sync_card}
     {summary_modal}"""
 
+    _modal_show_js = (
+        f'showUpgradeModal({json.dumps(upgrade_modal_param)});'
+        if upgrade_modal_param else ""
+    )
     extra_js = f"""
 (function() {{
   var form = document.querySelector('form[action="/sync"]');
@@ -1448,6 +1629,7 @@ def home():
     }});
   }}
 }})();
+{_modal_show_js}
 {"" if not syncing else _SYNC_POLL_JS}"""
 
     return _page_shell("メインダッシュボード", "main", content, extra_js,
@@ -1460,12 +1642,13 @@ def sync():
     if _sync_running:
         return redirect("/?error=sync_running")
 
+    # Plan gate: expired users cannot sync
+    _plan_now = _check_plan()
+    if _plan_now == "expired":
+        return redirect("/upgrade")
     # Free-plan daily sync limit
-    if _check_plan() == "free":
-        today = datetime.now(_JST).strftime("%Y-%m-%d")
-        last  = _get_license().get("last_sync_date", "")
-        if last == today:
-            return redirect("/?error=" + "無料版は1日1回の同期制限があります。プランをアップグレードすると無制限に同期できます。")
+    if _plan_now == "free" and _get_daily_sync_count() >= _FREE_SYNC_LIMIT:
+        return redirect("/?upgrade_modal=sync_limit")
 
     selected = request.form.getlist("statuses") or list(STATUSES)
     _sync_running = True
@@ -1486,7 +1669,8 @@ def sync():
         try:
             run_scraper(selected_statuses=selected)
             if _check_plan() == "free":
-                _record_sync_date()
+                _increment_sync_count()
+                _enforce_free_item_limit()
         except _SyncStopped:
             print("[sync] 強制停止されました")
             _sync_progress["stopped"] = True
@@ -1799,7 +1983,7 @@ def upgrade_page():
     elif from_pg == "ai":
         banner_msg = "AI分析は月額プランまたは買い切りプランでご利用いただけます。"
     elif plan in ("expired", "free"):
-        banner_msg = "7日間のトライアル期間が終了しました。引き続きご利用にはプランを選択してください。"
+        banner_msg = "3日間のトライアル期間が終了しました。引き続きご利用にはプランを選択してください。"
     else:
         banner_msg = ""
 
@@ -1808,9 +1992,9 @@ def upgrade_page():
         if banner_msg else ""
     )
 
-    free_features = "同期: 1日1回<br>商品管理: ○<br>売上分析: ✗<br>AI分析: ✗"
-    monthly_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○"
-    lifetime_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
+    free_features = "同期: 1日3回<br>商品管理: 100件まで<br>並び替え: ✗<br>売上分析: ✗<br>AI分析: ✗"
+    monthly_features = "同期: 無制限<br>商品管理: 無制限<br>並び替え: ○<br>売上分析: ○<br>AI分析: ○"
+    lifetime_features = "同期: 無制限<br>商品管理: 無制限<br>並び替え: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
 
     plan_grid = f"""
     <div class="plan-grid">
@@ -1899,6 +2083,7 @@ def products_page():
         products = filtered
 
     count = len(products)
+    sort_locked = _check_plan() in ("free", "expired")
 
     if searched:
         per_status = {}
@@ -1975,11 +2160,12 @@ def products_page():
               <thead>
                 <tr>
                   <th style="width:40px">#</th>
-                  <th data-sortable data-col="1">商品名</th>
-                  <th data-sortable data-col="2">価格</th>
-                  <th data-sortable data-col="3">状態</th>
-                  <th data-sortable data-col="4">商品登録時間</th>
-                  <th data-sortable data-col="5">抓取時間</th>
+                  {''.join([
+                    f'<th data-locked data-col="{c}" onclick="showUpgradeModal(\'sort\')">{lbl} <span class="sort-lock">&#128274;</span></th>'
+                    if sort_locked else
+                    f'<th data-sortable data-col="{c}">{lbl}</th>'
+                    for c, lbl in [(1,"商品名"),(2,"価格"),(3,"状態"),(4,"商品登録時間"),(5,"抓取時間")]
+                  ])}
                   <th>リンク</th>
                 </tr>
               </thead>
@@ -1997,7 +2183,8 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
     xlsx_el.href = '/export/xlsx?' + sp.toString();"""
 
     content  = search_card + "\n" + results_html
-    extra_js = f"{_STICKY_JS}\n{_SORT_JS}\n{_OPEN_LINK_JS}\n{export_js}"
+    _sort_js_include = "" if sort_locked else _SORT_JS
+    extra_js = f"{_STICKY_JS}\n{_sort_js_include}\n{_OPEN_LINK_JS}\n{export_js}"
     return _page_shell("商品管理", "products", content, extra_js,
                        subtitle="商品の検索・エクスポート")
 
@@ -2456,7 +2643,7 @@ def settings_page():
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">v1.4.2</span>
+          <span class="settings-value">v1.4.5</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
