@@ -1,9 +1,13 @@
 #!/bin/bash
-# build_mac.sh — Build Mercari Inventory as a macOS .app bundle + DMG installer.
+# build_mac.sh — Build MIA Inventory as a macOS .app bundle + DMG installer.
 #
 # Produces:
-#   dist/MercariInventory.app            Standard macOS .app bundle
+#   dist/MIAInventory.app                Standard macOS .app bundle
 #   dist/MIAInventory_Mac_<version>.dmg  Drag-and-drop DMG installer
+#
+# APP_NAME is the internal PyInstaller name (no spaces) so sys._MEIPASS and
+# the selenium-manager path are space-free.  The user-visible Finder name is
+# set via CFBundleDisplayName / CFBundleName in Info.plist after the build.
 #
 # Optional signing (set env vars before running):
 #   SIGN_IDENTITY  — "Developer ID Application: Your Name (TEAMID)"
@@ -22,7 +26,11 @@
 
 set -euo pipefail
 
-APP_NAME="MIA Inventory"
+# Internal name used by PyInstaller (no spaces — keeps sys._MEIPASS clean
+# and avoids Selenium Manager path-with-spaces issues on macOS).
+APP_NAME="MIAInventory"
+# User-visible display name patched into Info.plist after the build.
+DISPLAY_NAME="MIA Inventory"
 ENTRY="main.py"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARIZE="${NOTARIZE:-0}"
@@ -159,8 +167,22 @@ pyinstaller \
     \
     "${ENTRY}"
 
+# ── Patch Info.plist — set user-visible display name ─────────────────────────
+# PyInstaller uses APP_NAME ("MIAInventory") as the internal bundle name so
+# sys._MEIPASS stays space-free.  We override what Finder shows here.
+PLIST="${APP_BUNDLE}/Contents/Info.plist"
+if [ -f "${PLIST}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${DISPLAY_NAME}" "${PLIST}" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ${DISPLAY_NAME}" "${PLIST}"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName ${DISPLAY_NAME}" "${PLIST}" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :CFBundleName string ${DISPLAY_NAME}" "${PLIST}"
+    echo "✓ Info.plist patched: CFBundleDisplayName/CFBundleName = ${DISPLAY_NAME}"
+else
+    echo "  ⚠  Info.plist not found at ${PLIST} — skipping display name patch"
+fi
+
 # ── Code signing (.app) ───────────────────────────────────────────────────────
-# --windowed produces dist/MercariInventory.app — sign the whole bundle.
+# --windowed produces dist/MIAInventory.app — sign the whole bundle.
 # --deep signs the top-level bundle and all nested binaries/frameworks in one pass.
 
 if [ -n "${SIGN_IDENTITY}" ]; then

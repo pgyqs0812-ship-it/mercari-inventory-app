@@ -253,25 +253,38 @@ def _ensure_selenium_manager() -> None:
     if os.environ.get("SE_MANAGER_PATH"):
         return  # already pinned by a previous call
 
+    # Log _MEIPASS so we can confirm whether spaces in the temp dir path
+    # cause Selenium Manager / ChromeDriver discovery failures.
+    _meipass = getattr(sys, "_MEIPASS", None)
+    _logger.info("[selenium] sys._MEIPASS=%s (frozen=%s, has_space=%s)",
+                 _meipass, _meipass is not None,
+                 (" " in str(_meipass)) if _meipass else False)
+
     import selenium as _sel
     selenium_pkg_dir = os.path.dirname(os.path.abspath(_sel.__file__))
+    _logger.info("[selenium] selenium_pkg_dir=%s", selenium_pkg_dir)
     sm_path = os.path.join(
         selenium_pkg_dir, "webdriver", "common", "macos", "selenium-manager"
     )
 
     if not os.path.isfile(sm_path):
         print(f"[driver] selenium-manager が見つかりません: {sm_path}")
+        _logger.error("[selenium] selenium-manager not found at: %s", sm_path)
         return
 
     if not os.access(sm_path, os.X_OK):
         try:
             os.chmod(sm_path, 0o755)
             print(f"[driver] selenium-manager の実行権限を付与しました: {sm_path}")
+            _logger.info("[selenium] selenium-manager chmod +x: %s", sm_path)
         except OSError as exc:
             print(f"[driver] selenium-manager chmod 失敗: {exc}")
+            _logger.error("[selenium] selenium-manager chmod failed: %s", exc)
 
     os.environ["SE_MANAGER_PATH"] = sm_path
     print(f"[driver] SE_MANAGER_PATH={sm_path}")
+    _logger.info("[selenium] SE_MANAGER_PATH=%s (space_in_path=%s)",
+                 sm_path, " " in sm_path)
 
 
 def _get_or_create_driver() -> "webdriver.Chrome":
@@ -3268,7 +3281,7 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
     # Attempt to start Chrome; retry once with extra cleanup for visible driver.
     # Each attempt uses a fresh thread+queue so a hung previous attempt never
     # blocks the next one (eliminates ThreadPoolExecutor single-worker deadlock).
-    LAUNCH_TIMEOUT = 45
+    LAUNCH_TIMEOUT = 90
     max_attempts = 2 if not headless else 1
     last_exc: Exception | None = None
     driver = None
