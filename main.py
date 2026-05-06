@@ -8,6 +8,7 @@ errors and status are surfaced via macOS dialogs and notifications.
 import logging
 import logging.handlers
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -245,6 +246,21 @@ def main() -> None:
     flask_app    = _ms.app
     init_db      = _ms.init_db
     init_license = _ms.init_license
+
+    # SIGTERM handler — macOS sends SIGTERM when the user quits the .app via
+    # Cmd+Q or the Dock menu.  Python's default handler kills the process
+    # immediately without running atexit, leaving Chrome processes and a
+    # SingletonLock in the profile dir.  This handler runs the same cleanup
+    # that atexit would normally run and then exits cleanly.
+    def _sigterm_handler(signum, frame):  # noqa: ANN001
+        _log("[startup] SIGTERM 受信 — Chrome をシャットダウンします")
+        try:
+            _ms._shutdown_chrome()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     port_busy = is_port_in_use(PORT)
     _log(f"[startup] ポート {PORT} 使用中: {port_busy}")

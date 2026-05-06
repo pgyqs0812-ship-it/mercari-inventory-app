@@ -128,6 +128,7 @@ _sync_progress: dict = {
 # Singleton visible-Chrome driver shared by sync and link-open
 _singleton_driver = None
 _driver_lock = threading.Lock()   # guards singleton creation only
+_chromedriver_pid: int | None = None  # chromedriver process PID for targeted cleanup
 
 
 def jst_now() -> str:
@@ -233,14 +234,110 @@ def _is_driver_alive(driver) -> bool:
     return result[0]
 
 
-def _kill_orphan_chromedriver() -> None:
-    """Kill stale chromedriver processes left over from a previous crashed session."""
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is still running."""
     try:
-        import subprocess
-        subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True, timeout=5)
-        time.sleep(0.3)
+        import subprocess as _sp
+        return _sp.run(["kill", "-0", str(pid)],
+                       capture_output=True, timeout=2).returncode == 0
     except Exception:
-        pass
+        return False
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until the process exits or timeout expires. Returns True if it exited."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _remove_profile_lock_files() -> None:
+    """Remove Chrome profile lock files without killing any processes.
+
+    Used at shutdown after driver.quit() has already closed Chrome cleanly.
+    Killing Chrome with -9 at shutdown triggers the "restore pages" warning;
+    this function only removes the files that Chrome would have cleaned itself.
+    """
+    if not CHROME_PROFILE_DIR:
+        return
+    lock_files = [
+        "SingletonLock", "SingletonCookie", "SingletonSocket",
+        os.path.join("Default", "DevToolsActivePort"), "DevToolsActivePort",
+    ]
+    cleaned = []
+    for lock_name in lock_files:
+        lock_path = os.path.join(CHROME_PROFILE_DIR, lock_name)
+        try:
+            if os.path.exists(lock_path) or os.path.islink(lock_path):
+                os.remove(lock_path)
+                cleaned.append(lock_name)
+        except OSError:
+            pass
+    if cleaned:
+        _logger.info("[profile] シャットダウン — ロックファイル削除: %s", ", ".join(cleaned))
+
+
+def _kill_orphan_chromedriver() -> None:
+    """Kill the tracked chromedriver if it didn't exit after driver.quit().
+
+    Sends SIGTERM first, waits 3 s, then SIGKILL only if still alive.
+    """
+    global _chromedriver_pid
+    pid = _chromedriver_pid
+    _chromedriver_pid = None
+    if pid is None:
+        return
+    try:
+        import subprocess as _sp
+        if not _pid_alive(pid):
+            _logger.info("[profile] chromedriver は既に終了: PID=%s", pid)
+            return
+        _sp.run(["kill", "-15", str(pid)], capture_output=True, timeout=3)
+        if _wait_for_pid_exit(pid, timeout=3):
+            _logger.info("[profile] chromedriver 正常終了: PID=%s", pid)
+        else:
+            _sp.run(["kill", "-9", str(pid)], capture_output=True, timeout=3)
+            _logger.info("[profile] chromedriver 強制終了 (SIGKILL): PID=%s", pid)
+    except Exception as exc:
+        _logger.warning("[profile] chromedriver 終了エラー: %s", exc)
+
+
+def _shutdown_chrome() -> None:
+    """Gracefully quit Chrome on app exit (atexit) or SIGTERM.
+
+    Flow: driver.quit() → wait for chromedriver to exit naturally →
+    conditional SIGKILL only if still alive → remove leftover lock files.
+
+    Never force-kills the Chrome browser process itself so that Chrome does
+    not show its "restore pages?" dialog on the next app launch.
+    """
+    global _singleton_driver
+    # Read and clear the driver reference without holding the lock long —
+    # shutdown is a process-exit path; perfect thread safety is less important
+    # than not deadlocking.
+    driver = _singleton_driver
+    _singleton_driver = None
+
+    if driver is not None:
+        try:
+            _logger.info("[shutdown] Chrome をシャットダウンします (driver.quit)")
+            driver.quit()
+            _logger.info("[shutdown] Chrome.quit() 完了")
+        except Exception as exc:
+            _logger.warning("[shutdown] Chrome.quit() 失敗: %s", exc)
+
+    # Wait for chromedriver to self-exit, then force-kill only if needed.
+    _kill_orphan_chromedriver()
+
+    # Remove any leftover lock files (no process killing at shutdown).
+    _remove_profile_lock_files()
+
+
+import atexit as _atexit
+_atexit.register(_shutdown_chrome)
 
 
 def _ensure_selenium_manager() -> None:
@@ -295,28 +392,27 @@ def _get_or_create_driver() -> "webdriver.Chrome":
     closed the Chrome window, or a transient error), the old driver is quit
     gracefully, orphan processes and stale profile lock files are cleaned up,
     and a new driver is created.
-    Profile locks are always cleared before creating a new driver, even on
-    a fresh process start where _singleton_driver was never set.
     """
     global _singleton_driver
     with _driver_lock:
-        if _singleton_driver is not None and not _is_driver_alive(_singleton_driver):
+        if _singleton_driver is not None:
+            if _is_driver_alive(_singleton_driver):
+                _logger.info("[driver] 既存の Chrome ドライバーを再利用")
+                return _singleton_driver
+            # Driver is dead — quit and clean up before creating a new one
+            _logger.info("[driver] Chrome ドライバーが無効 — 再生成します")
             print("[driver] Driver無効 — 再生成します")
             try:
                 _singleton_driver.quit()
             except Exception:
                 pass
             _singleton_driver = None
-            time.sleep(0.5)          # let Chrome release file handles
+            time.sleep(0.5)  # let Chrome release file handles
             _kill_orphan_chromedriver()
-            _clear_profile_lock()    # remove any stale lock files
 
-        if _singleton_driver is None:
-            # Always clear profile locks before creating a new driver so stale
-            # locks from a previous app session (or crashed Chrome) don't block startup.
-            _clear_profile_lock()
-            _singleton_driver = _make_chrome_driver(headless=False)
-
+        # _make_chrome_driver already calls _clear_profile_lock() internally
+        _logger.info("[driver] 新しい Chrome ドライバーを生成します")
+        _singleton_driver = _make_chrome_driver(headless=False)
         return _singleton_driver
 
 
@@ -1652,7 +1748,7 @@ def login_page():
       <div class="login-btn-group">
         <form method="POST" action="/login/start">
           <button class="btn btn-primary login-btn" type="submit"
-                  onclick="this.disabled=true;this.textContent='起動中…'">
+                  onclick="var b=this;b.form.submit();b.disabled=true;b.textContent='起動中…';return false">
             再試行
           </button>
         </form>
@@ -1670,7 +1766,7 @@ def login_page():
       <p class="login-desc">Mercari の在庫を同期するには、<br>Mercari アカウントでログインが必要です。</p>
       <form method="POST" action="/login/start">
         <button class="btn btn-primary login-btn" type="submit"
-                onclick="this.disabled=true;this.textContent='起動中…'">
+                onclick="var b=this;b.form.submit();b.disabled=true;b.textContent='起動中…';return false">
           ログインを開始
         </button>
       </form>"""
@@ -1733,10 +1829,30 @@ def login_start():
     global _session_state, _login_error_msg, _login_start_time
     _logger.info("[login] ログインボタンが押されました (state=%s)", _session_state)
     with _login_start_lock:
-        stuck = (_session_state == "logging_in" and time.time() - _login_start_time > 120)
-        if _session_state == "logging_in" and not stuck:
-            _logger.info("[login] 重複リクエストを無視 (logging_in 進行中)")
-            return redirect("/login")
+        if _session_state == "logging_in":
+            # Check whether Chrome is still alive rather than using a fixed timer.
+            # If alive: bring it to the front and ignore the duplicate request.
+            # If dead: the previous login attempt crashed — allow a clean retry.
+            with _driver_lock:
+                _alive = (
+                    _singleton_driver is not None
+                    and _is_driver_alive(_singleton_driver)
+                )
+            if _alive:
+                _logger.info("[login] 重複リクエストを無視 (Chrome 起動中) — Chrome を前面に移動")
+                if platform.system() == "Darwin":
+                    try:
+                        import subprocess as _sp
+                        _sp.run(
+                            ["osascript", "-e",
+                             'tell application "Google Chrome" to activate'],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+                return redirect("/login")
+            # Driver dead — previous login crashed; allow clean retry
+            _logger.info("[login] 前回ログインの Chrome が無効 — クリーンアップして再試行")
         _login_error_msg = ""
         _session_state = "logging_in"
         _login_start_time = time.time()
@@ -2779,22 +2895,71 @@ def _is_valid_price(price: str) -> bool:
 
 
 def _clear_profile_lock() -> None:
-    """Remove stale Chrome singleton lock files so a new instance can start.
+    """Kill Chrome processes holding the app profile and remove all stale lock
+    files so that a new Selenium Chrome instance can open the profile cleanly.
 
-    Chrome writes lock files (SingletonLock, SingletonCookie, SingletonSocket)
-    into the user-data-dir. If Chrome crashes or is force-killed these remain
-    and prevent a new Chrome process from using the same profile directory.
+    Cleans: SingletonLock, SingletonCookie, SingletonSocket,
+            Default/DevToolsActivePort, DevToolsActivePort (root level).
+    Kills any Chrome process whose command-line references CHROME_PROFILE_DIR.
     """
     if not CHROME_PROFILE_DIR:
         return
-    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+
+    _logger.info("[profile] プロファイル準備: %s", CHROME_PROFILE_DIR)
+
+    # ── Kill Chrome processes using our profile ───────────────────────────────
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["pgrep", "-f", CHROME_PROFILE_DIR],
+            capture_output=True, text=True, timeout=3,
+        )
+        pids = [p.strip() for p in result.stdout.splitlines() if p.strip()]
+        if pids:
+            _logger.warning("[profile] プロファイル使用中の Chrome プロセス: PID=%s — 強制終了", pids)
+            for pid in pids:
+                try:
+                    _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
+                except Exception:
+                    pass
+            time.sleep(0.8)
+        else:
+            _logger.info("[profile] 使用中の Chrome プロセスなし")
+    except Exception as exc:
+        _logger.warning("[profile] Chrome プロセス検索エラー: %s", exc)
+
+    # ── Remove stale lock / port files ────────────────────────────────────────
+    lock_files = [
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        os.path.join("Default", "DevToolsActivePort"),
+        "DevToolsActivePort",
+    ]
+    cleaned = []
+    for lock_name in lock_files:
         lock_path = os.path.join(CHROME_PROFILE_DIR, lock_name)
         try:
             if os.path.exists(lock_path) or os.path.islink(lock_path):
                 os.remove(lock_path)
-                print(f"[driver] プロファイルロック削除: {lock_name}")
-        except OSError:
-            pass
+                cleaned.append(lock_name)
+        except OSError as exc:
+            _logger.warning("[profile] ロックファイル削除失敗: %s (%s)", lock_name, exc)
+
+    if cleaned:
+        _logger.info("[profile] 削除: %s", ", ".join(cleaned))
+    else:
+        _logger.info("[profile] 削除するロックファイルなし")
+
+    # ── Writability check ─────────────────────────────────────────────────────
+    try:
+        _test = os.path.join(CHROME_PROFILE_DIR, ".mia_write_test")
+        with open(_test, "w") as _f:
+            _f.write("ok")
+        os.remove(_test)
+        _logger.info("[profile] 書き込み可能を確認")
+    except Exception as exc:
+        _logger.error("[profile] プロファイルへの書き込み不可: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3271,6 +3436,10 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
         # Persistent profile: Mercari session and cookies survive across runs
         if CHROME_PROFILE_DIR:
             os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+            _logger.info("[profile] プロファイル: %s", CHROME_PROFILE_DIR)
+            # Clean stale locks and kill Chrome processes holding the profile
+            # BEFORE the first launch attempt — not just on retry.
+            _clear_profile_lock()
             opts.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
             opts.add_argument("--profile-directory=Default")
 
@@ -3279,57 +3448,71 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
     # call fixes that and sets SE_MANAGER_PATH so Selenium always finds it.
     _ensure_selenium_manager()
 
-    # Attempt to start Chrome; retry once with extra cleanup for visible driver.
-    # Each attempt uses a fresh thread+queue so a hung previous attempt never
-    # blocks the next one (eliminates ThreadPoolExecutor single-worker deadlock).
-    LAUNCH_TIMEOUT = 90
-    max_attempts = 2 if not headless else 1
-    last_exc: Exception | None = None
-    driver = None
-    for attempt in range(max_attempts):
+    def _launch_chrome(launch_opts, label="main"):
+        """Spawn Chrome in a daemon thread; return driver or raise on failure/timeout."""
         import queue as _q
         _result_q: _q.Queue = _q.Queue(maxsize=1)
 
-        def _chrome_worker(_o=opts, _rq=_result_q):
+        def _chrome_worker(_o=launch_opts, _rq=_result_q):
             try:
                 _rq.put(("ok", webdriver.Chrome(_o)))
             except Exception as _e:
                 _rq.put(("err", _e))
 
-        _t = threading.Thread(target=_chrome_worker, daemon=True,
-                              name=f"chrome-launch-{attempt}")
-        _t.start()
-        _logger.info("[selenium] Chrome 起動試行 %d/%d (headless=%s)",
-                     attempt + 1, max_attempts, headless)
+        threading.Thread(target=_chrome_worker, daemon=True,
+                         name=f"chrome-{label}").start()
         try:
             _status, _val = _result_q.get(timeout=LAUNCH_TIMEOUT)
         except _q.Empty:
-            last_exc = RuntimeError(
+            raise RuntimeError(
                 f"Chrome の起動が {LAUNCH_TIMEOUT} 秒以内に完了しませんでした。\n"
                 "Chrome または ChromeDriver が応答していない可能性があります。\n"
                 "もう一度試すか、PC を再起動してください。"
             )
-            print(f"[driver] Chrome起動タイムアウト (attempt {attempt + 1}/{max_attempts})")
-            _logger.error("[selenium] Chrome 起動タイムアウト (attempt %d, timeout=%ds)",
-                          attempt + 1, LAUNCH_TIMEOUT)
-            if attempt == 0 and not headless:
-                _kill_orphan_chromedriver()
-                _clear_profile_lock()
-                time.sleep(1.0)
-            continue
         if _status == "err":
-            last_exc = _val
-            print(f"[driver] Chrome起動失敗 (attempt {attempt + 1}/{max_attempts}): {_val}")
-            _logger.error("[selenium] Chrome 起動失敗 (attempt %d): %s",
-                          attempt + 1, _val)
+            raise _val
+        return _val
+
+    # Attempt to start Chrome; retry once with extra cleanup for visible driver.
+    LAUNCH_TIMEOUT = 90
+    max_attempts = 2 if not headless else 1
+    last_exc: Exception | None = None
+    driver = None
+    for attempt in range(max_attempts):
+        _logger.info("[selenium] Chrome 起動試行 %d/%d (headless=%s)",
+                     attempt + 1, max_attempts, headless)
+        try:
+            driver = _launch_chrome(opts, label=f"attempt{attempt + 1}")
+            _logger.info("[selenium] Chrome 起動成功 (attempt %d)", attempt + 1)
+            break
+        except Exception as exc:
+            last_exc = exc
+            _logger.error("[selenium] Chrome 起動失敗 (attempt %d): %s", attempt + 1, exc)
+            print(f"[driver] Chrome起動失敗 (attempt {attempt + 1}/{max_attempts}): {exc}")
             if attempt == 0 and not headless:
                 _kill_orphan_chromedriver()
                 _clear_profile_lock()
                 time.sleep(1.0)
-            continue
-        driver = _val
-        _logger.info("[selenium] Chrome 起動成功 (attempt %d)", attempt + 1)
-        break
+
+    # ── Temp-profile fallback ─────────────────────────────────────────────────
+    # If both profile-based attempts failed, try once more with a fresh
+    # temporary profile (no --user-data-dir).  Cookies will be injected after
+    # login from the JSON backup, so the user does not lose their session.
+    if driver is None and not headless and CHROME_PROFILE_DIR:
+        _logger.warning("[selenium] メインプロファイルで起動失敗 — 一時プロファイルで再試行")
+        tmp_opts = Options()
+        tmp_opts.add_argument("--disable-blink-features=AutomationControlled")
+        tmp_opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        tmp_opts.add_experimental_option("useAutomationExtension", False)
+        tmp_opts.add_argument("--start-maximized")
+        tmp_opts.add_argument("--no-first-run")
+        tmp_opts.add_argument("--no-default-browser-check")
+        try:
+            driver = _launch_chrome(tmp_opts, label="tmp")
+            _logger.info("[selenium] 一時プロファイルで Chrome 起動成功")
+        except Exception as exc:
+            last_exc = exc
+            _logger.error("[selenium] 一時プロファイルでも Chrome 起動失敗: %s", exc)
 
     if driver is None:
         raise RuntimeError(
@@ -3337,6 +3520,14 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
             "Google Chrome がインストールされていることを確認してください。\n"
             "https://www.google.com/chrome/"
         ) from last_exc
+
+    # Log chromedriver PID for targeted cleanup on shutdown / crash recovery
+    global _chromedriver_pid
+    try:
+        _chromedriver_pid = driver.service.process.pid
+        _logger.info("[selenium] chromedriver PID: %s", _chromedriver_pid)
+    except Exception:
+        pass
 
     # Remove navigator.webdriver fingerprint so Mercari does not detect Selenium
     try:
@@ -3439,17 +3630,67 @@ def click_login_button_if_exists(driver):
     print("没有找到可自动点击的ログイン按钮，请手动点击。")
 
 
+def _is_logged_in_dom(driver) -> bool:
+    """Return True if jp.mercari.com is showing a logged-in state via DOM elements.
+
+    Mercari's SPA sometimes keeps the URL at /login even after the user is
+    already authenticated (page renders logged-in content without redirecting).
+    This check looks for logged-in UI elements as a fallback to the URL check.
+    """
+    try:
+        from selenium.webdriver.common.by import By as _By
+        selectors = [
+            "[data-testid='user-icon']",
+            "[data-testid='account-icon']",
+            "[aria-label='マイページ']",
+            "a[href='/mypage']",
+            # 出品 button present only when logged in
+            "a[href*='/sell']",
+        ]
+        for sel in selectors:
+            if driver.find_elements(_By.CSS_SELECTOR, sel):
+                _logger.info("[login] DOM ログイン確認: %s", sel)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def wait_for_login(driver, timeout=300):
-    """Poll until the browser URL leaves the login page."""
-    print("ブラウザで Mercari にログインしてください。")
-    print("ログイン完了後、自動的に同期を開始します（最大 5 分待機）...")
+    """Poll until jp.mercari.com shows a logged-in state.
+
+    Accepts either a URL-based signal (URL leaves /login) or a DOM-based
+    signal (logged-in UI elements present while URL is still /login — Mercari's
+    SPA does this when the session is already active).
+
+    If Chrome navigates away from jp.mercari.com (e.g. to mercari-shops.com),
+    it is redirected back to jp.mercari.com/login.
+    Raises TimeoutError after `timeout` seconds.
+    """
+    _logger.info("[login] ログイン待機中 (最大 %d 秒)...", timeout)
+    print("ブラウザで jp.mercari.com にログインしてください。")
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            if "login" not in driver.current_url:
-                time.sleep(1)
-                print("ログイン確認完了。同期を開始します...")
+            cur = driver.current_url
+            # URL-based success: redirected away from /login
+            if "jp.mercari.com" in cur and "login" not in cur:
+                _logger.info("[login] jp.mercari.com ログイン確認 (URL: %s)", cur)
+                print("ログイン確認完了。セッションを保存します...")
                 return
+            # DOM-based success: SPA shows logged-in content at /login URL
+            if "jp.mercari.com" in cur and _is_logged_in_dom(driver):
+                _logger.info("[login] jp.mercari.com DOM ログイン確認 (URL: %s)", cur)
+                print("ログイン確認完了 (DOM)。セッションを保存します...")
+                return
+            # Chrome drifted to another domain — redirect back to jp.mercari.com
+            if cur and "jp.mercari.com" not in cur:
+                _logger.warning(
+                    "[login] 別ドメイン検出 (%s) — jp.mercari.com/login に戻します", cur
+                )
+                driver.get("https://jp.mercari.com/login")
+                time.sleep(2)
+                continue
         except Exception:
             pass
         time.sleep(2)
@@ -3510,6 +3751,21 @@ def _do_login(force_relogin: bool = False) -> None:
         except Exception:
             pass
 
+        # macOS: bring Chrome to the foreground so the user sees the login page.
+        # When a daemon thread launches Chrome via Selenium, macOS focus-stealing
+        # prevention keeps the new window behind the current frontmost app.
+        # osascript 'activate' is the only reliable way to override this.
+        if platform.system() == "Darwin":
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["osascript", "-e", 'tell application "Google Chrome" to activate'],
+                    timeout=3, capture_output=True,
+                )
+                _logger.info("[login] Chrome を前面に移動しました (osascript)")
+            except Exception:
+                pass
+
         if force_relogin:
             try:
                 driver.get("https://jp.mercari.com")
@@ -3518,10 +3774,28 @@ def _do_login(force_relogin: bool = False) -> None:
             except Exception:
                 pass
 
-        _logger.info("[login] Mercari ログインページに移動")
+        _logger.info("[login] jp.mercari.com/login に移動")
         driver.get("https://jp.mercari.com/login")
-        click_login_button_if_exists(driver)
-        wait_for_login(driver)
+        time.sleep(3)  # allow auto-redirect if existing session
+
+        cur = driver.current_url
+        _logger.info("[login] ナビゲーション後 URL: %s", cur)
+        already_in = (
+            "jp.mercari.com" in cur and "login" not in cur
+        ) or (
+            "jp.mercari.com" in cur and _is_logged_in_dom(driver)
+        )
+        if already_in:
+            _logger.info("[login] jp.mercari.com 既存セッション検出 (URL=%s)", cur)
+        else:
+            # Still on login page — wait for user to log in manually.
+            # click_login_button_if_exists is intentionally NOT called here:
+            # it was clicking Mercari Shops links and navigating to the wrong domain.
+            if "jp.mercari.com" not in cur:
+                _logger.warning("[login] 想定外の URL (%s) — jp.mercari.com/login に戻します", cur)
+                driver.get("https://jp.mercari.com/login")
+                time.sleep(2)
+            wait_for_login(driver)
         _save_session_cookies(driver)
         try:
             driver.set_window_position(-3000, 0)
@@ -3534,7 +3808,11 @@ def _do_login(force_relogin: bool = False) -> None:
         import traceback
         print(f"[login] ログイン失敗: {exc}")
         _logger.error("[login] ログイン失敗: %s\n%s", exc, traceback.format_exc())
-        _session_state = "invalid"
+        if isinstance(exc, TimeoutError):
+            _login_error_msg = "ログインがタイムアウトしました（5 分）。ボタンを押して再試行してください。"
+        elif not _login_error_msg:
+            _login_error_msg = f"ログインに失敗しました: {str(exc).split(chr(10))[0]}"
+        _session_state = "error"
     finally:
         if _session_state == "logging_in":
             print("[login] 警告: ログインスレッドが logging_in のまま終了 — invalid にリセット")
