@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import queue
+import sys
 import threading
 import time
 import webbrowser
