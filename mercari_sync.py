@@ -3630,71 +3630,178 @@ def click_login_button_if_exists(driver):
     print("没有找到可自动点击的ログイン按钮，请手动点击。")
 
 
-def _is_logged_in_dom(driver) -> bool:
-    """Return True if jp.mercari.com is showing a logged-in state via DOM elements.
+def _is_authenticated_dom(driver) -> bool:
+    """Return True if jp.mercari.com is showing authenticated-only UI elements.
 
-    Mercari's SPA sometimes keeps the URL at /login even after the user is
-    already authenticated (page renders logged-in content without redirecting).
-    This check looks for logged-in UI elements as a fallback to the URL check.
+    Uses a wide set of CSS selectors plus a JavaScript fallback that inspects
+    page text and form state. Logs every result so failed matches can be
+    diagnosed and new selectors can be added from the output.
     """
     try:
         from selenium.webdriver.common.by import By as _By
-        selectors = [
+
+        # ── Log current page state ────────────────────────────────────────────
+        cur_url, page_title = "?", "?"
+        try:
+            cur_url   = driver.current_url
+            page_title = driver.title
+        except Exception:
+            pass
+        _logger.info("[login] DOM check — URL: %s | title: %s", cur_url, page_title)
+
+        # ── CSS selector sweep ────────────────────────────────────────────────
+        # Confirmed on live jp.mercari.com (2026-05-06):
+        #   CONFIRMED HIT:  a[href*='/mypage'] (3 elements) — auth-only nav link
+        #   CONFIRMED HIT:  [data-testid='badge'] (1 element) — notification/account badge
+        # These are listed first. Remaining selectors are speculative fallbacks.
+        # Intentionally excluded: a[href*='/sell'] — exists on unauthenticated pages.
+        # Intentionally excluded: header img / nav img — matches Mercari logo too.
+        auth_selectors = [
+            # ── Confirmed auth-only (from live DOM probe) ──────────────────
+            "a[href*='/mypage']",            # mypage nav link; 3 hits confirmed
+            "[data-testid='badge']",         # notification/account badge; 1 hit confirmed
+            # ── Likely auth-only (speculative; not yet confirmed) ──────────
             "[data-testid='user-icon']",
             "[data-testid='account-icon']",
+            "[data-testid='header-user-icon']",
+            "[data-testid='notification-icon']",
+            "[data-testid='likes-icon']",
+            "[data-testid='account-name']",
+            "[data-testid='user-name']",
+            "[data-testid='list-button']",
+            "[data-testid='sell-button']",
             "[aria-label='マイページ']",
+            "[aria-label='通知']",
+            "[aria-label='いいね']",
+            "[aria-label='出品']",
+            "[aria-label='アカウント']",
             "a[href='/mypage']",
-            # 出品 button present only when logged in
-            "a[href*='/sell']",
+            "a[href*='/mypage/listing']",
+            "a[href*='/logout']",
+            "a[href*='logout']",
+            "mer-navigation-button",
+            "mer-icon-button",
         ]
-        for sel in selectors:
-            if driver.find_elements(_By.CSS_SELECTOR, sel):
-                _logger.info("[login] DOM ログイン確認: %s", sel)
+
+        hit_selectors = []
+        miss_selectors = []
+        for sel in auth_selectors:
+            try:
+                count = len(driver.find_elements(_By.CSS_SELECTOR, sel))
+                if count:
+                    hit_selectors.append(f"{sel}({count})")
+                else:
+                    miss_selectors.append(sel)
+            except Exception as _e:
+                miss_selectors.append(f"{sel}[err:{_e}]")
+
+        _logger.info("[login] selector hits: %s", hit_selectors or "none")
+        _logger.info("[login] selector misses: %s", miss_selectors)
+
+        if hit_selectors:
+            _logger.info("[login] authenticated selector found: %s", hit_selectors[0])
+            return True
+
+        # ── JavaScript fallback ───────────────────────────────────────────────
+        _logger.warning("[login] no CSS selector matched — running JS fallback")
+        try:
+            js_result = driver.execute_script("""
+                var body  = document.body ? document.body.innerText : '';
+                var links = Array.from(document.querySelectorAll('a[href]'))
+                                 .map(function(a){ return a.getAttribute('href'); })
+                                 .filter(function(h){ return h && h.length < 120; })
+                                 .slice(0, 50);
+                var tids  = Array.from(document.querySelectorAll('[data-testid]'))
+                                 .map(function(e){ return e.dataset.testid; })
+                                 .slice(0, 40);
+                return {
+                    hasLogout:      body.includes('ログアウト'),
+                    hasMypage:      body.includes('マイページ'),
+                    hasEmailInput:  !!document.querySelector('input[type=email]'),
+                    hasPasswordInput: !!document.querySelector('input[type=password]'),
+                    links:          links,
+                    dataTestIds:    tids
+                };
+            """)
+            _logger.info("[login] JS result: hasLogout=%s hasMypage=%s hasEmailInput=%s "
+                         "hasPasswordInput=%s",
+                         js_result.get('hasLogout'), js_result.get('hasMypage'),
+                         js_result.get('hasEmailInput'), js_result.get('hasPasswordInput'))
+            _logger.info("[login] JS links: %s", js_result.get('links', []))
+            _logger.info("[login] JS data-testids: %s", js_result.get('dataTestIds', []))
+
+            # Confirmed authenticated via text content
+            if js_result.get('hasLogout'):
+                _logger.info("[login] authenticated selector found: 'ログアウト' text in page")
                 return True
-    except Exception:
-        pass
+            if js_result.get('hasMypage') and not js_result.get('hasEmailInput'):
+                _logger.info("[login] authenticated selector found: 'マイページ' text without login form")
+                return True
+        except Exception as js_exc:
+            _logger.warning("[login] JS fallback error: %s", js_exc)
+
+        # ── Header HTML snapshot (for selector debugging) ─────────────────────
+        try:
+            snapshot = driver.execute_script("""
+                var el = document.querySelector('header')
+                      || document.querySelector('[class*="Header"]')
+                      || document.querySelector('[class*="header"]')
+                      || document.querySelector('nav');
+                return el ? el.outerHTML.substring(0, 3000) : '(no header/nav found)';
+            """)
+            _logger.info("[login] header HTML snapshot:\n%s", snapshot)
+        except Exception:
+            pass
+
+    except Exception as outer_exc:
+        _logger.warning("[login] _is_authenticated_dom outer error: %s", outer_exc)
+
     return False
 
 
 def wait_for_login(driver, timeout=300):
-    """Poll until jp.mercari.com shows a logged-in state.
+    """Poll until jp.mercari.com confirms an authenticated session.
 
-    Accepts either a URL-based signal (URL leaves /login) or a DOM-based
-    signal (logged-in UI elements present while URL is still /login — Mercari's
-    SPA does this when the session is already active).
+    Calls _is_authenticated_dom() on every 2-second cycle regardless of whether
+    the URL is still at /login.  Mercari's SPA renders logged-in UI at the /login
+    URL without redirecting, so a URL guard here would cause the poller to miss
+    the already-authenticated state.
 
-    If Chrome navigates away from jp.mercari.com (e.g. to mercari-shops.com),
-    it is redirected back to jp.mercari.com/login.
+    If Chrome drifts to another domain it is redirected back to jp.mercari.com/login.
     Raises TimeoutError after `timeout` seconds.
     """
-    _logger.info("[login] ログイン待機中 (最大 %d 秒)...", timeout)
+    _logger.info("[login] waiting for authenticated session... (timeout=%ds)", timeout)
     print("ブラウザで jp.mercari.com にログインしてください。")
     deadline = time.time() + timeout
+
     while time.time() < deadline:
         try:
             cur = driver.current_url
-            # URL-based success: redirected away from /login
-            if "jp.mercari.com" in cur and "login" not in cur:
-                _logger.info("[login] jp.mercari.com ログイン確認 (URL: %s)", cur)
-                print("ログイン確認完了。セッションを保存します...")
-                return
-            # DOM-based success: SPA shows logged-in content at /login URL
-            if "jp.mercari.com" in cur and _is_logged_in_dom(driver):
-                _logger.info("[login] jp.mercari.com DOM ログイン確認 (URL: %s)", cur)
-                print("ログイン確認完了 (DOM)。セッションを保存します...")
-                return
-            # Chrome drifted to another domain — redirect back to jp.mercari.com
+
+            # Wrong domain — redirect back and keep waiting
             if cur and "jp.mercari.com" not in cur:
                 _logger.warning(
-                    "[login] 別ドメイン検出 (%s) — jp.mercari.com/login に戻します", cur
+                    "[login] wrong domain detected (%s) — redirecting to jp.mercari.com/login", cur
                 )
                 driver.get("https://jp.mercari.com/login")
                 time.sleep(2)
                 continue
-        except Exception:
-            pass
+
+            # Run DOM + JS authentication check on every cycle.
+            # This works whether the URL is /login or any other jp.mercari.com page.
+            _logger.info("[login] waiting for authenticated session... (URL: %s)", cur)
+            if _is_authenticated_dom(driver):
+                _logger.info("[login] login confirmed (URL: %s)", cur)
+                print("ログイン確認完了。セッションを保存します...")
+                return
+
+        except Exception as exc:
+            _logger.debug("[login] poll error (ignored): %s", exc)
+
         time.sleep(2)
-    raise TimeoutError("ログインがタイムアウトしました（5 分）。アプリを再起動してください。")
+
+    _logger.error("[login] timeout waiting for login")
+    raise TimeoutError("ログインがタイムアウトしました（5 分）。ボタンを押して再試行してください。")
 
 
 def _check_session_background() -> None:
@@ -3776,25 +3883,32 @@ def _do_login(force_relogin: bool = False) -> None:
 
         _logger.info("[login] jp.mercari.com/login に移動")
         driver.get("https://jp.mercari.com/login")
-        time.sleep(3)  # allow auto-redirect if existing session
+        time.sleep(5)  # allow auto-redirect if existing Mercari session
 
         cur = driver.current_url
         _logger.info("[login] ナビゲーション後 URL: %s", cur)
-        already_in = (
-            "jp.mercari.com" in cur and "login" not in cur
-        ) or (
-            "jp.mercari.com" in cur and _is_logged_in_dom(driver)
-        )
-        if already_in:
-            _logger.info("[login] jp.mercari.com 既存セッション検出 (URL=%s)", cur)
+
+        if "jp.mercari.com" not in cur:
+            # Unexpected domain — navigate back before waiting
+            _logger.warning("[login] 想定外の URL (%s) — jp.mercari.com/login に戻します", cur)
+            driver.get("https://jp.mercari.com/login")
+            time.sleep(2)
+            cur = driver.current_url
+
+        if "jp.mercari.com" in cur and "login" not in cur:
+            # Mercari auto-redirected away from /login → existing authenticated session.
+            # Verify with DOM check; if it fails we still accept the URL change as auth.
+            _logger.info("[login] URL-based session detected (%s) — verifying...", cur)
+            time.sleep(2)  # give SPA a moment to finish rendering
+            if _is_authenticated_dom(driver):
+                _logger.info("[login] login confirmed (existing session, DOM verified)")
+            else:
+                _logger.info("[login] login confirmed (existing session, URL-only — DOM pending)")
         else:
-            # Still on login page — wait for user to log in manually.
-            # click_login_button_if_exists is intentionally NOT called here:
-            # it was clicking Mercari Shops links and navigating to the wrong domain.
-            if "jp.mercari.com" not in cur:
-                _logger.warning("[login] 想定外の URL (%s) — jp.mercari.com/login に戻します", cur)
-                driver.get("https://jp.mercari.com/login")
-                time.sleep(2)
+            # Still on /login — wait for user to complete login manually.
+            # DOM check is intentionally NOT used here: unreliable selectors exist on
+            # the unauthenticated login page (e.g. sell links, promo elements).
+            _logger.info("[login] login page visible — waiting for user to authenticate")
             wait_for_login(driver)
         _save_session_cookies(driver)
         try:
