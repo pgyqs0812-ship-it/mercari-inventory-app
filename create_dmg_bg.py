@@ -30,15 +30,21 @@ ICON_Y = 200
 
 
 def _draw_arrow(draw):
-    cy    = ICON_Y
-    x1    = APP_X  + 80   # clear gap from app icon edge
-    x2    = APPS_X - 80   # clear gap from Applications icon edge
-    if x2 <= x1:
-        return
+    cy      = ICON_Y
+    icon_r  = 64    # half-width of each icon in the DMG window
+    gap     = 12    # clearance between arrow and icon edge
+
+    # Arrowhead tip stops just before the Applications icon left edge.
+    tip = APPS_X - icon_r - gap           # 490 - 64 - 12 = 414
+    x1  = APP_X  + icon_r + gap           # 170 + 64 + 12 = 246
 
     shaft_h = 14
     head_w  = 24
     head_h  = 36
+
+    x2 = tip - head_w                     # shaft ends at 414 - 24 = 390
+    if x2 <= x1:
+        return
 
     # shaft
     draw.rectangle(
@@ -48,9 +54,9 @@ def _draw_arrow(draw):
     # arrowhead
     draw.polygon(
         [
-            (x2,          cy - head_h // 2),
-            (x2,          cy + head_h // 2),
-            (x2 + head_w, cy),
+            (x2,   cy - head_h // 2),
+            (x2,   cy + head_h // 2),
+            (tip,  cy),
         ],
         fill=ARROW,
     )

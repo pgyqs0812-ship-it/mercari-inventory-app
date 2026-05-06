@@ -545,6 +545,28 @@ def _check_plan() -> str:
     return plan
 
 
+def _can_export() -> bool:
+    """Return True if the current license permits CSV / Excel data export.
+
+    Allowed:  monthly, lifetime
+    Blocked:  free, trial, expired, invalid, unknown
+
+    This is the single backend source of truth for export permission.
+    It is intentionally kept as a thin wrapper around _check_plan() so
+    that future extensions (license_key validation, offline signature check,
+    device_id binding, expires_at comparison) can be added here without
+    touching any export route.
+    """
+    plan = _check_plan()
+    if plan in ("monthly", "lifetime"):
+        return True
+    # Future hook:
+    # key_data = _get_license().get("license_key")
+    # if key_data and _validate_offline_signature(key_data):
+    #     return True
+    return False
+
+
 def _trial_days_remaining() -> int:
     """Return days left in the trial (0 if expired or not in trial)."""
     state = _get_license()
@@ -922,6 +944,11 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
             gap: 14px; }
 .kpi-card { background: #fff; border-radius: 12px; padding: 18px 20px;
             box-shadow: var(--shadow-md); }
+a.kpi-card-link { text-decoration: none; color: inherit; display: block; }
+a.kpi-card-link .kpi-card { cursor: pointer;
+  transition: transform .12s ease, box-shadow .12s ease; }
+a.kpi-card-link:hover .kpi-card { transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgba(0,0,0,.13); }
 .kpi-value { font-size: 26px; font-weight: 700; color: var(--text);
              letter-spacing: -.5px; }
 .kpi-value.green { color: #16a34a; }
@@ -930,6 +957,13 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .kpi-value.red   { color: #dc2626; }
 .kpi-label { font-size: 11px; font-weight: 600; color: var(--muted);
              margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
+/* Active status filter chip */
+.active-filter-chip { display: inline-flex; align-items: center; gap: 8px;
+  background: var(--primary); color: #fff; border-radius: 20px;
+  padding: 4px 12px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+.active-filter-chip a.chip-clear { color: rgba(255,255,255,.8); text-decoration: none;
+  font-size: 16px; line-height: 1; }
+.active-filter-chip a.chip-clear:hover { color: #fff; }
 /* Sync warning banner */
 .sync-warning { background: #fffbeb; border: 1px solid #fde68a;
                 border-radius: 8px; color: #92400e;
@@ -1449,22 +1483,30 @@ def home():
     # ── KPI cards ─────────────────────────────────────────────────────────
     kpi_html = f"""
     <div class="kpi-grid">
-      <div class="kpi-card">
-        <div class="kpi-value">{stats['total']}</div>
-        <div class="kpi-label">総商品数</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value green">{stats['active']}</div>
-        <div class="kpi-label">出品中</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value amber">{stats['trading']}</div>
-        <div class="kpi-label">取引中</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value blue">{stats['sold']}</div>
-        <div class="kpi-label">売却済み</div>
-      </div>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=all">
+        <div class="kpi-card">
+          <div class="kpi-value">{stats['total']}</div>
+          <div class="kpi-label">総商品数</div>
+        </div>
+      </a>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=listed">
+        <div class="kpi-card">
+          <div class="kpi-value green">{stats['active']}</div>
+          <div class="kpi-label">出品中</div>
+        </div>
+      </a>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=trading">
+        <div class="kpi-card">
+          <div class="kpi-value amber">{stats['trading']}</div>
+          <div class="kpi-label">取引中</div>
+        </div>
+      </a>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=sold">
+        <div class="kpi-card">
+          <div class="kpi-value blue">{stats['sold']}</div>
+          <div class="kpi-label">売却済み</div>
+        </div>
+      </a>
       <div class="kpi-card">
         <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
         <div class="kpi-label">推定売上合計</div>
@@ -1973,6 +2015,14 @@ def shutdown():
 
 @app.route("/export/csv")
 def export_csv():
+    if not _can_export():
+        _logger.warning("[export] blocked — non-paid plan attempted export (plan=%s, route=csv)",
+                        _check_plan())
+        return Response(
+            '{"error": "データ出力機能は有料プランの限定機能です"}',
+            status=403,
+            mimetype="application/json",
+        )
     q            = request.args.get("q", "").strip()
     sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
@@ -1996,6 +2046,14 @@ def export_csv():
 
 @app.route("/export/xlsx")
 def export_xlsx():
+    if not _can_export():
+        _logger.warning("[export] blocked — non-paid plan attempted export (plan=%s, route=xlsx)",
+                        _check_plan())
+        return Response(
+            '{"error": "データ出力機能は有料プランの限定機能です"}',
+            status=403,
+            mimetype="application/json",
+        )
     q            = request.args.get("q", "").strip()
     sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
@@ -2037,6 +2095,8 @@ def upgrade_page():
         banner_msg = "売上分析は月額プランまたは買い切りプランでご利用いただけます。"
     elif from_pg == "ai":
         banner_msg = "AI分析は月額プランまたは買い切りプランでご利用いただけます。"
+    elif from_pg == "export":
+        banner_msg = "データ出力（CSV・Excel）は月額プランまたは買い切りプランでご利用いただけます。"
     elif plan in ("expired", "free"):
         banner_msg = "7日間のトライアル期間が終了しました。引き続きご利用にはプランを選択してください。"
     else:
@@ -2047,9 +2107,9 @@ def upgrade_page():
         if banner_msg else ""
     )
 
-    free_features = "同期: 1日1回<br>商品管理: ○<br>売上分析: ✗<br>AI分析: ✗"
-    monthly_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○"
-    lifetime_features = "同期: 無制限<br>商品管理: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
+    free_features = "同期: 1日1回<br>商品管理: ○<br>データ出力: ✗<br>売上分析: ✗<br>AI分析: ✗"
+    monthly_features = "同期: 無制限<br>商品管理: ○<br>データ出力: ○<br>売上分析: ○<br>AI分析: ○"
+    lifetime_features = "同期: 無制限<br>商品管理: ○<br>データ出力: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
 
     plan_grid = f"""
     <div class="plan-grid">
@@ -2112,9 +2172,21 @@ def products_page():
 
     searched     = request.args.get("searched") == "1"
     q            = request.args.get("q", "").strip()
-    sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     price_min    = request.args.get("price_min", "").strip()
     price_max    = request.args.get("price_max", "").strip()
+
+    _STATUS_FILTER_MAP = {
+        "all":     list(FILTER_STATUSES),
+        "listed":  ["出品中"],
+        "trading": ["取引中"],
+        "sold":    ["売却済み"],
+    }
+    status_filter = request.args.get("status_filter", "")
+    if status_filter in _STATUS_FILTER_MAP:
+        searched     = True
+        sel_statuses = _STATUS_FILTER_MAP[status_filter]
+    else:
+        sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
 
     products = _query_products(q, sel_statuses) if searched else []
 
@@ -2198,15 +2270,35 @@ def products_page():
             '<p>該当する商品が見つかりませんでした</p>'
             '</div></td></tr>'
         ) if count == 0 else ""
+        can_exp = _can_export()
+        if can_exp:
+            export_btns = f"""
+              <a class="btn btn-outline" id="export-csv" href="#" {disabled}>⬇ CSV</a>
+              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>⬇ Excel</a>"""
+            export_js = """
+const sp = new URLSearchParams(window.location.search);
+const csv_el  = document.getElementById('export-csv');
+const xlsx_el = document.getElementById('export-xlsx');
+if (csv_el  && !csv_el.hasAttribute('disabled'))
+    csv_el.href  = '/export/csv?'  + sp.toString();
+if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
+    xlsx_el.href = '/export/xlsx?' + sp.toString();"""
+        else:
+            export_btns = """
+              <button class="btn btn-outline export-locked"
+                      onclick="document.getElementById('export-gate-modal').style.display='flex'"
+                      title="有料プランが必要です">⬇ CSV 🔒</button>
+              <button class="btn btn-outline export-locked"
+                      onclick="document.getElementById('export-gate-modal').style.display='flex'"
+                      title="有料プランが必要です">⬇ Excel 🔒</button>"""
+            export_js = ""
         results_html = f"""
         <div class="card">
           <div class="card-header">
             <span class="card-title">検索結果
               <span class="count-badge">{count} 件</span>
             </span>
-            <div class="export-row">
-              <a class="btn btn-outline" id="export-csv" href="#" {disabled}>⬇ CSV</a>
-              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>⬇ Excel</a>
+            <div class="export-row">{export_btns}
             </div>
           </div>
           <div class="card-body" style="padding:0">
@@ -2226,16 +2318,47 @@ def products_page():
             </table>
           </div>
         </div>"""
-        export_js = """
-const sp = new URLSearchParams(window.location.search);
-const csv_el  = document.getElementById('export-csv');
-const xlsx_el = document.getElementById('export-xlsx');
-if (csv_el  && !csv_el.hasAttribute('disabled'))
-    csv_el.href  = '/export/csv?'  + sp.toString();
-if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
-    xlsx_el.href = '/export/xlsx?' + sp.toString();"""
 
-    content  = search_card + "\n" + results_html
+    _filter_label_map = {
+        "all":     "全商品",
+        "listed":  "出品中",
+        "trading": "取引中",
+        "sold":    "売却済み",
+    }
+    active_chip = ""
+    if status_filter in _filter_label_map:
+        label = _filter_label_map[status_filter]
+        active_chip = (
+            f'<div class="active-filter-chip">'
+            f'フィルター: {label}'
+            f'<a href="/products" class="chip-clear" title="フィルターを解除">×</a>'
+            f'</div>'
+        )
+
+    export_modal = ""
+    if not _can_export():
+        export_modal = """
+<div id="export-gate-modal"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
+            z-index:9999;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;padding:32px;
+              max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.3);
+              text-align:center">
+    <div style="font-size:2rem;margin-bottom:12px">🔒</div>
+    <h3 style="margin:0 0 8px">有料プランが必要です</h3>
+    <p style="color:var(--muted);margin:0 0 24px">
+      データ出力機能（CSV・Excel）は月額プランまたは買い切りプランの限定機能です。
+    </p>
+    <div style="display:flex;gap:12px;justify-content:center">
+      <button class="btn btn-outline"
+              onclick="document.getElementById('export-gate-modal').style.display='none'">
+        閉じる
+      </button>
+      <a class="btn btn-primary" href="/upgrade?from=export">プランを確認</a>
+    </div>
+  </div>
+</div>"""
+    content  = search_card + "\n" + active_chip + "\n" + results_html + export_modal
     extra_js = f"{_STICKY_JS}\n{_SORT_JS}\n{_OPEN_LINK_JS}\n{export_js}"
     return _page_shell("商品管理", "products", content, extra_js,
                        subtitle="商品の検索・エクスポート")
