@@ -224,7 +224,7 @@ def main() -> None:
     _log("  MIA Inventory App")
     _log(f"  データ保存先: {data_dir}")
     _log(f"  ログ保存先:   {logs_dir}")
-    _log(f"  URL:          http://127.0.0.1:{PORT}")
+    _log(f"  URL:          http://0.0.0.0:{PORT}")
     _log("=" * 54)
 
     check_chrome_browser()
@@ -277,7 +277,7 @@ def main() -> None:
 
     server = threading.Thread(
         target=lambda: flask_app.run(
-            host="127.0.0.1",
+            host="0.0.0.0",
             port=PORT,
             debug=False,
             use_reloader=False,

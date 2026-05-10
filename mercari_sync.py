@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import queue
+import secrets
 import sys
 import threading
 import time
@@ -547,6 +548,52 @@ def init_license() -> None:
         plan = _check_plan()
         days = _trial_days_remaining()
         print(f"[license] プラン: {plan}, トライアル残り: {days} 日")
+
+
+# ---------------------------------------------------------------------------
+# API token helpers (iPhone companion app authentication)
+# ---------------------------------------------------------------------------
+
+def _api_token() -> str:
+    """Return (and lazily create) the persistent API token stored in license.json."""
+    state = _get_license()
+    if not state.get("api_token"):
+        state["api_token"] = secrets.token_hex(16)
+        _save_license(state)
+    return state["api_token"]
+
+
+def _require_api_token():
+    """Return None when the request carries a valid Bearer token; HTTP 401 otherwise."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != _api_token():
+        return Response(
+            '{"error":"unauthorized"}',
+            status=401,
+            mimetype="application/json",
+        )
+    return None
+
+
+def _get_lan_ip() -> str:
+    """Return the Mac's LAN IPv4 address (best-effort; falls back to 127.0.0.1)."""
+    import socket as _sock
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _reset_api_token() -> str:
+    """Generate a new token, persist it, and return it."""
+    state = _get_license()
+    state["api_token"] = secrets.token_hex(16)
+    _save_license(state)
+    return state["api_token"]
 
 
 def _check_plan() -> str:
@@ -2927,7 +2974,72 @@ def settings_page():
       </div>
     </div>"""
 
-    content = f"{info_card}\n{plan_card}\n{actions_card}\n{app_card}\n{diag_card}"
+    # ── iPhone 連携 card ──────────────────────────────────────────────────
+    lan_ip   = _get_lan_ip()
+    raw_tok  = _api_token()
+    tok_reset_ok = request.args.get("tok_reset") == "1"
+    tok_flash = (
+        '<div class="error-banner" '
+        'style="background:#dcfce7;border-color:#86efac;color:#166534;margin-bottom:12px">'
+        '&#10003; APIトークンを再生成しました。iPhoneアプリの設定を更新してください。'
+        '</div>'
+        if tok_reset_ok else ""
+    )
+    iphone_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">iPhone 連携</span></div>
+      <div class="card-body">
+        {tok_flash}
+        <p style="font-size:13px;color:var(--muted);margin-bottom:16px">
+          MIA Inventory iPhone アプリから Mac に接続するための情報です。
+          Mac と iPhone が同じ Wi-Fi ネットワークに接続されていることを確認してください。
+        </p>
+        <div class="settings-row">
+          <span class="settings-label">Mac の IP アドレス</span>
+          <span class="settings-value" style="font-family:monospace">{html_module.escape(lan_ip)}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">ポート番号</span>
+          <span class="settings-value" style="font-family:monospace">5050</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">API トークン</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="tok-val" class="settings-value"
+                  style="font-family:monospace;letter-spacing:.08em">
+              {'•' * len(raw_tok)}
+            </span>
+            <button class="btn btn-outline" type="button" style="padding:4px 10px;font-size:12px"
+                    onclick="(function(){{
+                      var el=document.getElementById('tok-val');
+                      var shown=el.dataset.shown;
+                      if(!shown){{el.textContent={json.dumps(raw_tok)};el.dataset.shown='1';this.textContent='隠す';}}
+                      else{{el.textContent={'•' * len(raw_tok)!r};delete el.dataset.shown;this.textContent='表示';}}
+                    }}).call(this)">表示</button>
+            <button class="btn btn-outline" type="button" style="padding:4px 10px;font-size:12px"
+                    onclick="navigator.clipboard.writeText({json.dumps(raw_tok)}).then(function(){{alert('トークンをコピーしました');}})">
+              コピー
+            </button>
+          </div>
+        </div>
+        <div style="margin-top:16px">
+          <form method="POST" action="/settings/reset-token"
+                onsubmit="return confirm('APIトークンを再生成しますか？\\niPhoneアプリの設定も更新が必要です。')">
+            <button class="btn btn-danger" type="submit"
+                    style="font-size:13px;padding:8px 16px">
+              トークンを再生成
+            </button>
+          </form>
+        </div>
+        <p style="margin-top:14px;font-size:12px;color:var(--muted)">
+          API ベース URL:
+          <code style="font-size:12px">http://{html_module.escape(lan_ip)}:5050</code>
+        </p>
+      </div>
+    </div>"""
+
+    content = (f"{info_card}\n{plan_card}\n{actions_card}\n"
+               f"{iphone_card}\n{app_card}\n{diag_card}")
     return _page_shell("設定", "settings", content,
                        subtitle="セッション管理・アプリ情報")
 
@@ -3009,6 +3121,141 @@ def support_export_logs():
             "Content-Disposition": f'attachment; filename="{zip_name}"',
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# iPhone companion API — token management
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/reset-token", methods=["POST"])
+def settings_reset_token():
+    if _session_state != "valid":
+        return redirect("/login")
+    _reset_api_token()
+    return redirect("/settings?tok_reset=1")
+
+
+# ---------------------------------------------------------------------------
+# iPhone companion API — JSON endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/api/ping")
+def api_ping():
+    """Health-check endpoint — no auth required."""
+    return {"ok": True, "version": APP_VERSION, "app": "MIA Inventory"}
+
+
+@app.route("/api/stats")
+def api_stats():
+    err = _require_api_token()
+    if err:
+        return err
+    stats = _get_kpi_stats()
+    return {k: stats[k] for k in
+            ("total", "active", "stopped", "trading", "sold", "last_sync")}
+
+
+@app.route("/api/products")
+def api_products():
+    err = _require_api_token()
+    if err:
+        return err
+    q        = request.args.get("q", "")
+    status_f = request.args.get("status", "")
+    statuses = [status_f] if status_f else None
+    rows     = _query_products(q=q, statuses=statuses)
+    items = []
+    for title, price, item_url, created_at, synced_at, status, vis in rows:
+        item_id = item_url.rstrip("/").split("/")[-1] if item_url else ""
+        items.append({
+            "id":           item_id,
+            "title":        title,
+            "price":        price,
+            "price_int":    _parse_price_int(price),
+            "status":       status,
+            "visibility":   vis or "",
+            "item_url":     item_url,
+            "created_at":   created_at or "",
+            "synced_at":    synced_at or "",
+        })
+    return {"count": len(items), "items": items}
+
+
+@app.route("/api/products/<item_id>")
+def api_product_detail(item_id):
+    err = _require_api_token()
+    if err:
+        return err
+    if not item_id or not re.match(r'^[a-zA-Z0-9_\-]+$', item_id):
+        return Response('{"error":"invalid id"}', status=400,
+                        mimetype="application/json")
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, title, price, item_url, created_at, synced_at, "
+            "       status, visibility_status, raw_text "
+            "FROM mercari_products WHERE item_url LIKE ?",
+            (f"%{item_id}",),
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except Exception as exc:
+        return Response(f'{{"error":"{exc}"}}', status=500,
+                        mimetype="application/json")
+    if not row:
+        return Response('{"error":"not found"}', status=404,
+                        mimetype="application/json")
+    db_id, title, price, item_url, created_at, synced_at, status, vis, raw_text = row
+    return {
+        "id":          item_id,
+        "db_id":       db_id,
+        "title":       title,
+        "price":       price,
+        "price_int":   _parse_price_int(price),
+        "status":      status,
+        "visibility":  vis or "",
+        "item_url":    item_url,
+        "created_at":  created_at or "",
+        "synced_at":   synced_at or "",
+    }
+
+
+@app.route("/api/search")
+def api_search():
+    err = _require_api_token()
+    if err:
+        return err
+    q = request.args.get("q", "").strip()
+    if not q:
+        return {"count": 0, "items": []}
+    rows  = _query_products(q=q)
+    items = []
+    for title, price, item_url, created_at, synced_at, status, vis in rows:
+        item_id = item_url.rstrip("/").split("/")[-1] if item_url else ""
+        items.append({
+            "id":        item_id,
+            "title":     title,
+            "price":     price,
+            "price_int": _parse_price_int(price),
+            "status":    status,
+            "item_url":  item_url,
+        })
+    return {"count": len(items), "items": items}
+
+
+@app.route("/api/sync/status")
+def api_sync_status():
+    err = _require_api_token()
+    if err:
+        return err
+    return {
+        "running":  _sync_progress.get("running", False),
+        "done":     _sync_progress.get("done", True),
+        "step":     _sync_progress.get("step", ""),
+        "fetched":  _sync_progress.get("fetched", 0),
+        "error":    _sync_progress.get("error", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
