@@ -75,7 +75,10 @@ def generate_background(output="dmg_background.png"):
     # Flatten RGBA → RGB (composite over background)
     final = Image.new("RGB", (W, H), bg_rgb)
     final.paste(img, mask=img.split()[3])
-    final.save(output, "PNG", dpi=(144, 144))
+    # 72 DPI = 1 pixel per logical point — matches the 660×400 pt window exactly.
+    # 144 DPI would cause macOS to treat this as a 2x image covering only
+    # 330×200 logical points, rendering the background in the upper-left corner.
+    final.save(output, "PNG", dpi=(72, 72))
     print(f"[dmg-bg] {output}  ({W}x{H} px, text-free)")
 
 
