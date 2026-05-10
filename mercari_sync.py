@@ -440,6 +440,34 @@ FILTER_STATUSES = ["出品中", "公開停止中", "取引中", "売却済み"]
 # Badge texts that can appear on cards (superset of STATUSES for detection)
 _DETECT_STATUSES = set(STATUSES) | {"公開停止中", "出品停止中"}
 
+# Transaction-workflow step texts that Mercari renders on 取引中 cards.
+# These must never be stored as product titles.
+# Extensible: add new phrases here as Mercari UI changes.
+_TRANSACTION_STATUS_TEXTS = {
+    # Shipping steps
+    "発送してください",
+    "発送待ちです",
+    "発送準備をしてください",
+    "発送済みです",
+    "配送中です",
+    "配送状況を確認",
+    # Payment steps
+    "支払い待ち",
+    "支払い済み",
+    "入金待ちです",
+    "お支払い手続きをしてください",
+    # Evaluation / receipt steps
+    "受取評価待ち",
+    "評価してください",
+    "相手の評価を待っています",
+    "受取連絡をしてください",
+    # Generic transaction UI
+    "取引メッセージ",
+    "取引完了",
+    "取引をキャンセルする",
+    "取引情報を確認",
+}
+
 # Mercari mypage URL for each sync status
 STATUS_URLS = {
     "出品中":   "https://jp.mercari.com/mypage/listings",
@@ -792,8 +820,8 @@ _CSS = """
   --primary: #2563eb;
   --primary-h: #1d4ed8;
   --radius: 12px;
-  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
-  --shadow-md: 0 4px 6px rgba(0,0,0,.07), 0 2px 4px rgba(0,0,0,.05);
+  --shadow: 0 1px 3px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.04);
+  --shadow-md: 0 4px 8px rgba(0,0,0,.08), 0 2px 4px rgba(0,0,0,.04);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -815,7 +843,7 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
 .card { background: var(--surface); border-radius: var(--radius);
         box-shadow: var(--shadow-md); overflow: clip; }
 .card-header { display: flex; justify-content: space-between; align-items: center;
-               padding: 16px 20px; border-bottom: 1px solid var(--border); }
+               padding: 16px 22px; border-bottom: 1px solid var(--border); }
 .card-title { font-size: 14px; font-weight: 600; color: var(--text); }
 .card-body  { padding: 20px; }
 .field-label { font-size: 12px; font-weight: 600; color: var(--muted);
@@ -856,7 +884,7 @@ thead th { background: #f9fafb; color: var(--muted); font-size: 12px;
            padding: 10px 14px; text-align: left;
            border-bottom: 2px solid var(--border);
            position: sticky; top: 0; z-index: 5; }
-tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border);
+tbody td { padding: 12px 14px; border-bottom: 1px solid var(--border);
            font-size: 14px; vertical-align: middle; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #f9fafb; }
@@ -865,7 +893,7 @@ tbody tr:hover { background: #f9fafb; }
          padding: 3px 10px; font-size: 12px; font-weight: 600;
          white-space: nowrap; }
 .link-btn { color: var(--primary); font-weight: 600; text-decoration: none;
-            font-size: 13px; }
+            font-size: 13px; white-space: nowrap; }
 .link-btn:hover { text-decoration: underline; }
 .empty-state { text-align: center; padding: 56px 20px; color: var(--muted); }
 .empty-state .es-icon { font-size: 40px; margin-bottom: 12px; }
@@ -942,8 +970,8 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .kpi-grid { display: grid;
             grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
             gap: 14px; }
-.kpi-card { background: #fff; border-radius: 12px; padding: 18px 20px;
-            box-shadow: var(--shadow-md); }
+.kpi-card { background: #fff; border-radius: 12px; padding: 20px 22px;
+            box-shadow: var(--shadow-md); border: 1px solid var(--border); }
 a.kpi-card-link { text-decoration: none; color: inherit; display: block; }
 a.kpi-card-link .kpi-card { cursor: pointer;
   transition: transform .12s ease, box-shadow .12s ease; }
@@ -990,20 +1018,22 @@ a.kpi-card-link:hover .kpi-card { transform: translateY(-2px);
 .suggestion-tip { font-size: 13px; color: var(--muted);
                   padding: 10px 20px 4px; line-height: 1.5; }
 /* Upgrade / pricing page */
-.plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-             gap: 20px; margin-top: 4px; }
+.plan-grid { display: grid; grid-template-columns: repeat(3, 1fr);
+             gap: 24px; margin-top: 4px; max-width: 880px; }
+@media (max-width: 620px) { .plan-grid { grid-template-columns: 1fr; } }
 .plan-card { background: #fff; border: 2px solid var(--border); border-radius: 16px;
              padding: 28px 24px; display: flex; flex-direction: column;
-             align-items: center; text-align: center; transition: border-color .2s; }
+             align-items: center; text-align: center; transition: border-color .2s;
+             align-self: stretch; }
 .plan-card:hover { border-color: var(--primary); }
 .plan-card.featured { border-color: var(--primary);
                       box-shadow: 0 4px 20px rgba(37,99,235,.15); }
-.plan-name  { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
-.plan-price { font-size: 28px; font-weight: 800; color: var(--primary);
-              letter-spacing: -.5px; margin-bottom: 4px; }
+.plan-name  { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+.plan-price { font-size: 30px; font-weight: 800; color: var(--primary);
+              letter-spacing: -.5px; margin-bottom: 6px; }
 .plan-price small { font-size: 14px; font-weight: 500; color: var(--muted); }
-.plan-features { font-size: 13px; color: var(--muted); line-height: 1.7;
-                 margin-bottom: 20px; flex: 1; }
+.plan-features { font-size: 13px; color: var(--muted); line-height: 1.8;
+                 margin-bottom: 24px; flex: 1; }
 .plan-cta { width: 100%; padding: 11px; font-size: 14px; font-weight: 600;
             border-radius: 10px; cursor: pointer; border: none;
             transition: background .15s; }
@@ -1012,6 +1042,13 @@ a.kpi-card-link:hover .kpi-card { transform: translateY(-2px);
 .plan-cta-outline { background: #fff; color: var(--text);
                     border: 1.5px solid var(--border); }
 .plan-cta-outline:hover { border-color: var(--primary); color: var(--primary); }
+.plan-cta-current { background: #f3f4f6; color: var(--muted);
+                    border: 1.5px solid var(--border);
+                    cursor: default; pointer-events: none; opacity: 1; }
+/* Export locked buttons */
+.export-locked { color: var(--muted) !important; border-style: dashed !important;
+                 cursor: not-allowed !important; }
+.export-locked:hover { background: #fff !important; color: var(--muted) !important; }
 .upgrade-banner { background: #fef3c7; border: 1px solid #fde68a;
                   border-radius: 12px; padding: 16px 20px; margin-bottom: 4px;
                   font-size: 14px; color: #92400e; line-height: 1.6; }
@@ -1304,7 +1341,7 @@ def _build_result_rows(products):
           <td data-sort="{html_module.escape(display_status)}">{badge}</td>
           <td style="color:var(--muted)">{created}</td>
           <td style="color:var(--muted)">{synced}</td>
-          <td><a class="link-btn open-link" data-url="{url}">開く ↗</a></td>
+          <td style="text-align:center"><a class="link-btn open-link" data-url="{url}">開く ↗</a></td>
         </tr>"""
     return rows
 
@@ -1331,8 +1368,7 @@ def _get_kpi_stats() -> dict:
         cursor.execute("SELECT COUNT(*) FROM mercari_products")
         total = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT COUNT(*) FROM mercari_products "
-            "WHERE status='出品中' AND (visibility_status IS NULL OR visibility_status != 'stopped')"
+            "SELECT COUNT(*) FROM mercari_products WHERE status='出品中'"
         )
         active = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM mercari_products WHERE status='取引中'")
@@ -1428,7 +1464,7 @@ def _page_shell(title: str, active: str, content: str,
         {sub_html}
       </div>
       <div class="page-header-actions">
-        <span class="db-pill">DB: {stats['total']} 件</span>
+        <span class="db-pill">商品 {stats['total']} 件</span>
         <button class="btn-exit" onclick="doShutdown()">終了</button>
       </div>
     </div>
@@ -1492,7 +1528,7 @@ def home():
       <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=listed">
         <div class="kpi-card">
           <div class="kpi-value green">{stats['active']}</div>
-          <div class="kpi-label">出品中</div>
+          <div class="kpi-label" title="公開停止中を含む">出品中</div>
         </div>
       </a>
       <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=trading">
@@ -2111,15 +2147,21 @@ def upgrade_page():
     monthly_features = "同期: 無制限<br>商品管理: ○<br>データ出力: ○<br>売上分析: ○<br>AI分析: ○"
     lifetime_features = "同期: 無制限<br>商品管理: ○<br>データ出力: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
 
+    free_cta = (
+        '<button class="plan-cta plan-cta-current" disabled>✓ 無料版を利用中</button>'
+        if plan == "free"
+        else '<form method="POST" action="/license/choose-free" style="width:100%">'
+             '<button class="plan-cta plan-cta-outline" type="submit">無料版で続ける</button>'
+             '</form>'
+    )
+
     plan_grid = f"""
     <div class="plan-grid">
       <div class="plan-card">
         <div class="plan-name">無料版</div>
         <div class="plan-price">¥0</div>
         <div class="plan-features">{free_features}</div>
-        <form method="POST" action="/license/choose-free" style="width:100%">
-          <button class="plan-cta plan-cta-outline" type="submit">無料版で続ける</button>
-        </form>
+        {free_cta}
       </div>
       <div class="plan-card featured">
         <div class="plan-name">月額プラン</div>
@@ -2287,10 +2329,10 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
             export_btns = """
               <button class="btn btn-outline export-locked"
                       onclick="document.getElementById('export-gate-modal').style.display='flex'"
-                      title="有料プランが必要です">⬇ CSV 🔒</button>
+                      title="有料プラン限定機能">⬇ CSV <span style="font-size:11px">🔒</span></button>
               <button class="btn btn-outline export-locked"
                       onclick="document.getElementById('export-gate-modal').style.display='flex'"
-                      title="有料プランが必要です">⬇ Excel 🔒</button>"""
+                      title="有料プラン限定機能">⬇ Excel <span style="font-size:11px">🔒</span></button>"""
             export_js = ""
         results_html = f"""
         <div class="card">
@@ -2307,11 +2349,11 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
                 <tr>
                   <th style="width:40px">#</th>
                   <th data-sortable data-col="1">商品名</th>
-                  <th data-sortable data-col="2">価格</th>
-                  <th data-sortable data-col="3">状態</th>
-                  <th data-sortable data-col="4">商品登録時間</th>
-                  <th data-sortable data-col="5">抓取時間</th>
-                  <th>リンク</th>
+                  <th data-sortable data-col="2" style="width:100px">価格</th>
+                  <th data-sortable data-col="3" style="width:120px">状態</th>
+                  <th data-sortable data-col="4" style="width:140px">商品登録時間</th>
+                  <th data-sortable data-col="5" style="width:140px">抓取時間</th>
+                  <th style="width:72px;text-align:center">リンク</th>
                 </tr>
               </thead>
               <tbody>{rows_html}{empty_row}</tbody>
@@ -2989,7 +3031,7 @@ def parse_listing_text(text):
                     created_at = line
                 break
 
-    ignore = {"¥"} | INVALID_TITLES | _DETECT_STATUSES
+    ignore = {"¥"} | INVALID_TITLES | _DETECT_STATUSES | _TRANSACTION_STATUS_TEXTS
     for line in reversed(lines):
         if line in ignore:
             continue
@@ -3006,7 +3048,12 @@ def parse_listing_text(text):
 
 
 def is_valid_title(title):
-    return bool(title) and title not in INVALID_TITLES and not title.replace(",", "").isdigit()
+    return (
+        bool(title)
+        and title not in INVALID_TITLES
+        and title not in _TRANSACTION_STATUS_TEXTS
+        and not title.replace(",", "").isdigit()
+    )
 
 
 def _is_valid_price(price: str) -> bool:
@@ -3417,6 +3464,15 @@ def save_or_update_product(item_url, title, price, status, created_at, raw_text,
 
     if row:
         _, old_title, old_price, old_status, old_created_at, old_vis = row
+
+        # Safety net: never overwrite a valid stored title with a transaction
+        # workflow text that slipped through parse-level filtering.
+        if title in _TRANSACTION_STATUS_TEXTS and is_valid_title(old_title):
+            _logger.warning(
+                "[scrape] rejected status-like text as product title: %r (url=%s)",
+                title, item_url,
+            )
+            title = old_title
 
         changes = []
         if _norm_str(old_title) != _norm_str(title):

@@ -20,8 +20,9 @@ except ImportError:
 
 W, H = 660, 400
 
-BG    = "#F5F5F7"   # Apple-style off-white
-ARROW = "#B0BEC5"   # neutral gray arrow
+BG         = "#F5F5F7"          # Apple-style off-white
+ARROW_RGB  = (143, 163, 184)    # soft blue-gray; close to macOS system control tint
+ARROW_A    = 210                # slight transparency for softer appearance
 
 # Icon centre positions — must mirror icon_locations in dmgbuild_settings.py
 APP_X  = 170
@@ -32,41 +33,49 @@ ICON_Y = 200
 def _draw_arrow(draw):
     cy      = ICON_Y
     icon_r  = 64    # half-width of each icon in the DMG window
-    gap     = 12    # clearance between arrow and icon edge
+    gap     = 16    # clearance between arrow and icon edge
 
     # Arrowhead tip stops just before the Applications icon left edge.
-    tip = APPS_X - icon_r - gap           # 490 - 64 - 12 = 414
-    x1  = APP_X  + icon_r + gap           # 170 + 64 + 12 = 246
+    tip = APPS_X - icon_r - gap           # 490 - 64 - 16 = 410
+    x1  = APP_X  + icon_r + gap           # 170 + 64 + 16 = 250
 
-    shaft_h = 14
-    head_w  = 24
-    head_h  = 36
+    # Larger, bolder arrow — more visible and native-feeling
+    shaft_h = 22
+    head_w  = 40
+    head_h  = 54
 
-    x2 = tip - head_w                     # shaft ends at 414 - 24 = 390
+    x2 = tip - head_w                     # shaft ends at 410 - 40 = 370
     if x2 <= x1:
         return
+
+    color = ARROW_RGB + (ARROW_A,)        # RGBA tuple
 
     # shaft
     draw.rectangle(
         [(x1, cy - shaft_h // 2), (x2, cy + shaft_h // 2)],
-        fill=ARROW,
+        fill=color,
     )
-    # arrowhead
+    # arrowhead — optically nudged 2px right for visual balance
     draw.polygon(
         [
-            (x2,   cy - head_h // 2),
-            (x2,   cy + head_h // 2),
-            (tip,  cy),
+            (x2,       cy - head_h // 2),
+            (x2,       cy + head_h // 2),
+            (tip + 2,  cy),
         ],
-        fill=ARROW,
+        fill=color,
     )
 
 
 def generate_background(output="dmg_background.png"):
-    img  = Image.new("RGB", (W, H), BG)
+    # Render in RGBA for soft transparency, then flatten onto BG for RGB PNG output
+    bg_rgb = tuple(int(BG.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+    img  = Image.new("RGBA", (W, H), bg_rgb + (255,))
     draw = ImageDraw.Draw(img)
     _draw_arrow(draw)
-    img.save(output, "PNG", dpi=(144, 144))
+    # Flatten RGBA → RGB (composite over background)
+    final = Image.new("RGB", (W, H), bg_rgb)
+    final.paste(img, mask=img.split()[3])
+    final.save(output, "PNG", dpi=(144, 144))
     print(f"[dmg-bg] {output}  ({W}x{H} px, text-free)")
 
 
