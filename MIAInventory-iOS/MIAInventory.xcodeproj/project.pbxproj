@@ -1,0 +1,404 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AA1111111111111111110001 /* MIAInventoryApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110001 /* MIAInventoryApp.swift */; };
+		AA1111111111111111110002 /* Product.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110002 /* Product.swift */; };
+		AA1111111111111111110003 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110003 /* APIClient.swift */; };
+		AA1111111111111111110004 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110004 /* AppSettings.swift */; };
+		AA1111111111111111110005 /* DashboardViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110005 /* DashboardViewModel.swift */; };
+		AA1111111111111111110006 /* ProductListViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110006 /* ProductListViewModel.swift */; };
+		AA1111111111111111110007 /* SettingsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110007 /* SettingsViewModel.swift */; };
+		AA1111111111111111110008 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110008 /* ContentView.swift */; };
+		AA1111111111111111110009 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB1111111111111111110009 /* DashboardView.swift */; };
+		AA111111111111111111000A /* ProductListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB111111111111111111000A /* ProductListView.swift */; };
+		AA111111111111111111000B /* ProductDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB111111111111111111000B /* ProductDetailView.swift */; };
+		AA111111111111111111000C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB111111111111111111000C /* SettingsView.swift */; };
+		AA111111111111111111000D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB111111111111111111000D /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		BB1111111111111111110001 /* MIAInventoryApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MIAInventoryApp.swift; sourceTree = "<group>"; };
+		BB1111111111111111110002 /* Product.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Product.swift; sourceTree = "<group>"; };
+		BB1111111111111111110003 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		BB1111111111111111110004 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		BB1111111111111111110005 /* DashboardViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardViewModel.swift; sourceTree = "<group>"; };
+		BB1111111111111111110006 /* ProductListViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProductListViewModel.swift; sourceTree = "<group>"; };
+		BB1111111111111111110007 /* SettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewModel.swift; sourceTree = "<group>"; };
+		BB1111111111111111110008 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		BB1111111111111111110009 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+		BB111111111111111111000A /* ProductListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProductListView.swift; sourceTree = "<group>"; };
+		BB111111111111111111000B /* ProductDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProductDetailView.swift; sourceTree = "<group>"; };
+		BB111111111111111111000C /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		BB111111111111111111000D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		BB111111111111111111000E /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BB111111111111111111000F /* MIAInventory.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MIAInventory.entitlements; sourceTree = "<group>"; };
+		BB1111111111111111110010 /* MIAInventory.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MIAInventory.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DD1111111111111111110002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		CC1111111111111111110001 /* root */ = {
+			isa = PBXGroup;
+			children = (
+				CC1111111111111111110002 /* MIAInventory */,
+				CC1111111111111111110009 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110002 /* MIAInventory */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110001 /* MIAInventoryApp.swift */,
+				BB111111111111111111000E /* Info.plist */,
+				BB111111111111111111000F /* MIAInventory.entitlements */,
+				CC1111111111111111110003 /* Models */,
+				CC1111111111111111110004 /* Networking */,
+				CC1111111111111111110005 /* Persistence */,
+				CC1111111111111111110006 /* ViewModels */,
+				CC1111111111111111110007 /* Views */,
+				CC1111111111111111110008 /* Resources */,
+			);
+			path = MIAInventory;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110003 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110002 /* Product.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110004 /* Networking */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110003 /* APIClient.swift */,
+			);
+			path = Networking;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110005 /* Persistence */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110004 /* AppSettings.swift */,
+			);
+			path = Persistence;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110006 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110005 /* DashboardViewModel.swift */,
+				BB1111111111111111110006 /* ProductListViewModel.swift */,
+				BB1111111111111111110007 /* SettingsViewModel.swift */,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110007 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110008 /* ContentView.swift */,
+				BB1111111111111111110009 /* DashboardView.swift */,
+				BB111111111111111111000A /* ProductListView.swift */,
+				BB111111111111111111000B /* ProductDetailView.swift */,
+				BB111111111111111111000C /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110008 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				BB111111111111111111000D /* Assets.xcassets */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		CC1111111111111111110009 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				BB1111111111111111110010 /* MIAInventory.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		EE1111111111111111110001 /* MIAInventory */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AC1111111111111111110002 /* Build configuration list for PBXNativeTarget "MIAInventory" */;
+			buildPhases = (
+				DD1111111111111111110001 /* Sources */,
+				DD1111111111111111110002 /* Frameworks */,
+				DD1111111111111111110003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MIAInventory;
+			productName = MIAInventory;
+			productReference = BB1111111111111111110010 /* MIAInventory.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FF1111111111111111110001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					EE1111111111111111110001 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = AC1111111111111111110001 /* Build configuration list for PBXProject "MIAInventory" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = CC1111111111111111110001;
+			productRefGroup = CC1111111111111111110009 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				EE1111111111111111110001 /* MIAInventory */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		DD1111111111111111110003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA111111111111111111000D /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		DD1111111111111111110001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA1111111111111111110001 /* MIAInventoryApp.swift in Sources */,
+				AA1111111111111111110002 /* Product.swift in Sources */,
+				AA1111111111111111110003 /* APIClient.swift in Sources */,
+				AA1111111111111111110004 /* AppSettings.swift in Sources */,
+				AA1111111111111111110005 /* DashboardViewModel.swift in Sources */,
+				AA1111111111111111110006 /* ProductListViewModel.swift in Sources */,
+				AA1111111111111111110007 /* SettingsViewModel.swift in Sources */,
+				AA1111111111111111110008 /* ContentView.swift in Sources */,
+				AA1111111111111111110009 /* DashboardView.swift in Sources */,
+				AA111111111111111111000A /* ProductListView.swift in Sources */,
+				AA111111111111111111000B /* ProductDetailView.swift in Sources */,
+				AA111111111111111111000C /* SettingsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AB1111111111111111110001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		AB1111111111111111110002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		AB1111111111111111110003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = MIAInventory/MIAInventory.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				INFOPLIST_FILE = MIAInventory/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.miainventory.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		AB1111111111111111110004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = MIAInventory/MIAInventory.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				INFOPLIST_FILE = MIAInventory/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.miainventory.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AC1111111111111111110001 /* Build configuration list for PBXProject "MIAInventory" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB1111111111111111110001 /* Debug */,
+				AB1111111111111111110002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AC1111111111111111110002 /* Build configuration list for PBXNativeTarget "MIAInventory" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB1111111111111111110003 /* Debug */,
+				AB1111111111111111110004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = FF1111111111111111110001 /* Project object */;
+}
