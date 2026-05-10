@@ -1371,6 +1371,11 @@ def _get_kpi_stats() -> dict:
             "SELECT COUNT(*) FROM mercari_products WHERE status='出品中'"
         )
         active = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*) FROM mercari_products "
+            "WHERE status='出品中' AND visibility_status='stopped'"
+        )
+        stopped = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM mercari_products WHERE status='取引中'")
         trading = cursor.fetchone()[0]
         cursor.execute(
@@ -1388,15 +1393,16 @@ def _get_kpi_stats() -> dict:
         last_sync = (row[0] or "")[:16] if row else ""
         conn.close()
     except Exception:
-        return {"total": 0, "active": 0, "trading": 0, "sold": 0,
+        return {"total": 0, "active": 0, "stopped": 0, "trading": 0, "sold": 0,
                 "total_sales": 0, "last_sync": "–"}
     return {
-        "total": total,
-        "active": active,
-        "trading": trading,
-        "sold": sold,
+        "total":       total,
+        "active":      active,
+        "stopped":     stopped,
+        "trading":     trading,
+        "sold":        sold,
         "total_sales": total_sales,
-        "last_sync": last_sync or "–",
+        "last_sync":   last_sync or "–",
     }
 
 
@@ -1529,6 +1535,12 @@ def home():
         <div class="kpi-card">
           <div class="kpi-value green">{stats['active']}</div>
           <div class="kpi-label" title="公開停止中を含む">出品中</div>
+        </div>
+      </a>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=stopped">
+        <div class="kpi-card">
+          <div class="kpi-value" style="color:#ea580c">{stats['stopped']}</div>
+          <div class="kpi-label">公開停止中</div>
         </div>
       </a>
       <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=trading">
@@ -2220,6 +2232,7 @@ def products_page():
     _STATUS_FILTER_MAP = {
         "all":     list(FILTER_STATUSES),
         "listed":  ["出品中"],
+        "stopped": ["公開停止中"],
         "trading": ["取引中"],
         "sold":    ["売却済み"],
     }
@@ -2364,6 +2377,7 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
     _filter_label_map = {
         "all":     "全商品",
         "listed":  "出品中",
+        "stopped": "公開停止中",
         "trading": "取引中",
         "sold":    "売却済み",
     }
