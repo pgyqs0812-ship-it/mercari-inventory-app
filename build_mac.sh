@@ -116,6 +116,10 @@ if [ ! -f "${SM_BIN}" ]; then
 fi
 echo "✓ selenium-manager: ${SM_BIN}"
 
+# ── Inject version so the running app reports the correct string ──────────────
+echo "APP_VERSION = \"${VERSION}\"" > _version.py
+echo "✓ _version.py written: APP_VERSION = \"${VERSION}\""
+
 # ── PyInstaller build ─────────────────────────────────────────────────────────
 echo "Building ${APP_NAME}.app (this may take a minute)..."
 echo ""
