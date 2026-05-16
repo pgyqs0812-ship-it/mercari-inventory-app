@@ -2,11 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Python runtime needs to write executable memory (required for PyInstaller). -->
+    <!-- PyInstaller bundles load .so extensions signed with different identities. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- CPython requires writable+executable memory for its eval loop. -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
-    <!-- PyInstaller bundles load dylibs signed with different identities at runtime. -->
-    <key>com.apple.security.cs.disable-library-validation</key>
+    <!-- Flask binds a listening socket on port 5050. -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- Selenium connects to the local ChromeDriver process. -->
+    <key>com.apple.security.network.client</key>
     <true/>
 </dict>
 </plist>

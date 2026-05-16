@@ -1,9 +1,13 @@
 #!/bin/bash
-# build_mac.sh — Build Mercari Inventory as a macOS .app bundle + DMG installer.
+# build_mac.sh — Build MIA Inventory as a macOS .app bundle + DMG installer.
 #
 # Produces:
 #   dist/MIAInventory.app                Standard macOS .app bundle
 #   dist/MIAInventory_Mac_<version>.dmg  Drag-and-drop DMG installer
+#
+# APP_NAME is the internal PyInstaller name (no spaces) so sys._MEIPASS and
+# the selenium-manager path are space-free.  The user-visible Finder name is
+# set via CFBundleDisplayName / CFBundleName in Info.plist after the build.
 #
 # Optional signing (set env vars before running):
 #   SIGN_IDENTITY  — "Developer ID Application: Your Name (TEAMID)"
@@ -22,7 +26,11 @@
 
 set -euo pipefail
 
+# Internal name used by PyInstaller (no spaces — keeps sys._MEIPASS clean
+# and avoids Selenium Manager path-with-spaces issues on macOS).
 APP_NAME="MIAInventory"
+# User-visible display name patched into Info.plist after the build.
+DISPLAY_NAME="MIA Inventory"
 ENTRY="main.py"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARIZE="${NOTARIZE:-0}"
@@ -114,6 +122,10 @@ if [ ! -f "${SM_BIN}" ]; then
 fi
 echo "✓ selenium-manager: ${SM_BIN}"
 
+# ── Inject version so the running app reports the correct string ──────────────
+echo "APP_VERSION = \"${VERSION}\"" > _version.py
+echo "✓ _version.py written: APP_VERSION = \"${VERSION}\""
+
 # ── PyInstaller build ─────────────────────────────────────────────────────────
 echo "Building ${APP_NAME}.app (this may take a minute)..."
 echo ""
@@ -165,38 +177,26 @@ pyinstaller \
     \
     "${ENTRY}"
 
-# ── Code signing (.app) ───────────────────────────────────────────────────────
-# --windowed produces dist/MIAInventory.app — sign the whole bundle.
-# --deep signs the top-level bundle and all nested binaries/frameworks in one pass.
+# ── Patch Info.plist — set user-visible display name ─────────────────────────
+# PyInstaller uses APP_NAME ("MIAInventory") as the internal bundle name so
+# sys._MEIPASS stays space-free.  We override what Finder shows here.
+PLIST="${APP_BUNDLE}/Contents/Info.plist"
+if [ -f "${PLIST}" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${DISPLAY_NAME}" "${PLIST}" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string ${DISPLAY_NAME}" "${PLIST}"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName ${DISPLAY_NAME}" "${PLIST}" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :CFBundleName string ${DISPLAY_NAME}" "${PLIST}"
+    echo "✓ Info.plist patched: CFBundleDisplayName/CFBundleName = ${DISPLAY_NAME}"
+else
+    echo "  ⚠  Info.plist not found at ${PLIST} — skipping display name patch"
+fi
 
+# ── Code signing (.app) ───────────────────────────────────────────────────────
 if [ -n "${SIGN_IDENTITY}" ]; then
     echo ""
-    echo "Signing .app with Developer ID: ${SIGN_IDENTITY}"
-
-    ENTITLEMENTS="entitlements.plist"
-    SIGN_ARGS=(--sign "${SIGN_IDENTITY}" --force --options runtime)
-    if [ -f "${ENTITLEMENTS}" ]; then
-        SIGN_ARGS+=(--entitlements "${ENTITLEMENTS}")
-    else
-        echo "  ⚠  entitlements.plist not found — signing without entitlements"
-    fi
-
-    codesign "${SIGN_ARGS[@]}" --deep "${APP_BUNDLE}"
-    echo "✓ .app signed (Developer ID)"
-
-    # ── Notarization ─────────────────────────────────────────────────────────
-    if [ "${NOTARIZE}" = "1" ]; then
-        echo "Submitting .app to Apple notarization service (this takes a few minutes)..."
-        NOTARIZE_ZIP="notarize_submit.zip"
-        ditto -c -k --keepParent "${APP_BUNDLE}" "${NOTARIZE_ZIP}"
-        xcrun notarytool submit "${NOTARIZE_ZIP}" \
-            --keychain-profile "${NOTARIZE_PROFILE}" \
-            --wait
-        rm -f "${NOTARIZE_ZIP}"
-        xcrun stapler staple "${APP_BUNDLE}"
-        echo "✓ .app notarized and stapled"
-    fi
-
+    SIGN_IDENTITY="${SIGN_IDENTITY}" \
+    ENTITLEMENTS="${ENTITLEMENTS:-entitlements.plist}" \
+        ./scripts/sign_app.sh "${APP_BUNDLE}"
 else
     codesign --sign - --force --deep "${APP_BUNDLE}" 2>/dev/null || true
     echo "✓ .app ad-hoc signed (dev build — see SIGNING.md for distribution signing)"
@@ -213,49 +213,29 @@ dmgbuild \
     -s dmgbuild_settings.py \
     -D app_path="${APP_BUNDLE}" \
     -D bg_path="dmg_background.png" \
-    "MIAInventory ${VERSION}" \
+    "MIA Inventory Installer ${VERSION}" \
     "dist/${DMG_NAME}"
 
-# ── DMG signing ──────────────────────────────────────────────────────────────
+# ── DMG signing + notarization ────────────────────────────────────────────────
 if [ -n "${SIGN_IDENTITY}" ]; then
-    codesign --sign "${SIGN_IDENTITY}" --force "dist/${DMG_NAME}"
+    codesign --sign "${SIGN_IDENTITY}" --force --timestamp "dist/${DMG_NAME}"
     echo "✓ DMG signed (Developer ID)"
+    if [ "${NOTARIZE}" = "1" ]; then
+        NOTARIZE_PROFILE="${NOTARIZE_PROFILE}" \
+            ./scripts/notarize_dmg.sh "dist/${DMG_NAME}"
+    fi
 else
     codesign --sign - --force "dist/${DMG_NAME}" 2>/dev/null || true
     echo "✓ DMG ad-hoc signed"
 fi
 
-# ── Version validation gate ───────────────────────────────────────────────────
-# Hard-fail if the DMG file is missing (dmgbuild failure or name mismatch).
-# Attempt volume name check via hdiutil; warn and skip if mounting is unavailable
-# (e.g. headless CI environment with ad-hoc signing).
-echo "Validating version consistency..."
-
-EXPECTED_DMG="dist/${DMG_NAME}"
-EXPECTED_VOLUME="MIAInventory ${VERSION}"
-
-if [ ! -f "${EXPECTED_DMG}" ]; then
-    echo "ERROR: DMG not found at: ${EXPECTED_DMG}"
-    exit 1
-fi
-echo "✓ DMG filename: ${EXPECTED_DMG}"
-
-_MOUNT_POINT=$(hdiutil attach "${EXPECTED_DMG}" -nobrowse -noverify -noautoopen 2>/dev/null \
-    | awk 'END{print $NF}') || true
-
-if [ -d "${_MOUNT_POINT}" ]; then
-    _VOLUME_NAME=$(basename "${_MOUNT_POINT}")
-    hdiutil detach "${_MOUNT_POINT}" -quiet 2>/dev/null || true
-    if [ "${_VOLUME_NAME}" != "${EXPECTED_VOLUME}" ]; then
-        echo "ERROR: Volume name mismatch"
-        echo "  Expected : ${EXPECTED_VOLUME}"
-        echo "  Got      : ${_VOLUME_NAME}"
-        exit 1
+# ── Final verification ────────────────────────────────────────────────────────
+if [ -n "${SIGN_IDENTITY}" ]; then
+    if [ "${NOTARIZE}" = "1" ]; then
+        ./scripts/verify.sh "${APP_BUNDLE}" "dist/${DMG_NAME}"
+    else
+        ./scripts/verify.sh "${APP_BUNDLE}" ""
     fi
-    echo "✓ Volume name: ${_VOLUME_NAME}"
-else
-    echo "⚠  Mount check skipped (ad-hoc DMG cannot be attached in this environment)"
-    echo "   Volume label set by dmgbuild to: ${EXPECTED_VOLUME}"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

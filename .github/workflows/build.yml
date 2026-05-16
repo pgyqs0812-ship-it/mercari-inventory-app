@@ -70,6 +70,18 @@ jobs:
             -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
           echo "KEYCHAIN_PATH=${KEYCHAIN_PATH}" >> "$GITHUB_ENV"
 
+      # ── Patch Info.plist — user-visible display name ──────────────────────────
+      # PyInstaller internal name is MIAInventory (no space) so sys._MEIPASS is
+      # space-free.  We patch the plist so Finder shows "MIA Inventory".
+      - name: Patch Info.plist display name
+        run: |
+          PLIST="dist/MIAInventory.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName MIA Inventory" "${PLIST}" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string MIA Inventory" "${PLIST}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName MIA Inventory" "${PLIST}" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleName string MIA Inventory" "${PLIST}"
+          echo "✓ Info.plist patched"
+
       - name: Sign app bundle
         if: env.APPLE_SIGN_IDENTITY != ''
         run: |
@@ -83,14 +95,14 @@ jobs:
         run: |
           KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
           echo "${APPLE_API_KEY_BASE64}" | base64 --decode -o "${KEY_PATH}"
-          ditto -c -k --keepParent dist/MIAInventory.app notarize_submit.zip
+          ditto -c -k --keepParent "dist/MIAInventory.app" notarize_submit.zip
           xcrun notarytool submit notarize_submit.zip \
             --key "${KEY_PATH}" \
             --key-id "${APPLE_API_KEY_ID}" \
             --issuer "${APPLE_API_ISSUER_ID}" \
             --team-id "${APPLE_TEAM_ID}" \
             --wait
-          xcrun stapler staple dist/MIAInventory.app
+          xcrun stapler staple "dist/MIAInventory.app"
           rm -f notarize_submit.zip "${KEY_PATH}"
           echo "✓ .app notarized and stapled"
 
@@ -105,7 +117,7 @@ jobs:
             -s dmgbuild_settings.py \
             -D app_path="dist/MIAInventory.app" \
             -D bg_path="dmg_background.png" \
-            "MIAInventory ${{ github.ref_name }}" \
+            "MIA Inventory Installer ${VERSION}" \
             "dist/${DMG_NAME}"
           echo "✓ DMG: dist/${DMG_NAME}"
           # Validation gate: hard-fail on missing DMG; attempt volume name check
@@ -137,7 +149,7 @@ jobs:
 
       - name: Zip dist
         run: |
-          ditto -c -k --keepParent dist/MIAInventory.app dist.zip
+          ditto -c -k --keepParent "dist/MIAInventory.app" dist.zip
 
       - name: Generate QR code for release download URL
         run: |

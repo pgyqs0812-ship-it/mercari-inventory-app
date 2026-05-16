@@ -1,7 +1,12 @@
 import json
+import logging
+import logging.handlers
 import os
+import platform
 import re
 import queue
+import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -31,6 +36,63 @@ DB_NAME          = "products.db"
 COOKIE_FILE      = "mercari_session.json"  # patched to absolute path by main.py
 CHROME_PROFILE_DIR = ""                    # patched to absolute path by main.py
 LICENSE_FILE     = "license.json"          # patched to absolute path by main.py
+
+# ---------------------------------------------------------------------------
+# App version
+# ---------------------------------------------------------------------------
+try:
+    from _version import APP_VERSION  # generated at build time by CI
+except ImportError:
+    APP_VERSION = "dev"
+
+# ---------------------------------------------------------------------------
+# Diagnostic logging
+# ---------------------------------------------------------------------------
+# Module-level logger — configured by setup_app_logging() called from main.py.
+# Falls back to a no-op NullHandler so imports in tests never raise errors.
+_logger = logging.getLogger("mia")
+_logger.addHandler(logging.NullHandler())
+
+_LOG_DIR: str = ""   # absolute path to logs/ dir; set by setup_app_logging()
+
+
+def setup_app_logging(logs_dir: str, launch_log_path: str = "") -> None:
+    """Attach file handlers to the 'mia' logger.
+
+    Called once from main.py after the data directory is known.
+    Adds handlers for both the rotating aggregate log and the per-launch
+    session log so all mia.* events appear in both files.
+    """
+    global _LOG_DIR
+    _LOG_DIR = logs_dir
+    os.makedirs(logs_dir, exist_ok=True)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Rotating aggregate log
+    fh_rotating = logging.handlers.RotatingFileHandler(
+        os.path.join(logs_dir, "app-runtime.log"),
+        maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    fh_rotating.setFormatter(fmt)
+    _logger.addHandler(fh_rotating)
+
+    # Per-launch session log (same file main.py opened for root logger)
+    if launch_log_path:
+        fh_launch = logging.FileHandler(launch_log_path, encoding="utf-8")
+        fh_launch.setFormatter(fmt)
+        _logger.addHandler(fh_launch)
+
+    _logger.setLevel(logging.INFO)
+    _logger.propagate = False   # root already writes to same files
+    _logger.info("[setup] app logging initialised — log dir: %s", logs_dir)
+    if launch_log_path:
+        _logger.info("[setup] 起動ログ: %s", launch_log_path)
+    _logger.info("[setup] app version: %s | OS: %s %s",
+                 APP_VERSION, platform.system(), platform.release())
 
 
 class _SyncStopped(Exception):
@@ -66,8 +128,10 @@ _sync_stop_requested = False
 #   "logging_in" → "valid" / "invalid" / "error"
 #   "error"     → "logging_in" (retry) / "invalid" (cancel)
 _session_state: str = "unknown"
-_session_last_login: str = ""    # "YYYY-MM-DD HH:MM" — set on save or check
-_login_error_msg:   str = ""    # set when _session_state == "error"
+_session_last_login: str = ""  # "YYYY-MM-DD HH:MM" — set on save or check
+_login_start_lock = threading.Lock()   # atomic duplicate-request guard
+_login_start_time: float = 0.0         # epoch when current login attempt started
+_login_error_msg: str = ""             # surfaced to UI on "error" state
 
 # Live progress state updated by the background sync thread; read by /sync_status
 _sync_progress: dict = {
@@ -83,13 +147,8 @@ _sync_progress: dict = {
 
 # Singleton visible-Chrome driver shared by sync and link-open
 _singleton_driver = None
-_driver_lock = threading.Lock()       # guards singleton creation only
-_login_start_lock = threading.Lock()  # prevents concurrent /login/start calls
-
-# Timestamp of the most recent login start — used to detect stuck "logging_in"
-# states that were never resolved (e.g. a thread that died without setting state).
-# Protected by _login_start_lock.
-_login_start_time: float = 0.0
+_driver_lock = threading.Lock()   # guards singleton creation only
+_chromedriver_pid: int | None = None  # chromedriver process PID for targeted cleanup
 
 
 def jst_now() -> str:
@@ -154,23 +213,28 @@ def _try_restore_session(driver) -> bool:
     profile cookies have expired but the JSON backup is still valid.
     """
     # Strategy 1: profile cookies (the normal case after first login)
+    _logger.info("[session] セッション確認 — プロファイル Cookie を試みます")
     driver.get("https://jp.mercari.com/mypage/listings")
     time.sleep(2)
     if "login" not in driver.current_url:
         print("[session] セッション有効（プロファイルのCookie）— ログイン不要")
+        _logger.info("[session] セッション有効 (Strategy 1: profile cookies)")
         _save_session_cookies(driver)
         return True
 
     # Strategy 2: inject from JSON backup file
+    _logger.info("[session] Strategy 1 失敗 — JSON Cookie で復元を試みます")
     if _inject_saved_cookies(driver):
         driver.get("https://jp.mercari.com/mypage/listings")
         time.sleep(2)
         if "login" not in driver.current_url:
             print("[session] セッション復元（JSON Cookie）— ログイン不要")
+            _logger.info("[session] セッション復元成功 (Strategy 2: JSON cookies)")
             _save_session_cookies(driver)
             return True
 
     print("[session] セッション無効 → ログインが必要です")
+    _logger.warning("[session] セッション無効 — ログインが必要です")
     return False
 
 
@@ -195,14 +259,110 @@ def _is_driver_alive(driver) -> bool:
     return result[0]
 
 
-def _kill_orphan_chromedriver() -> None:
-    """Kill stale chromedriver processes left over from a previous crashed session."""
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with the given PID is still running."""
     try:
-        import subprocess
-        subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True, timeout=5)
-        time.sleep(0.3)
+        import subprocess as _sp
+        return _sp.run(["kill", "-0", str(pid)],
+                       capture_output=True, timeout=2).returncode == 0
     except Exception:
-        pass
+        return False
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until the process exits or timeout expires. Returns True if it exited."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _remove_profile_lock_files() -> None:
+    """Remove Chrome profile lock files without killing any processes.
+
+    Used at shutdown after driver.quit() has already closed Chrome cleanly.
+    Killing Chrome with -9 at shutdown triggers the "restore pages" warning;
+    this function only removes the files that Chrome would have cleaned itself.
+    """
+    if not CHROME_PROFILE_DIR:
+        return
+    lock_files = [
+        "SingletonLock", "SingletonCookie", "SingletonSocket",
+        os.path.join("Default", "DevToolsActivePort"), "DevToolsActivePort",
+    ]
+    cleaned = []
+    for lock_name in lock_files:
+        lock_path = os.path.join(CHROME_PROFILE_DIR, lock_name)
+        try:
+            if os.path.exists(lock_path) or os.path.islink(lock_path):
+                os.remove(lock_path)
+                cleaned.append(lock_name)
+        except OSError:
+            pass
+    if cleaned:
+        _logger.info("[profile] シャットダウン — ロックファイル削除: %s", ", ".join(cleaned))
+
+
+def _kill_orphan_chromedriver() -> None:
+    """Kill the tracked chromedriver if it didn't exit after driver.quit().
+
+    Sends SIGTERM first, waits 3 s, then SIGKILL only if still alive.
+    """
+    global _chromedriver_pid
+    pid = _chromedriver_pid
+    _chromedriver_pid = None
+    if pid is None:
+        return
+    try:
+        import subprocess as _sp
+        if not _pid_alive(pid):
+            _logger.info("[profile] chromedriver は既に終了: PID=%s", pid)
+            return
+        _sp.run(["kill", "-15", str(pid)], capture_output=True, timeout=3)
+        if _wait_for_pid_exit(pid, timeout=3):
+            _logger.info("[profile] chromedriver 正常終了: PID=%s", pid)
+        else:
+            _sp.run(["kill", "-9", str(pid)], capture_output=True, timeout=3)
+            _logger.info("[profile] chromedriver 強制終了 (SIGKILL): PID=%s", pid)
+    except Exception as exc:
+        _logger.warning("[profile] chromedriver 終了エラー: %s", exc)
+
+
+def _shutdown_chrome() -> None:
+    """Gracefully quit Chrome on app exit (atexit) or SIGTERM.
+
+    Flow: driver.quit() → wait for chromedriver to exit naturally →
+    conditional SIGKILL only if still alive → remove leftover lock files.
+
+    Never force-kills the Chrome browser process itself so that Chrome does
+    not show its "restore pages?" dialog on the next app launch.
+    """
+    global _singleton_driver
+    # Read and clear the driver reference without holding the lock long —
+    # shutdown is a process-exit path; perfect thread safety is less important
+    # than not deadlocking.
+    driver = _singleton_driver
+    _singleton_driver = None
+
+    if driver is not None:
+        try:
+            _logger.info("[shutdown] Chrome をシャットダウンします (driver.quit)")
+            driver.quit()
+            _logger.info("[shutdown] Chrome.quit() 完了")
+        except Exception as exc:
+            _logger.warning("[shutdown] Chrome.quit() 失敗: %s", exc)
+
+    # Wait for chromedriver to self-exit, then force-kill only if needed.
+    _kill_orphan_chromedriver()
+
+    # Remove any leftover lock files (no process killing at shutdown).
+    _remove_profile_lock_files()
+
+
+import atexit as _atexit
+_atexit.register(_shutdown_chrome)
 
 
 # Path for the PID lock file — set by main.py or __main__ block at startup.
@@ -340,25 +500,38 @@ def _ensure_selenium_manager() -> None:
     if os.environ.get("SE_MANAGER_PATH"):
         return  # already pinned by a previous call
 
+    # Log _MEIPASS so we can confirm whether spaces in the temp dir path
+    # cause Selenium Manager / ChromeDriver discovery failures.
+    _meipass = getattr(sys, "_MEIPASS", None)
+    _logger.info("[selenium] sys._MEIPASS=%s (frozen=%s, has_space=%s)",
+                 _meipass, _meipass is not None,
+                 (" " in str(_meipass)) if _meipass else False)
+
     import selenium as _sel
     selenium_pkg_dir = os.path.dirname(os.path.abspath(_sel.__file__))
+    _logger.info("[selenium] selenium_pkg_dir=%s", selenium_pkg_dir)
     sm_path = os.path.join(
         selenium_pkg_dir, "webdriver", "common", "macos", "selenium-manager"
     )
 
     if not os.path.isfile(sm_path):
         print(f"[driver] selenium-manager が見つかりません: {sm_path}")
+        _logger.error("[selenium] selenium-manager not found at: %s", sm_path)
         return
 
     if not os.access(sm_path, os.X_OK):
         try:
             os.chmod(sm_path, 0o755)
             print(f"[driver] selenium-manager の実行権限を付与しました: {sm_path}")
+            _logger.info("[selenium] selenium-manager chmod +x: %s", sm_path)
         except OSError as exc:
             print(f"[driver] selenium-manager chmod 失敗: {exc}")
+            _logger.error("[selenium] selenium-manager chmod failed: %s", exc)
 
     os.environ["SE_MANAGER_PATH"] = sm_path
     print(f"[driver] SE_MANAGER_PATH={sm_path}")
+    _logger.info("[selenium] SE_MANAGER_PATH=%s (space_in_path=%s)",
+                 sm_path, " " in sm_path)
 
 
 def _get_or_create_driver() -> "webdriver.Chrome":
@@ -368,28 +541,32 @@ def _get_or_create_driver() -> "webdriver.Chrome":
     closed the Chrome window, or a transient error), the old driver is quit
     gracefully, orphan processes and stale profile lock files are cleaned up,
     and a new driver is created.
-    Profile locks are always cleared before creating a new driver, even on
-    a fresh process start where _singleton_driver was never set.
     """
     global _singleton_driver
     with _driver_lock:
-        if _singleton_driver is not None and not _is_driver_alive(_singleton_driver):
+        if _singleton_driver is not None:
+            if _is_driver_alive(_singleton_driver):
+                _logger.info("[driver] 既存の Chrome ドライバーを再利用")
+                return _singleton_driver
+            # Driver is dead — quit and clean up before creating a new one
+            _logger.info("[driver] Chrome ドライバーが無効 — 再生成します")
             print("[driver] Driver無効 — 再生成します")
             try:
                 _singleton_driver.quit()
             except Exception:
                 pass
             _singleton_driver = None
-            time.sleep(0.5)          # let Chrome release file handles
+            time.sleep(0.5)  # let Chrome release file handles
             _kill_orphan_chromedriver()
-            _clear_profile_lock()    # remove any stale lock files
 
-        if _singleton_driver is None:
-            # Always clear profile locks before creating a new driver so stale
-            # locks from a previous app session (or crashed Chrome) don't block startup.
-            _clear_profile_lock()
-            _singleton_driver = _make_chrome_driver(headless=False)
-
+        # _make_chrome_driver already calls _clear_profile_lock() internally
+        _logger.info("[driver] ChromeDriver を初期化します")
+        _singleton_driver = _make_chrome_driver(headless=False)
+        try:
+            _logger.info("[driver] ChromeDriver 初期化完了 — session_id=%s",
+                         _singleton_driver.session_id)
+        except Exception:
+            _logger.info("[driver] ChromeDriver 初期化完了")
         return _singleton_driver
 
 
@@ -416,6 +593,34 @@ FILTER_STATUSES = ["出品中", "公開停止中", "取引中", "売却済み"]
 
 # Badge texts that can appear on cards (superset of STATUSES for detection)
 _DETECT_STATUSES = set(STATUSES) | {"公開停止中", "出品停止中"}
+
+# Transaction-workflow step texts that Mercari renders on 取引中 cards.
+# These must never be stored as product titles.
+# Extensible: add new phrases here as Mercari UI changes.
+_TRANSACTION_STATUS_TEXTS = {
+    # Shipping steps
+    "発送してください",
+    "発送待ちです",
+    "発送準備をしてください",
+    "発送済みです",
+    "配送中です",
+    "配送状況を確認",
+    # Payment steps
+    "支払い待ち",
+    "支払い済み",
+    "入金待ちです",
+    "お支払い手続きをしてください",
+    # Evaluation / receipt steps
+    "受取評価待ち",
+    "評価してください",
+    "相手の評価を待っています",
+    "受取連絡をしてください",
+    # Generic transaction UI
+    "取引メッセージ",
+    "取引完了",
+    "取引をキャンセルする",
+    "取引情報を確認",
+}
 
 # Mercari mypage URL for each sync status
 STATUS_URLS = {
@@ -499,6 +704,52 @@ def init_license() -> None:
         print(f"[license] プラン: {plan}, トライアル残り: {days} 日")
 
 
+# ---------------------------------------------------------------------------
+# API token helpers (iPhone companion app authentication)
+# ---------------------------------------------------------------------------
+
+def _api_token() -> str:
+    """Return (and lazily create) the persistent API token stored in license.json."""
+    state = _get_license()
+    if not state.get("api_token"):
+        state["api_token"] = secrets.token_hex(16)
+        _save_license(state)
+    return state["api_token"]
+
+
+def _require_api_token():
+    """Return None when the request carries a valid Bearer token; HTTP 401 otherwise."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != _api_token():
+        return Response(
+            '{"error":"unauthorized"}',
+            status=401,
+            mimetype="application/json",
+        )
+    return None
+
+
+def _get_lan_ip() -> str:
+    """Return the Mac's LAN IPv4 address (best-effort; falls back to 127.0.0.1)."""
+    import socket as _sock
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _reset_api_token() -> str:
+    """Generate a new token, persist it, and return it."""
+    state = _get_license()
+    state["api_token"] = secrets.token_hex(16)
+    _save_license(state)
+    return state["api_token"]
+
+
 def _check_plan() -> str:
     """Return the effective plan: trial | expired | free | monthly | lifetime."""
     state = _get_license()
@@ -521,6 +772,28 @@ def _check_plan() -> str:
             except Exception:
                 pass
     return plan
+
+
+def _can_export() -> bool:
+    """Return True if the current license permits CSV / Excel data export.
+
+    Allowed:  monthly, lifetime
+    Blocked:  free, trial, expired, invalid, unknown
+
+    This is the single backend source of truth for export permission.
+    It is intentionally kept as a thin wrapper around _check_plan() so
+    that future extensions (license_key validation, offline signature check,
+    device_id binding, expires_at comparison) can be added here without
+    touching any export route.
+    """
+    plan = _check_plan()
+    if plan in ("monthly", "lifetime"):
+        return True
+    # Future hook:
+    # key_data = _get_license().get("license_key")
+    # if key_data and _validate_offline_signature(key_data):
+    #     return True
+    return False
 
 
 def _trial_days_remaining() -> int:
@@ -786,8 +1059,8 @@ _CSS = """
   --primary: #2563eb;
   --primary-h: #1d4ed8;
   --radius: 12px;
-  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
-  --shadow-md: 0 4px 6px rgba(0,0,0,.07), 0 2px 4px rgba(0,0,0,.05);
+  --shadow: 0 1px 3px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.04);
+  --shadow-md: 0 4px 8px rgba(0,0,0,.08), 0 2px 4px rgba(0,0,0,.04);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -809,7 +1082,7 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
 .card { background: var(--surface); border-radius: var(--radius);
         box-shadow: var(--shadow-md); overflow: clip; }
 .card-header { display: flex; justify-content: space-between; align-items: center;
-               padding: 16px 20px; border-bottom: 1px solid var(--border); }
+               padding: 16px 22px; border-bottom: 1px solid var(--border); }
 .card-title { font-size: 14px; font-weight: 600; color: var(--text); }
 .card-body  { padding: 20px; }
 .field-label { font-size: 12px; font-weight: 600; color: var(--muted);
@@ -850,7 +1123,7 @@ thead th { background: #f9fafb; color: var(--muted); font-size: 12px;
            padding: 10px 14px; text-align: left;
            border-bottom: 2px solid var(--border);
            position: sticky; top: 0; z-index: 5; }
-tbody td { padding: 11px 14px; border-bottom: 1px solid var(--border);
+tbody td { padding: 12px 14px; border-bottom: 1px solid var(--border);
            font-size: 14px; vertical-align: middle; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #f9fafb; }
@@ -859,7 +1132,7 @@ tbody tr:hover { background: #f9fafb; }
          padding: 3px 10px; font-size: 12px; font-weight: 600;
          white-space: nowrap; }
 .link-btn { color: var(--primary); font-weight: 600; text-decoration: none;
-            font-size: 13px; }
+            font-size: 13px; white-space: nowrap; }
 .link-btn:hover { text-decoration: underline; }
 .empty-state { text-align: center; padding: 56px 20px; color: var(--muted); }
 .empty-state .es-icon { font-size: 40px; margin-bottom: 12px; }
@@ -936,12 +1209,13 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
 .kpi-grid { display: grid;
             grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
             gap: 14px; }
-.kpi-card { background: #fff; border-radius: 12px; padding: 18px 20px;
-            box-shadow: var(--shadow-md); }
-a.kpi-card { display: block; text-decoration: none; color: inherit;
-             cursor: pointer; transition: box-shadow .15s, transform .15s; }
-a.kpi-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,.13);
-                   transform: translateY(-2px); }
+.kpi-card { background: #fff; border-radius: 12px; padding: 20px 22px;
+            box-shadow: var(--shadow-md); border: 1px solid var(--border); }
+a.kpi-card-link { text-decoration: none; color: inherit; display: block; }
+a.kpi-card-link .kpi-card { cursor: pointer;
+  transition: transform .12s ease, box-shadow .12s ease; }
+a.kpi-card-link:hover .kpi-card { transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgba(0,0,0,.13); }
 .kpi-value { font-size: 26px; font-weight: 700; color: var(--text);
              letter-spacing: -.5px; }
 .kpi-value.green { color: #16a34a; }
@@ -950,6 +1224,13 @@ a.kpi-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,.13);
 .kpi-value.red   { color: #dc2626; }
 .kpi-label { font-size: 11px; font-weight: 600; color: var(--muted);
              margin-top: 4px; text-transform: uppercase; letter-spacing: .04em; }
+/* Active status filter chip */
+.active-filter-chip { display: inline-flex; align-items: center; gap: 8px;
+  background: var(--primary); color: #fff; border-radius: 20px;
+  padding: 4px 12px; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+.active-filter-chip a.chip-clear { color: rgba(255,255,255,.8); text-decoration: none;
+  font-size: 16px; line-height: 1; }
+.active-filter-chip a.chip-clear:hover { color: #fff; }
 /* Sync warning banner */
 .sync-warning { background: #fffbeb; border: 1px solid #fde68a;
                 border-radius: 8px; color: #92400e;
@@ -976,20 +1257,22 @@ a.kpi-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,.13);
 .suggestion-tip { font-size: 13px; color: var(--muted);
                   padding: 10px 20px 4px; line-height: 1.5; }
 /* Upgrade / pricing page */
-.plan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-             gap: 20px; margin-top: 4px; }
+.plan-grid { display: grid; grid-template-columns: repeat(3, 1fr);
+             gap: 24px; margin-top: 4px; max-width: 880px; }
+@media (max-width: 620px) { .plan-grid { grid-template-columns: 1fr; } }
 .plan-card { background: #fff; border: 2px solid var(--border); border-radius: 16px;
              padding: 28px 24px; display: flex; flex-direction: column;
-             align-items: center; text-align: center; transition: border-color .2s; }
+             align-items: center; text-align: center; transition: border-color .2s;
+             align-self: stretch; }
 .plan-card:hover { border-color: var(--primary); }
 .plan-card.featured { border-color: var(--primary);
                       box-shadow: 0 4px 20px rgba(37,99,235,.15); }
-.plan-name  { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
-.plan-price { font-size: 28px; font-weight: 800; color: var(--primary);
-              letter-spacing: -.5px; margin-bottom: 4px; }
+.plan-name  { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+.plan-price { font-size: 30px; font-weight: 800; color: var(--primary);
+              letter-spacing: -.5px; margin-bottom: 6px; }
 .plan-price small { font-size: 14px; font-weight: 500; color: var(--muted); }
-.plan-features { font-size: 13px; color: var(--muted); line-height: 1.7;
-                 margin-bottom: 20px; flex: 1; }
+.plan-features { font-size: 13px; color: var(--muted); line-height: 1.8;
+                 margin-bottom: 24px; flex: 1; }
 .plan-cta { width: 100%; padding: 11px; font-size: 14px; font-weight: 600;
             border-radius: 10px; cursor: pointer; border: none;
             transition: background .15s; }
@@ -998,6 +1281,13 @@ a.kpi-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,.13);
 .plan-cta-outline { background: #fff; color: var(--text);
                     border: 1.5px solid var(--border); }
 .plan-cta-outline:hover { border-color: var(--primary); color: var(--primary); }
+.plan-cta-current { background: #f3f4f6; color: var(--muted);
+                    border: 1.5px solid var(--border);
+                    cursor: default; pointer-events: none; opacity: 1; }
+/* Export locked buttons */
+.export-locked { color: var(--muted) !important; border-style: dashed !important;
+                 cursor: not-allowed !important; }
+.export-locked:hover { background: #fff !important; color: var(--muted) !important; }
 .upgrade-banner { background: #fef3c7; border: 1px solid #fde68a;
                   border-radius: 12px; padding: 16px 20px; margin-bottom: 4px;
                   font-size: 14px; color: #92400e; line-height: 1.6; }
@@ -1231,16 +1521,7 @@ document.addEventListener('click', function(e) {
 #   (page re-renders with the correct UI for the new state).
 _LOGIN_POLL_JS = """
 (function() {
-  var pollStart = Date.now();
-  var CLIENT_TIMEOUT_MS = 60000; // 60 s — stop spinning if server stays stuck
-
-  function showTimeoutUI() {
-    var spinner = document.querySelector('.spinner');
-    var status  = document.querySelector('.login-status');
-    if (spinner) spinner.style.display = 'none';
-    if (status)  status.textContent = 'ブラウザが起動しませんでした。キャンセルして再試行してください。';
-  }
-
+  var _deadline = Date.now() + 60000;
   function poll() {
     if (Date.now() - pollStart >= CLIENT_TIMEOUT_MS) {
       showTimeoutUI();
@@ -1261,6 +1542,7 @@ _LOGIN_POLL_JS = """
           return;
         }
         // still in-progress: 'checking', 'logging_in', 'clearing'
+        if (Date.now() > _deadline) { window.location = '/login'; return; }
         setTimeout(poll, 2000);
       })
       .catch(function() { setTimeout(poll, 3000); });
@@ -1390,7 +1672,7 @@ def _build_result_rows(products):
           <td data-sort="{html_module.escape(display_status)}">{badge}</td>
           <td style="color:var(--muted)">{created}</td>
           <td style="color:var(--muted)">{synced}</td>
-          <td><a class="link-btn open-link" data-url="{url}">開く ↗</a></td>
+          <td style="text-align:center"><a class="link-btn open-link" data-url="{url}">開く ↗</a></td>
         </tr>"""
     return rows
 
@@ -1417,10 +1699,14 @@ def _get_kpi_stats() -> dict:
         cursor.execute("SELECT COUNT(*) FROM mercari_products")
         total = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT COUNT(*) FROM mercari_products "
-            "WHERE status='出品中' AND (visibility_status IS NULL OR visibility_status != 'stopped')"
+            "SELECT COUNT(*) FROM mercari_products WHERE status='出品中'"
         )
         active = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*) FROM mercari_products "
+            "WHERE status='出品中' AND visibility_status='stopped'"
+        )
+        stopped = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM mercari_products WHERE status='取引中'")
         trading = cursor.fetchone()[0]
         cursor.execute(
@@ -1438,15 +1724,16 @@ def _get_kpi_stats() -> dict:
         last_sync = (row[0] or "")[:16] if row else ""
         conn.close()
     except Exception:
-        return {"total": 0, "active": 0, "trading": 0, "sold": 0,
+        return {"total": 0, "active": 0, "stopped": 0, "trading": 0, "sold": 0,
                 "total_sales": 0, "last_sync": "–"}
     return {
-        "total": total,
-        "active": active,
-        "trading": trading,
-        "sold": sold,
+        "total":       total,
+        "active":      active,
+        "stopped":     stopped,
+        "trading":     trading,
+        "sold":        sold,
         "total_sales": total_sales,
-        "last_sync": last_sync or "–",
+        "last_sync":   last_sync or "–",
     }
 
 
@@ -1471,7 +1758,7 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">{APP_VERSION}</div>
+  <div class="sidebar-footer">{html_module.escape(APP_VERSION)}</div>
 </nav>"""
 
 
@@ -1531,7 +1818,7 @@ def _page_shell(title: str, active: str, content: str,
         {sub_html}
       </div>
       <div class="page-header-actions">
-        <span class="db-pill">DB: {stats['total']} 件</span>
+        <span class="db-pill">商品 {stats['total']} 件</span>
         <button class="btn-exit" onclick="doShutdown()">終了</button>
       </div>
     </div>
@@ -1596,21 +1883,35 @@ def home():
     _q_sold    = "/products?searched=1&statuses=%E5%A3%B2%E5%8D%B4%E6%B8%88%E3%81%BF"
     kpi_html = f"""
     <div class="kpi-grid">
-      <a class="kpi-card" href="{_q_all}">
-        <div class="kpi-value">{stats['total']}</div>
-        <div class="kpi-label">総商品数</div>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=all">
+        <div class="kpi-card">
+          <div class="kpi-value">{stats['total']}</div>
+          <div class="kpi-label">総商品数</div>
+        </div>
       </a>
-      <a class="kpi-card" href="{_q_listed}">
-        <div class="kpi-value green">{stats['active']}</div>
-        <div class="kpi-label">出品中</div>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=listed">
+        <div class="kpi-card">
+          <div class="kpi-value green">{stats['active']}</div>
+          <div class="kpi-label" title="公開停止中を含む">出品中</div>
+        </div>
       </a>
-      <a class="kpi-card" href="{_q_trading}">
-        <div class="kpi-value amber">{stats['trading']}</div>
-        <div class="kpi-label">取引中</div>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=stopped">
+        <div class="kpi-card">
+          <div class="kpi-value" style="color:#ea580c">{stats['stopped']}</div>
+          <div class="kpi-label">公開停止中</div>
+        </div>
       </a>
-      <a class="kpi-card" href="{_q_sold}">
-        <div class="kpi-value blue">{stats['sold']}</div>
-        <div class="kpi-label">売却済み</div>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=trading">
+        <div class="kpi-card">
+          <div class="kpi-value amber">{stats['trading']}</div>
+          <div class="kpi-label">取引中</div>
+        </div>
+      </a>
+      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=sold">
+        <div class="kpi-card">
+          <div class="kpi-value blue">{stats['sold']}</div>
+          <div class="kpi-label">売却済み</div>
+        </div>
       </a>
       <div class="kpi-card">
         <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
@@ -1829,20 +2130,26 @@ def sync():
     }
 
     def _bg_sync():
+        import traceback as _tb
         global _sync_running, _sync_progress, _sync_stop_requested
         _sync_stop_requested = False   # clear any leftover stop flag from previous run
+        _logger.info("[sync] 同期開始 — 対象ステータス: %s", selected)
+        _sync_start_ts = time.time()
         try:
             run_scraper(selected_statuses=selected)
             if _check_plan() == "free":
-                _increment_sync_count()
-                _enforce_free_item_limit()
+                _record_sync_date()
+            elapsed = round(time.time() - _sync_start_ts, 1)
+            _logger.info("[sync] 同期完了 — 所要時間: %.1f 秒", elapsed)
         except _SyncStopped:
             print("[sync] 強制停止されました")
+            _logger.info("[sync] ユーザーにより強制停止されました")
             _sync_progress["stopped"] = True
         except Exception as exc:
-            import traceback
             print("[sync] 同期エラー:")
-            traceback.print_exc()
+            _tb.print_exc()
+            # Full traceback goes to log only — never shown raw in UI
+            _logger.error("[sync] 同期エラー: %s\n%s", exc, _tb.format_exc())
             _sync_progress["error"] = str(exc).split("\n")[0][:200]
         finally:
             _sync_running = False
@@ -1937,13 +2244,32 @@ def login_page():
       </div>"""
         poll_js = ""
 
+    elif state == "error":
+        err_html = html_module.escape(_login_error_msg) if _login_error_msg else "ログインに失敗しました。"
+        body_content = f"""
+      <p class="login-error">&#9888; {err_html}</p>
+      <div class="login-btn-group">
+        <form method="POST" action="/login/start">
+          <button class="btn btn-primary login-btn" type="submit"
+                  onclick="var b=this;b.form.submit();b.disabled=true;b.textContent='起動中…';return false">
+            再試行
+          </button>
+        </form>
+        <form method="POST" action="/login/cancel">
+          <button class="btn btn-outline login-btn" type="submit">
+            キャンセル
+          </button>
+        </form>
+      </div>"""
+        poll_js = ""
+
     else:
         # "invalid" or anything unexpected — show the login button
         body_content = """
       <p class="login-desc">Mercari の在庫を同期するには、<br>Mercari アカウントでログインが必要です。</p>
-      <form method="POST" action="/login/start" id="login-start-form">
-        <button class="btn btn-primary login-btn" type="submit" id="login-start-btn"
-                onclick="this.disabled=true;this.textContent='起動中…'">
+      <form method="POST" action="/login/start">
+        <button class="btn btn-primary login-btn" type="submit"
+                onclick="var b=this;b.form.submit();b.disabled=true;b.textContent='起動中…';return false">
           ログインを開始
         </button>
       </form>"""
@@ -1969,9 +2295,8 @@ def login_page():
   .login-btn {{ width: 100%; padding: 13px; font-size: 15px; justify-content: center; }}
   .btn-danger {{ background: #ef4444; color: #fff; border: none; }}
   .btn-danger:hover {{ background: #dc2626; }}
-  .login-error {{ font-size: 14px; color: #b91c1c; background: #fef2f2;
-                 border: 1px solid #fca5a5; border-radius: 8px;
-                 padding: 14px 18px; margin-bottom: 8px; text-align: center; }}
+  .login-error {{ font-size: 14px; color: #dc2626; margin-bottom: 20px;
+                 text-align: center; line-height: 1.5; }}
   .spinner {{ width: 36px; height: 36px; border: 4px solid var(--border);
              border-top-color: var(--primary); border-radius: 50%;
              animation: spin .8s linear infinite; margin: 0 auto; }}
@@ -2005,24 +2330,36 @@ def login_page():
 @app.route("/login/start", methods=["POST"])
 def login_start():
     global _session_state, _login_error_msg, _login_start_time
-    print("[login] ログイン開始リクエスト受信")
+    _logger.info("[login] ログインボタンが押されました (state=%s)", _session_state)
     with _login_start_lock:
-        # Allow override if the "logging_in" state is older than the login timeout
-        # (120 s = wait_for_login timeout).  This handles threads that died without
-        # updating the state.
-        stuck = (
-            _session_state == "logging_in"
-            and time.time() - _login_start_time > 120
-        )
-        if _session_state == "logging_in" and not stuck:
-            print("[login] すでにログイン中のため重複リクエストを無視します")
-            return redirect("/login")
-        if stuck:
-            print("[login] ログイン状態がスタック — 強制リセットして再試行します")
-        print("[login] ログインフローを開始します — ブラウザ起動準備中")
+        if _session_state == "logging_in":
+            # Check whether Chrome is still alive rather than using a fixed timer.
+            # If alive: bring it to the front and ignore the duplicate request.
+            # If dead: the previous login attempt crashed — allow a clean retry.
+            with _driver_lock:
+                _alive = (
+                    _singleton_driver is not None
+                    and _is_driver_alive(_singleton_driver)
+                )
+            if _alive:
+                _logger.info("[login] 重複リクエストを無視 (Chrome 起動中) — Chrome を前面に移動")
+                if platform.system() == "Darwin":
+                    try:
+                        import subprocess as _sp
+                        _sp.run(
+                            ["osascript", "-e",
+                             'tell application "Google Chrome" to activate'],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        pass
+                return redirect("/login")
+            # Driver dead — previous login crashed; allow clean retry
+            _logger.info("[login] 前回ログインの Chrome が無効 — クリーンアップして再試行")
         _login_error_msg = ""
         _session_state = "logging_in"
         _login_start_time = time.time()
+    _logger.info("[login] ログイン開始 — バックグラウンドスレッド起動")
     threading.Thread(target=_do_login, daemon=True, name="login-thread").start()
     return redirect("/login")
 
@@ -2033,28 +2370,24 @@ def login_use():
     global _session_state
     if _session_state == "found_session":
         _session_state = "valid"
+        _logger.info("[login] ユーザーが既存セッションを使用することを選択")
     return redirect("/")
 
 
 @app.route("/login/relogin", methods=["POST"])
 def login_relogin():
     """Discard the existing session and force a fresh interactive login."""
-    global _session_state, _login_error_msg
-    print("[login] 再ログインリクエスト受信")
+    global _session_state, _login_error_msg, _login_start_time
+    _logger.info("[login] 再ログインリクエスト (state=%s)", _session_state)
     with _login_start_lock:
-        stuck = (
-            _session_state == "logging_in"
-            and time.time() - _login_start_time > 120
-        )
+        stuck = (_session_state == "logging_in" and time.time() - _login_start_time > 120)
         if _session_state == "logging_in" and not stuck:
-            print("[login] すでにログイン中のため重複リクエストを無視します")
+            _logger.info("[login] 重複リクエストを無視 (logging_in 進行中)")
             return redirect("/login")
-        if stuck:
-            print("[login] ログイン状態がスタック — 強制リセットして再試行します")
-        print("[login] 再ログインフローを開始します — ブラウザ起動準備中")
         _login_error_msg = ""
         _session_state = "logging_in"
         _login_start_time = time.time()
+    _logger.info("[login] 強制再ログイン開始")
     threading.Thread(
         target=lambda: _do_login(force_relogin=True),
         daemon=True,
@@ -2079,19 +2412,27 @@ def login_clear():
     global _session_state
     if _session_state == "clearing":
         return redirect("/login")
+    _logger.info("[login] セッションクリアを開始します (state=%s)", _session_state)
     _session_state = "clearing"
     threading.Thread(target=_clear_session, daemon=True, name="session-clear").start()
+    return redirect("/login")
+
+
+@app.route("/login/cancel", methods=["POST"])
+def login_cancel():
+    """Reset error or stuck state so the login button re-appears."""
+    global _session_state, _login_error_msg
+    if _session_state in ("error", "logging_in"):
+        _session_state = "invalid"
+        _login_error_msg = ""
     return redirect("/login")
 
 
 @app.route("/login/status")
 def login_status():
     from flask import jsonify
-    return jsonify({
-        "state":      _session_state,
-        "last_login": _session_last_login,
-        "error_msg":  _login_error_msg,
-    })
+    return jsonify({"state": _session_state, "last_login": _session_last_login,
+                    "error_msg": _login_error_msg})
 
 
 @app.route("/open")
@@ -2137,19 +2478,24 @@ def open_url():
 
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
-    print("[shutdown] 終了ボタンが押されました")
-    def _do_exit():
-        time.sleep(0.5)   # let response reach the browser
-        cleanup_app_processes()
-        time.sleep(0.3)
-        print("[shutdown] プロセスを終了します")
-        os._exit(0)
-    threading.Thread(target=_do_exit, daemon=True).start()
+    _logger.info("[shutdown] シャットダウンリクエスト受信 — アプリを終了します")
+    threading.Thread(
+        target=lambda: (time.sleep(0.8), os._exit(0)),
+        daemon=True,
+    ).start()
     return Response("ok", status=200, headers={"Content-Type": "text/plain"})
 
 
 @app.route("/export/csv")
 def export_csv():
+    if not _can_export():
+        _logger.warning("[export] blocked — non-paid plan attempted export (plan=%s, route=csv)",
+                        _check_plan())
+        return Response(
+            '{"error": "データ出力機能は有料プランの限定機能です"}',
+            status=403,
+            mimetype="application/json",
+        )
     q            = request.args.get("q", "").strip()
     sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
@@ -2173,6 +2519,14 @@ def export_csv():
 
 @app.route("/export/xlsx")
 def export_xlsx():
+    if not _can_export():
+        _logger.warning("[export] blocked — non-paid plan attempted export (plan=%s, route=xlsx)",
+                        _check_plan())
+        return Response(
+            '{"error": "データ出力機能は有料プランの限定機能です"}',
+            status=403,
+            mimetype="application/json",
+        )
     q            = request.args.get("q", "").strip()
     sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     products     = _query_products(q, sel_statuses)
@@ -2214,6 +2568,8 @@ def upgrade_page():
         banner_msg = "売上分析は月額プランまたは買い切りプランでご利用いただけます。"
     elif from_pg == "ai":
         banner_msg = "AI分析は月額プランまたは買い切りプランでご利用いただけます。"
+    elif from_pg == "export":
+        banner_msg = "データ出力（CSV・Excel）は月額プランまたは買い切りプランでご利用いただけます。"
     elif plan in ("expired", "free"):
         banner_msg = "3日間のトライアル期間が終了しました。引き続きご利用にはプランを選択してください。"
     else:
@@ -2224,9 +2580,17 @@ def upgrade_page():
         if banner_msg else ""
     )
 
-    free_features = "同期: 1日3回<br>商品管理: 100件まで<br>並び替え: ✗<br>売上分析: ✗<br>AI分析: ✗"
-    monthly_features = "同期: 無制限<br>商品管理: 無制限<br>並び替え: ○<br>売上分析: ○<br>AI分析: ○"
-    lifetime_features = "同期: 無制限<br>商品管理: 無制限<br>並び替え: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
+    free_features = "同期: 1日1回<br>商品管理: ○<br>データ出力: ✗<br>売上分析: ✗<br>AI分析: ✗"
+    monthly_features = "同期: 無制限<br>商品管理: ○<br>データ出力: ○<br>売上分析: ○<br>AI分析: ○"
+    lifetime_features = "同期: 無制限<br>商品管理: ○<br>データ出力: ○<br>売上分析: ○<br>AI分析: ○<br>将来のアップデート: ○"
+
+    free_cta = (
+        '<button class="plan-cta plan-cta-current" disabled>✓ 無料版を利用中</button>'
+        if plan == "free"
+        else '<form method="POST" action="/license/choose-free" style="width:100%">'
+             '<button class="plan-cta plan-cta-outline" type="submit">無料版で続ける</button>'
+             '</form>'
+    )
 
     plan_grid = f"""
     <div class="plan-grid">
@@ -2234,9 +2598,7 @@ def upgrade_page():
         <div class="plan-name">無料版</div>
         <div class="plan-price">¥0</div>
         <div class="plan-features">{free_features}</div>
-        <form method="POST" action="/license/choose-free" style="width:100%">
-          <button class="plan-cta plan-cta-outline" type="submit">無料版で続ける</button>
-        </form>
+        {free_cta}
       </div>
       <div class="plan-card featured">
         <div class="plan-name">月額プラン</div>
@@ -2289,9 +2651,22 @@ def products_page():
 
     searched     = request.args.get("searched") == "1"
     q            = request.args.get("q", "").strip()
-    sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
     price_min    = request.args.get("price_min", "").strip()
     price_max    = request.args.get("price_max", "").strip()
+
+    _STATUS_FILTER_MAP = {
+        "all":     list(FILTER_STATUSES),
+        "listed":  ["出品中"],
+        "stopped": ["公開停止中"],
+        "trading": ["取引中"],
+        "sold":    ["売却済み"],
+    }
+    status_filter = request.args.get("status_filter", "")
+    if status_filter in _STATUS_FILTER_MAP:
+        searched     = True
+        sel_statuses = _STATUS_FILTER_MAP[status_filter]
+    else:
+        sel_statuses = request.args.getlist("statuses") or list(FILTER_STATUSES)
 
     products = _query_products(q, sel_statuses) if searched else []
 
@@ -2376,36 +2751,12 @@ def products_page():
             '<p>該当する商品が見つかりませんでした</p>'
             '</div></td></tr>'
         ) if count == 0 else ""
-        results_html = f"""
-        <div class="card">
-          <div class="card-header">
-            <span class="card-title">検索結果
-              <span class="count-badge">{count} 件</span>
-            </span>
-            <div class="export-row">
+        can_exp = _can_export()
+        if can_exp:
+            export_btns = f"""
               <a class="btn btn-outline" id="export-csv" href="#" {disabled}>⬇ CSV</a>
-              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>⬇ Excel</a>
-            </div>
-          </div>
-          <div class="card-body" style="padding:0">
-            <table>
-              <thead>
-                <tr>
-                  <th style="width:40px">#</th>
-                  {''.join([
-                    f'<th data-locked data-col="{c}" onclick="showUpgradeModal(\'sort\')">{lbl} <span class="sort-lock">&#128274;</span></th>'
-                    if sort_locked else
-                    f'<th data-sortable data-col="{c}">{lbl}</th>'
-                    for c, lbl in [(1,"商品名"),(2,"価格"),(3,"状態"),(4,"商品登録時間"),(5,"抓取時間")]
-                  ])}
-                  <th>リンク</th>
-                </tr>
-              </thead>
-              <tbody>{rows_html}{empty_row}</tbody>
-            </table>
-          </div>
-        </div>"""
-        export_js = """
+              <a class="btn btn-outline" id="export-xlsx" href="#" {disabled}>⬇ Excel</a>"""
+            export_js = """
 const sp = new URLSearchParams(window.location.search);
 const csv_el  = document.getElementById('export-csv');
 const xlsx_el = document.getElementById('export-xlsx');
@@ -2413,10 +2764,84 @@ if (csv_el  && !csv_el.hasAttribute('disabled'))
     csv_el.href  = '/export/csv?'  + sp.toString();
 if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
     xlsx_el.href = '/export/xlsx?' + sp.toString();"""
+        else:
+            export_btns = """
+              <button class="btn btn-outline export-locked"
+                      onclick="document.getElementById('export-gate-modal').style.display='flex'"
+                      title="有料プラン限定機能">⬇ CSV <span style="font-size:11px">🔒</span></button>
+              <button class="btn btn-outline export-locked"
+                      onclick="document.getElementById('export-gate-modal').style.display='flex'"
+                      title="有料プラン限定機能">⬇ Excel <span style="font-size:11px">🔒</span></button>"""
+            export_js = ""
+        results_html = f"""
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">検索結果
+              <span class="count-badge">{count} 件</span>
+            </span>
+            <div class="export-row">{export_btns}
+            </div>
+          </div>
+          <div class="card-body" style="padding:0">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:40px">#</th>
+                  <th data-sortable data-col="1">商品名</th>
+                  <th data-sortable data-col="2" style="width:100px">価格</th>
+                  <th data-sortable data-col="3" style="width:120px">状態</th>
+                  <th data-sortable data-col="4" style="width:140px">商品登録時間</th>
+                  <th data-sortable data-col="5" style="width:140px">抓取時間</th>
+                  <th style="width:72px;text-align:center">リンク</th>
+                </tr>
+              </thead>
+              <tbody>{rows_html}{empty_row}</tbody>
+            </table>
+          </div>
+        </div>"""
 
-    content  = search_card + "\n" + results_html
-    _sort_js_include = "" if sort_locked else _SORT_JS
-    extra_js = f"{_STICKY_JS}\n{_sort_js_include}\n{_OPEN_LINK_JS}\n{export_js}"
+    _filter_label_map = {
+        "all":     "全商品",
+        "listed":  "出品中",
+        "stopped": "公開停止中",
+        "trading": "取引中",
+        "sold":    "売却済み",
+    }
+    active_chip = ""
+    if status_filter in _filter_label_map:
+        label = _filter_label_map[status_filter]
+        active_chip = (
+            f'<div class="active-filter-chip">'
+            f'フィルター: {label}'
+            f'<a href="/products" class="chip-clear" title="フィルターを解除">×</a>'
+            f'</div>'
+        )
+
+    export_modal = ""
+    if not _can_export():
+        export_modal = """
+<div id="export-gate-modal"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);
+            z-index:9999;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;padding:32px;
+              max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.3);
+              text-align:center">
+    <div style="font-size:2rem;margin-bottom:12px">🔒</div>
+    <h3 style="margin:0 0 8px">有料プランが必要です</h3>
+    <p style="color:var(--muted);margin:0 0 24px">
+      データ出力機能（CSV・Excel）は月額プランまたは買い切りプランの限定機能です。
+    </p>
+    <div style="display:flex;gap:12px;justify-content:center">
+      <button class="btn btn-outline"
+              onclick="document.getElementById('export-gate-modal').style.display='none'">
+        閉じる
+      </button>
+      <a class="btn btn-primary" href="/upgrade?from=export">プランを確認</a>
+    </div>
+  </div>
+</div>"""
+    content  = search_card + "\n" + active_chip + "\n" + results_html + export_modal
+    extra_js = f"{_STICKY_JS}\n{_SORT_JS}\n{_OPEN_LINK_JS}\n{export_js}"
     return _page_shell("商品管理", "products", content, extra_js,
                        subtitle="商品の検索・エクスポート")
 
@@ -2875,7 +3300,7 @@ def settings_page():
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">バージョン</span>
-          <span class="settings-value">{APP_VERSION}</span>
+          <span class="settings-value">{html_module.escape(APP_VERSION)}</span>
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
@@ -2887,9 +3312,329 @@ def settings_page():
       </div>
     </div>"""
 
-    content = f"{info_card}\n{plan_card}\n{actions_card}\n{app_card}"
+    diag_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">診断・サポート</span></div>
+      <div class="card-body">
+        <div class="settings-row">
+          <span class="settings-label">ログ保存先</span>
+          <span class="settings-path">{html_module.escape(_LOG_DIR or app_data_dir + "/logs")}</span>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:16px">
+          <form method="POST" action="/support/open-logs">
+            <button class="btn btn-outline" type="submit">
+              ログフォルダを開く
+            </button>
+          </form>
+          <a class="btn btn-outline" href="/support/export-logs"
+             style="text-decoration:none">
+            診断ログをエクスポート
+          </a>
+          <button class="btn btn-outline" type="button"
+                  onclick="(function(){{
+                    var s = 'MIA Inventory 診断サマリー\\n'
+                          + '========================\\n'
+                          + 'バージョン: {html_module.escape(APP_VERSION)}\\n'
+                          + 'データ保存先: {html_module.escape(app_data_dir)}\\n'
+                          + 'ログ保存先: {html_module.escape(_LOG_DIR or app_data_dir + '/logs')}\\n'
+                          + 'ポート: 5050\\n'
+                          + '取得日時: ' + new Date().toLocaleString('ja-JP');
+                    navigator.clipboard.writeText(s).then(function(){{
+                      alert('診断サマリーをクリップボードにコピーしました');
+                    }});
+                  }})()">
+            診断サマリーをコピー
+          </button>
+        </div>
+        <p style="margin-top:12px;font-size:12px;color:var(--muted)">
+          問題が発生した場合は「診断ログをエクスポート」で ZIP を作成し、
+          サポートにお送りください。パスワード・Cookie などの個人情報は含まれません。
+        </p>
+      </div>
+    </div>"""
+
+    # ── iPhone 連携 card ──────────────────────────────────────────────────
+    lan_ip   = _get_lan_ip()
+    raw_tok  = _api_token()
+    tok_reset_ok = request.args.get("tok_reset") == "1"
+    tok_flash = (
+        '<div class="error-banner" '
+        'style="background:#dcfce7;border-color:#86efac;color:#166534;margin-bottom:12px">'
+        '&#10003; APIトークンを再生成しました。iPhoneアプリの設定を更新してください。'
+        '</div>'
+        if tok_reset_ok else ""
+    )
+    iphone_card = f"""
+    <div class="card">
+      <div class="card-header"><span class="card-title">iPhone 連携</span></div>
+      <div class="card-body">
+        {tok_flash}
+        <p style="font-size:13px;color:var(--muted);margin-bottom:16px">
+          MIA Inventory iPhone アプリから Mac に接続するための情報です。
+          Mac と iPhone が同じ Wi-Fi ネットワークに接続されていることを確認してください。
+        </p>
+        <div class="settings-row">
+          <span class="settings-label">Mac の IP アドレス</span>
+          <span class="settings-value" style="font-family:monospace">{html_module.escape(lan_ip)}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">ポート番号</span>
+          <span class="settings-value" style="font-family:monospace">5050</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">API トークン</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="tok-val" class="settings-value"
+                  style="font-family:monospace;letter-spacing:.08em">
+              {'•' * len(raw_tok)}
+            </span>
+            <button class="btn btn-outline" type="button" style="padding:4px 10px;font-size:12px"
+                    onclick="(function(){{
+                      var el=document.getElementById('tok-val');
+                      var shown=el.dataset.shown;
+                      if(!shown){{el.textContent={json.dumps(raw_tok)};el.dataset.shown='1';this.textContent='隠す';}}
+                      else{{el.textContent={'•' * len(raw_tok)!r};delete el.dataset.shown;this.textContent='表示';}}
+                    }}).call(this)">表示</button>
+            <button class="btn btn-outline" type="button" style="padding:4px 10px;font-size:12px"
+                    onclick="navigator.clipboard.writeText({json.dumps(raw_tok)}).then(function(){{alert('トークンをコピーしました');}})">
+              コピー
+            </button>
+          </div>
+        </div>
+        <div style="margin-top:16px">
+          <form method="POST" action="/settings/reset-token"
+                onsubmit="return confirm('APIトークンを再生成しますか？\\niPhoneアプリの設定も更新が必要です。')">
+            <button class="btn btn-danger" type="submit"
+                    style="font-size:13px;padding:8px 16px">
+              トークンを再生成
+            </button>
+          </form>
+        </div>
+        <p style="margin-top:14px;font-size:12px;color:var(--muted)">
+          API ベース URL:
+          <code style="font-size:12px">http://{html_module.escape(lan_ip)}:5050</code>
+        </p>
+      </div>
+    </div>"""
+
+    content = (f"{info_card}\n{plan_card}\n{actions_card}\n"
+               f"{iphone_card}\n{app_card}\n{diag_card}")
     return _page_shell("設定", "settings", content,
                        subtitle="セッション管理・アプリ情報")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic support routes
+# ---------------------------------------------------------------------------
+
+@app.route("/support/open-logs", methods=["POST"])
+def support_open_logs():
+    """Open the logs directory in Finder."""
+    if _session_state != "valid":
+        return redirect("/login")
+    logs_dir = _LOG_DIR or os.path.join(
+        os.path.dirname(os.path.abspath(DB_NAME)), "logs"
+    )
+    os.makedirs(logs_dir, exist_ok=True)
+    try:
+        import subprocess as _sp
+        _sp.Popen(["open", logs_dir])
+        _logger.info("[support] ログフォルダを Finder で開きました: %s", logs_dir)
+    except Exception as exc:
+        _logger.error("[support] ログフォルダを開けませんでした: %s", exc)
+    return redirect("/settings")
+
+
+@app.route("/support/export-logs")
+def support_export_logs():
+    """Stream a zip of recent log files as a download.
+
+    Privacy: includes only log files and a plain-text summary.
+    Never includes products.db, license.json, mercari_session.json,
+    or chrome-profile/.
+    """
+    if _session_state != "valid":
+        return redirect("/login")
+
+    import zipfile
+    import glob
+
+    logs_dir = _LOG_DIR or os.path.join(
+        os.path.dirname(os.path.abspath(DB_NAME)), "logs"
+    )
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"MIAInventory_DiagnosticLogs_{ts}.zip"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # Include all rotated log files
+        for log_path in sorted(glob.glob(os.path.join(logs_dir, "app-runtime.log*"))):
+            zf.write(log_path, os.path.basename(log_path))
+
+        # Include plain-text diagnostic summary
+        import platform as _pl
+        summary_lines = [
+            "MIA Inventory — 診断サマリー",
+            "=" * 40,
+            f"バージョン    : {APP_VERSION}",
+            f"OS            : {_pl.system()} {_pl.release()} ({_pl.machine()})",
+            f"Python        : {_pl.python_version()}",
+            f"データ保存先  : {os.path.dirname(os.path.abspath(DB_NAME)) if DB_NAME else 'unknown'}",
+            f"ログ保存先    : {logs_dir}",
+            f"ポート        : 5050",
+            f"ログイン状態  : {_session_state}",
+            f"最終ログイン  : {_session_last_login or '不明'}",
+            f"エクスポート時刻: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "注意: このファイルには認証情報・パスワード・Cookie は含まれません。",
+        ]
+        zf.writestr("diagnostic_summary.txt", "\n".join(summary_lines))
+
+    buf.seek(0)
+    _logger.info("[support] 診断ログ ZIP を生成しました: %s", zip_name)
+    return Response(
+        buf.getvalue(),
+        status=200,
+        headers={
+            "Content-Type": "application/zip",
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# iPhone companion API — token management
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/reset-token", methods=["POST"])
+def settings_reset_token():
+    if _session_state != "valid":
+        return redirect("/login")
+    _reset_api_token()
+    return redirect("/settings?tok_reset=1")
+
+
+# ---------------------------------------------------------------------------
+# iPhone companion API — JSON endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/api/ping")
+def api_ping():
+    """Health-check endpoint — no auth required."""
+    return {"ok": True, "version": APP_VERSION, "app": "MIA Inventory"}
+
+
+@app.route("/api/stats")
+def api_stats():
+    err = _require_api_token()
+    if err:
+        return err
+    stats = _get_kpi_stats()
+    return {k: stats[k] for k in
+            ("total", "active", "stopped", "trading", "sold", "last_sync")}
+
+
+@app.route("/api/products")
+def api_products():
+    err = _require_api_token()
+    if err:
+        return err
+    q        = request.args.get("q", "")
+    status_f = request.args.get("status", "")
+    statuses = [status_f] if status_f else None
+    rows     = _query_products(q=q, statuses=statuses)
+    items = []
+    for title, price, item_url, created_at, synced_at, status, vis in rows:
+        item_id = item_url.rstrip("/").split("/")[-1] if item_url else ""
+        items.append({
+            "id":           item_id,
+            "title":        title,
+            "price":        price,
+            "price_int":    _parse_price_int(price),
+            "status":       status,
+            "visibility":   vis or "",
+            "item_url":     item_url,
+            "created_at":   created_at or "",
+            "synced_at":    synced_at or "",
+        })
+    return {"count": len(items), "items": items}
+
+
+@app.route("/api/products/<item_id>")
+def api_product_detail(item_id):
+    err = _require_api_token()
+    if err:
+        return err
+    if not item_id or not re.match(r'^[a-zA-Z0-9_\-]+$', item_id):
+        return Response('{"error":"invalid id"}', status=400,
+                        mimetype="application/json")
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, title, price, item_url, created_at, synced_at, "
+            "       status, visibility_status, raw_text "
+            "FROM mercari_products WHERE item_url LIKE ?",
+            (f"%{item_id}",),
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except Exception as exc:
+        return Response(f'{{"error":"{exc}"}}', status=500,
+                        mimetype="application/json")
+    if not row:
+        return Response('{"error":"not found"}', status=404,
+                        mimetype="application/json")
+    db_id, title, price, item_url, created_at, synced_at, status, vis, raw_text = row
+    return {
+        "id":          item_id,
+        "db_id":       db_id,
+        "title":       title,
+        "price":       price,
+        "price_int":   _parse_price_int(price),
+        "status":      status,
+        "visibility":  vis or "",
+        "item_url":    item_url,
+        "created_at":  created_at or "",
+        "synced_at":   synced_at or "",
+    }
+
+
+@app.route("/api/search")
+def api_search():
+    err = _require_api_token()
+    if err:
+        return err
+    q = request.args.get("q", "").strip()
+    if not q:
+        return {"count": 0, "items": []}
+    rows  = _query_products(q=q)
+    items = []
+    for title, price, item_url, created_at, synced_at, status, vis in rows:
+        item_id = item_url.rstrip("/").split("/")[-1] if item_url else ""
+        items.append({
+            "id":        item_id,
+            "title":     title,
+            "price":     price,
+            "price_int": _parse_price_int(price),
+            "status":    status,
+            "item_url":  item_url,
+        })
+    return {"count": len(items), "items": items}
+
+
+@app.route("/api/sync/status")
+def api_sync_status():
+    err = _require_api_token()
+    if err:
+        return err
+    return {
+        "running":  _sync_progress.get("running", False),
+        "done":     _sync_progress.get("done", True),
+        "step":     _sync_progress.get("step", ""),
+        "fetched":  _sync_progress.get("fetched", 0),
+        "error":    _sync_progress.get("error", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2926,7 +3671,7 @@ def parse_listing_text(text):
                     created_at = line
                 break
 
-    ignore = {"¥"} | INVALID_TITLES | _DETECT_STATUSES
+    ignore = {"¥"} | INVALID_TITLES | _DETECT_STATUSES | _TRANSACTION_STATUS_TEXTS
     for line in reversed(lines):
         if line in ignore:
             continue
@@ -2943,7 +3688,12 @@ def parse_listing_text(text):
 
 
 def is_valid_title(title):
-    return bool(title) and title not in INVALID_TITLES and not title.replace(",", "").isdigit()
+    return (
+        bool(title)
+        and title not in INVALID_TITLES
+        and title not in _TRANSACTION_STATUS_TEXTS
+        and not title.replace(",", "").isdigit()
+    )
 
 
 def _is_valid_price(price: str) -> bool:
@@ -2955,22 +3705,71 @@ def _is_valid_price(price: str) -> bool:
 
 
 def _clear_profile_lock() -> None:
-    """Remove stale Chrome singleton lock files so a new instance can start.
+    """Kill Chrome processes holding the app profile and remove all stale lock
+    files so that a new Selenium Chrome instance can open the profile cleanly.
 
-    Chrome writes lock files (SingletonLock, SingletonCookie, SingletonSocket)
-    into the user-data-dir. If Chrome crashes or is force-killed these remain
-    and prevent a new Chrome process from using the same profile directory.
+    Cleans: SingletonLock, SingletonCookie, SingletonSocket,
+            Default/DevToolsActivePort, DevToolsActivePort (root level).
+    Kills any Chrome process whose command-line references CHROME_PROFILE_DIR.
     """
     if not CHROME_PROFILE_DIR:
         return
-    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+
+    _logger.info("[profile] プロファイル準備: %s", CHROME_PROFILE_DIR)
+
+    # ── Kill Chrome processes using our profile ───────────────────────────────
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["pgrep", "-f", CHROME_PROFILE_DIR],
+            capture_output=True, text=True, timeout=3,
+        )
+        pids = [p.strip() for p in result.stdout.splitlines() if p.strip()]
+        if pids:
+            _logger.warning("[profile] プロファイル使用中の Chrome プロセス: PID=%s — 強制終了", pids)
+            for pid in pids:
+                try:
+                    _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
+                except Exception:
+                    pass
+            time.sleep(0.8)
+        else:
+            _logger.info("[profile] 使用中の Chrome プロセスなし")
+    except Exception as exc:
+        _logger.warning("[profile] Chrome プロセス検索エラー: %s", exc)
+
+    # ── Remove stale lock / port files ────────────────────────────────────────
+    lock_files = [
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        os.path.join("Default", "DevToolsActivePort"),
+        "DevToolsActivePort",
+    ]
+    cleaned = []
+    for lock_name in lock_files:
         lock_path = os.path.join(CHROME_PROFILE_DIR, lock_name)
         try:
             if os.path.exists(lock_path) or os.path.islink(lock_path):
                 os.remove(lock_path)
-                print(f"[driver] プロファイルロック削除: {lock_name}")
-        except OSError:
-            pass
+                cleaned.append(lock_name)
+        except OSError as exc:
+            _logger.warning("[profile] ロックファイル削除失敗: %s (%s)", lock_name, exc)
+
+    if cleaned:
+        _logger.info("[profile] 削除: %s", ", ".join(cleaned))
+    else:
+        _logger.info("[profile] 削除するロックファイルなし")
+
+    # ── Writability check ─────────────────────────────────────────────────────
+    try:
+        _test = os.path.join(CHROME_PROFILE_DIR, ".mia_write_test")
+        with open(_test, "w") as _f:
+            _f.write("ok")
+        os.remove(_test)
+        _logger.info("[profile] 書き込み可能を確認")
+    except Exception as exc:
+        _logger.error("[profile] プロファイルへの書き込み不可: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3221,10 +4020,16 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
 
 
 def load_all_listings(driver, selected_statuses):
-    """Load items for every selected status page, deduplicating by URL."""
+    """Load items for every selected status page, deduplicating by URL.
+
+    Returns (all_items, counts, scraped_urls_by_status).
+    scraped_urls_by_status maps each status to the set of item URLs scraped
+    for that status — used by reconciliation to detect stale DB records.
+    """
     all_items = []
     seen_urls = set()
     counts = {}
+    scraped_urls_by_status: dict = {}
 
     _sync_progress["total_steps"] = len(selected_statuses)
 
@@ -3241,6 +4046,7 @@ def load_all_listings(driver, selected_statuses):
         seen_urls.update(i["url"] for i in new_items)
         all_items.extend(new_items)
         counts[status] = len(new_items)
+        scraped_urls_by_status[status] = {i["url"] for i in new_items}
 
         _sync_progress["fetched"] = len(all_items)
 
@@ -3248,7 +4054,7 @@ def load_all_listings(driver, selected_statuses):
     for s in selected_statuses:
         print(f"  {s}: {counts.get(s, 0)}")
     print(f"  合計: {len(all_items)} 件")
-    return all_items, counts
+    return all_items, counts, scraped_urls_by_status
 
 
 # ---------------------------------------------------------------------------
@@ -3305,6 +4111,15 @@ def save_or_update_product(item_url, title, price, status, created_at, raw_text,
 
     if row:
         _, old_title, old_price, old_status, old_created_at, old_vis = row
+
+        # Safety net: never overwrite a valid stored title with a transaction
+        # workflow text that slipped through parse-level filtering.
+        if title in _TRANSACTION_STATUS_TEXTS and is_valid_title(old_title):
+            _logger.warning(
+                "[scrape] rejected status-like text as product title: %r (url=%s)",
+                title, item_url,
+            )
+            title = old_title
 
         changes = []
         if _norm_str(old_title) != _norm_str(title):
@@ -3447,6 +4262,10 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
         # Persistent profile: Mercari session and cookies survive across runs
         if CHROME_PROFILE_DIR:
             os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+            _logger.info("[profile] プロファイル: %s", CHROME_PROFILE_DIR)
+            # Clean stale locks and kill Chrome processes holding the profile
+            # BEFORE the first launch attempt — not just on retry.
+            _clear_profile_lock()
             opts.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
             opts.add_argument("--profile-directory=Default")
 
@@ -3455,64 +4274,84 @@ def _make_chrome_driver(headless=False) -> "webdriver.Chrome":
     # call fixes that and sets SE_MANAGER_PATH so Selenium always finds it.
     _ensure_selenium_manager()
 
+    def _launch_chrome(launch_opts, label="main"):
+        """Spawn Chrome in a daemon thread; return driver or raise on failure/timeout."""
+        import queue as _q
+        _result_q: _q.Queue = _q.Queue(maxsize=1)
+
+        def _chrome_worker(_o=launch_opts, _rq=_result_q):
+            try:
+                _rq.put(("ok", webdriver.Chrome(_o)))
+            except Exception as _e:
+                _rq.put(("err", _e))
+
+        threading.Thread(target=_chrome_worker, daemon=True,
+                         name=f"chrome-{label}").start()
+        try:
+            _status, _val = _result_q.get(timeout=LAUNCH_TIMEOUT)
+        except _q.Empty:
+            raise RuntimeError(
+                f"Chrome の起動が {LAUNCH_TIMEOUT} 秒以内に完了しませんでした。\n"
+                "Chrome または ChromeDriver が応答していない可能性があります。\n"
+                "もう一度試すか、PC を再起動してください。"
+            )
+        if _status == "err":
+            raise _val
+        return _val
+
     # Attempt to start Chrome; retry once with extra cleanup for visible driver.
-    # Each attempt is capped at LAUNCH_TIMEOUT seconds so selenium-manager
-    # download hangs do not block the login thread forever.
-    #
-    # IMPORTANT: we use a fresh threading.Thread + queue.Queue per attempt
-    # instead of a shared ThreadPoolExecutor(max_workers=1).  A shared single-
-    # worker executor causes a permanent deadlock: when a timeout fires, the
-    # worker thread is still running webdriver.Chrome(), so every subsequent
-    # submit() queues behind it and also times out.  A fresh thread starts
-    # immediately and independently each time.
-    import queue as _q
-    LAUNCH_TIMEOUT = 45
+    LAUNCH_TIMEOUT = 90
     max_attempts = 2 if not headless else 1
     last_exc: Exception | None = None
+    driver = None
     for attempt in range(max_attempts):
-        print(f"[driver] Chrome起動中 (attempt {attempt + 1}/{max_attempts}) …")
+        _logger.info("[selenium] Chrome 起動試行 %d/%d (headless=%s)",
+                     attempt + 1, max_attempts, headless)
         try:
-            _result_q: _q.Queue = _q.Queue(maxsize=1)
-
-            def _chrome_worker(_o=opts, _rq=_result_q):
-                try:
-                    _rq.put(("ok", webdriver.Chrome(_o)))
-                except Exception as _e:
-                    _rq.put(("err", _e))
-
-            _t = threading.Thread(target=_chrome_worker, daemon=True,
-                                  name=f"chrome-launch-{attempt}")
-            _t.start()
-            try:
-                _status, _val = _result_q.get(timeout=LAUNCH_TIMEOUT)
-            except _q.Empty:
-                raise RuntimeError(
-                    f"Chrome の起動が {LAUNCH_TIMEOUT} 秒以内に完了しませんでした。"
-                    " selenium-manager がネットワークに接続できない可能性があります。"
-                ) from None
-            if _status == "err":
-                raise _val
-            driver = _val
+            driver = _launch_chrome(opts, label=f"attempt{attempt + 1}")
+            _logger.info("[selenium] Chrome 起動成功 (attempt %d)", attempt + 1)
             break
         except Exception as exc:
             last_exc = exc
+            _logger.error("[selenium] Chrome 起動失敗 (attempt %d): %s", attempt + 1, exc)
             print(f"[driver] Chrome起動失敗 (attempt {attempt + 1}/{max_attempts}): {exc}")
             if attempt == 0 and not headless:
-                # First failure on visible driver: kill orphans, clear locks, retry
                 _kill_orphan_chromedriver()
                 _clear_profile_lock()
                 time.sleep(1.0)
-    else:
+
+    # ── Temp-profile fallback ─────────────────────────────────────────────────
+    # If both profile-based attempts failed, try once more with a fresh
+    # temporary profile (no --user-data-dir).  Cookies will be injected after
+    # login from the JSON backup, so the user does not lose their session.
+    if driver is None and not headless and CHROME_PROFILE_DIR:
+        _logger.warning("[selenium] メインプロファイルで起動失敗 — 一時プロファイルで再試行")
+        tmp_opts = Options()
+        tmp_opts.add_argument("--disable-blink-features=AutomationControlled")
+        tmp_opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        tmp_opts.add_experimental_option("useAutomationExtension", False)
+        tmp_opts.add_argument("--start-maximized")
+        tmp_opts.add_argument("--no-first-run")
+        tmp_opts.add_argument("--no-default-browser-check")
+        try:
+            driver = _launch_chrome(tmp_opts, label="tmp")
+            _logger.info("[selenium] 一時プロファイルで Chrome 起動成功")
+        except Exception as exc:
+            last_exc = exc
+            _logger.error("[selenium] 一時プロファイルでも Chrome 起動失敗: %s", exc)
+
+    if driver is None:
         raise RuntimeError(
             "Chrome の自動ドライバーセットアップに失敗しました。\n"
             "Google Chrome がインストールされていることを確認してください。\n"
             "https://www.google.com/chrome/"
         ) from last_exc
 
-    # Limit how long driver.get() will wait for a page to load (protects against
-    # Mercari pages that hang on a slow/stuck resource).
+    # Log chromedriver PID for targeted cleanup on shutdown / crash recovery
+    global _chromedriver_pid
     try:
-        driver.set_page_load_timeout(30)
+        _chromedriver_pid = driver.service.process.pid
+        _logger.info("[selenium] chromedriver PID: %s", _chromedriver_pid)
     except Exception:
         pass
 
@@ -3624,43 +4463,178 @@ def click_login_button_if_exists(driver):
     print("[login] ログインボタンが見つかりません — 手動でクリックしてください")
 
 
-def wait_for_login(driver, timeout=120):
-    """Poll until Mercari login is detected via URL change.
+def _is_authenticated_dom(driver) -> bool:
+    """Return True if jp.mercari.com is showing authenticated-only UI elements.
 
-    Success: URL navigates away from /login and /auth pages.
-    The DOM-fallback (absence of form inputs) was removed because Mercari's
-    React SPA does not render standard input[type='email'] immediately after
-    driver.get(), causing a false positive on the first poll iteration.
-    The fast-path in _do_login() already handles the "already logged in" case,
-    so by the time this function runs the user definitely needs to log in.
+    Uses a wide set of CSS selectors plus a JavaScript fallback that inspects
+    page text and form state. Logs every result so failed matches can be
+    diagnosed and new selectors can be added from the output.
     """
-    print("[login] ブラウザで Mercari にログインしてください（最大 2 分待機）")
-    deadline   = time.time() + timeout
-    last_log   = time.time()
-    iteration  = 0
-    while time.time() < deadline:
+    try:
+        from selenium.webdriver.common.by import By as _By
+
+        # ── Log current page state ────────────────────────────────────────────
+        cur_url, page_title = "?", "?"
         try:
-            url = driver.current_url
+            cur_url   = driver.current_url
+            page_title = driver.title
+        except Exception:
+            pass
+        _logger.info("[login] DOM check — URL: %s | title: %s", cur_url, page_title)
 
-            if ("mercari.com" in url
-                    and "/login" not in url
-                    and "/auth"  not in url):
-                time.sleep(1)
-                print(f"[login] ログイン確認（URL）: {url}")
-                return
+        # ── CSS selector sweep ────────────────────────────────────────────────
+        # Confirmed on live jp.mercari.com (2026-05-06):
+        #   CONFIRMED HIT:  a[href*='/mypage'] (3 elements) — auth-only nav link
+        #   CONFIRMED HIT:  [data-testid='badge'] (1 element) — notification/account badge
+        # These are listed first. Remaining selectors are speculative fallbacks.
+        # Intentionally excluded: a[href*='/sell'] — exists on unauthenticated pages.
+        # Intentionally excluded: header img / nav img — matches Mercari logo too.
+        auth_selectors = [
+            # ── Confirmed auth-only (from live DOM probe) ──────────────────
+            "a[href*='/mypage']",            # mypage nav link; 3 hits confirmed
+            "[data-testid='badge']",         # notification/account badge; 1 hit confirmed
+            # ── Likely auth-only (speculative; not yet confirmed) ──────────
+            "[data-testid='user-icon']",
+            "[data-testid='account-icon']",
+            "[data-testid='header-user-icon']",
+            "[data-testid='notification-icon']",
+            "[data-testid='likes-icon']",
+            "[data-testid='account-name']",
+            "[data-testid='user-name']",
+            "[data-testid='list-button']",
+            "[data-testid='sell-button']",
+            "[aria-label='マイページ']",
+            "[aria-label='通知']",
+            "[aria-label='いいね']",
+            "[aria-label='出品']",
+            "[aria-label='アカウント']",
+            "a[href='/mypage']",
+            "a[href*='/mypage/listing']",
+            "a[href*='/logout']",
+            "a[href*='logout']",
+            "mer-navigation-button",
+            "mer-icon-button",
+        ]
 
-            if time.time() - last_log >= 10:
-                remaining = int(deadline - time.time())
-                print(f"[login] 待機中… URL={url} (残り {remaining}s)")
-                last_log = time.time()
+        hit_selectors = []
+        miss_selectors = []
+        for sel in auth_selectors:
+            try:
+                count = len(driver.find_elements(_By.CSS_SELECTOR, sel))
+                if count:
+                    hit_selectors.append(f"{sel}({count})")
+                else:
+                    miss_selectors.append(sel)
+            except Exception as _e:
+                miss_selectors.append(f"{sel}[err:{_e}]")
 
+        _logger.info("[login] selector hits: %s", hit_selectors or "none")
+        _logger.info("[login] selector misses: %s", miss_selectors)
+
+        if hit_selectors:
+            _logger.info("[login] authenticated selector found: %s", hit_selectors[0])
+            return True
+
+        # ── JavaScript fallback ───────────────────────────────────────────────
+        _logger.warning("[login] no CSS selector matched — running JS fallback")
+        try:
+            js_result = driver.execute_script("""
+                var body  = document.body ? document.body.innerText : '';
+                var links = Array.from(document.querySelectorAll('a[href]'))
+                                 .map(function(a){ return a.getAttribute('href'); })
+                                 .filter(function(h){ return h && h.length < 120; })
+                                 .slice(0, 50);
+                var tids  = Array.from(document.querySelectorAll('[data-testid]'))
+                                 .map(function(e){ return e.dataset.testid; })
+                                 .slice(0, 40);
+                return {
+                    hasLogout:      body.includes('ログアウト'),
+                    hasMypage:      body.includes('マイページ'),
+                    hasEmailInput:  !!document.querySelector('input[type=email]'),
+                    hasPasswordInput: !!document.querySelector('input[type=password]'),
+                    links:          links,
+                    dataTestIds:    tids
+                };
+            """)
+            _logger.info("[login] JS result: hasLogout=%s hasMypage=%s hasEmailInput=%s "
+                         "hasPasswordInput=%s",
+                         js_result.get('hasLogout'), js_result.get('hasMypage'),
+                         js_result.get('hasEmailInput'), js_result.get('hasPasswordInput'))
+            _logger.info("[login] JS links: %s", js_result.get('links', []))
+            _logger.info("[login] JS data-testids: %s", js_result.get('dataTestIds', []))
+
+            # Confirmed authenticated via text content
+            if js_result.get('hasLogout'):
+                _logger.info("[login] authenticated selector found: 'ログアウト' text in page")
+                return True
+            if js_result.get('hasMypage') and not js_result.get('hasEmailInput'):
+                _logger.info("[login] authenticated selector found: 'マイページ' text without login form")
+                return True
+        except Exception as js_exc:
+            _logger.warning("[login] JS fallback error: %s", js_exc)
+
+        # ── Header HTML snapshot (for selector debugging) ─────────────────────
+        try:
+            snapshot = driver.execute_script("""
+                var el = document.querySelector('header')
+                      || document.querySelector('[class*="Header"]')
+                      || document.querySelector('[class*="header"]')
+                      || document.querySelector('nav');
+                return el ? el.outerHTML.substring(0, 3000) : '(no header/nav found)';
+            """)
+            _logger.info("[login] header HTML snapshot:\n%s", snapshot)
         except Exception:
             pass
 
-        iteration += 1
+    except Exception as outer_exc:
+        _logger.warning("[login] _is_authenticated_dom outer error: %s", outer_exc)
+
+    return False
+
+
+def wait_for_login(driver, timeout=300):
+    """Poll until jp.mercari.com confirms an authenticated session.
+
+    Calls _is_authenticated_dom() on every 2-second cycle regardless of whether
+    the URL is still at /login.  Mercari's SPA renders logged-in UI at the /login
+    URL without redirecting, so a URL guard here would cause the poller to miss
+    the already-authenticated state.
+
+    If Chrome drifts to another domain it is redirected back to jp.mercari.com/login.
+    Raises TimeoutError after `timeout` seconds.
+    """
+    _logger.info("[login] waiting for authenticated session... (timeout=%ds)", timeout)
+    print("ブラウザで jp.mercari.com にログインしてください。")
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            cur = driver.current_url
+
+            # Wrong domain — redirect back and keep waiting
+            if cur and "jp.mercari.com" not in cur:
+                _logger.warning(
+                    "[login] wrong domain detected (%s) — redirecting to jp.mercari.com/login", cur
+                )
+                driver.get("https://jp.mercari.com/login")
+                time.sleep(2)
+                continue
+
+            # Run DOM + JS authentication check on every cycle.
+            # This works whether the URL is /login or any other jp.mercari.com page.
+            _logger.info("[login] waiting for authenticated session... (URL: %s)", cur)
+            if _is_authenticated_dom(driver):
+                _logger.info("[login] login confirmed (URL: %s)", cur)
+                print("ログイン確認完了。セッションを保存します...")
+                return
+
+        except Exception as exc:
+            _logger.debug("[login] poll error (ignored): %s", exc)
+
         time.sleep(2)
 
-    raise TimeoutError("ログインがタイムアウトしました（2 分）。再試行してください。")
+    _logger.error("[login] timeout waiting for login")
+    raise TimeoutError("ログインがタイムアウトしました（5 分）。ボタンを押して再試行してください。")
 
 
 def _check_session_background() -> None:
@@ -3694,34 +4668,43 @@ def _check_session_background() -> None:
 def _do_login(force_relogin: bool = False) -> None:
     """Perform interactive Mercari login in a background thread.
 
-    Brings Chrome to screen, navigates to the login page, waits for the user
-    to complete login, saves cookies, then moves Chrome off-screen.
-
-    State transitions:
-      success             → "valid"
-      Chrome launch error → "error"  (shows retry UI)
-      user timeout        → "invalid" (login button reappears)
-
-    The try/finally guarantees that _session_state always leaves "logging_in"
-    even if an unhandled exception escapes all except clauses.
+    Sets _session_state to "valid" on success, "error" on Chrome launch failure,
+    "invalid" on login timeout or other errors.
     """
     global _session_state, _login_error_msg
-    print(f"[login] ログインスレッド開始 (force_relogin={force_relogin})")
-
-    # Clean up any stale app process on port 5050 BEFORE launching Chrome.
-    # Runs inside the background thread so the HTTP redirect fires immediately.
-    _cleanup_stale_port_owner(5050)
-
+    _logger.info("[login] _do_login 開始 (force_relogin=%s, profile=%s)",
+                 force_relogin, CHROME_PROFILE_DIR)
     try:
-        print("[login] Chrome / Selenium 起動中…")
-        driver = _get_or_create_driver()
-        print(f"[login] Chrome 起動完了 (session_id={driver.session_id})")
+        try:
+            driver = _get_or_create_driver()
+        except Exception as exc:
+            msg = str(exc).split("\n")[0]
+            print(f"[login] Chrome起動失敗: {exc}")
+            _logger.error("[login] Chrome 起動失敗: %s", exc)
+            _login_error_msg = f"Chrome の起動に失敗しました: {msg}"
+            _session_state = "error"
+            return
 
         try:
             driver.maximize_window()
             driver.set_window_position(0, 0)
         except Exception:
             pass
+
+        # macOS: bring Chrome to the foreground so the user sees the login page.
+        # When a daemon thread launches Chrome via Selenium, macOS focus-stealing
+        # prevention keeps the new window behind the current frontmost app.
+        # osascript 'activate' is the only reliable way to override this.
+        if platform.system() == "Darwin":
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["osascript", "-e", 'tell application "Google Chrome" to activate'],
+                    timeout=3, capture_output=True,
+                )
+                _logger.info("[login] Chrome を前面に移動しました (osascript)")
+            except Exception:
+                pass
 
         if force_relogin:
             try:
@@ -3754,33 +4737,57 @@ def _do_login(force_relogin: bool = False) -> None:
             except SeleniumTimeoutException:
                 print("[login] mypage 読み込みタイムアウト — ログインページへ進みます")
 
-        print("[login] Mercari ログインページへ移動中…")
-        try:
+        _logger.info("[login] jp.mercari.com/login に移動")
+        driver.get("https://jp.mercari.com/login")
+        time.sleep(5)  # allow auto-redirect if existing Mercari session
+
+        cur = driver.current_url
+        _logger.info("[login] ナビゲーション後 URL: %s", cur)
+
+        if "jp.mercari.com" not in cur:
+            # Unexpected domain — navigate back before waiting
+            _logger.warning("[login] 想定外の URL (%s) — jp.mercari.com/login に戻します", cur)
             driver.get("https://jp.mercari.com/login")
-        except SeleniumTimeoutException:
-            print("[login] ログインページ読み込みタイムアウト — 部分読み込みで継続")
-        print(f"[login] 現在のURL: {driver.current_url}")
-        click_login_button_if_exists(driver)
-        wait_for_login(driver)
+            time.sleep(2)
+            cur = driver.current_url
+
+        if "jp.mercari.com" in cur and "login" not in cur:
+            # Mercari auto-redirected away from /login → existing authenticated session.
+            # Verify with DOM check; if it fails we still accept the URL change as auth.
+            _logger.info("[login] URL-based session detected (%s) — verifying...", cur)
+            time.sleep(2)  # give SPA a moment to finish rendering
+            if _is_authenticated_dom(driver):
+                _logger.info("[login] login confirmed (existing session, DOM verified)")
+            else:
+                _logger.info("[login] login confirmed (existing session, URL-only — DOM pending)")
+        else:
+            # Still on /login — wait for user to complete login manually.
+            # DOM check is intentionally NOT used here: unreliable selectors exist on
+            # the unauthenticated login page (e.g. sell links, promo elements).
+            _logger.info("[login] login page visible — waiting for user to authenticate")
+            wait_for_login(driver)
         _save_session_cookies(driver)
         try:
             driver.set_window_position(-3000, 0)
         except Exception:
             pass
         _session_state = "valid"
+        _logger.info("[login] ログイン完了 — セッション有効")
         print("[login] ログイン完了 — セッション有効")
-
-    except RuntimeError as exc:
-        # Chrome failed to start — show actionable error UI
-        msg = str(exc)
-        print(f"[login] Chrome起動エラー: {msg}")
-        _login_error_msg = "ブラウザを起動できませんでした。Google Chrome がインストールされていることを確認して再試行してください。"
+    except Exception as exc:
+        import traceback
+        print(f"[login] ログイン失敗: {exc}")
+        _logger.error("[login] ログイン失敗: %s\n%s", exc, traceback.format_exc())
+        if isinstance(exc, TimeoutError):
+            _login_error_msg = "ログインがタイムアウトしました（5 分）。ボタンを押して再試行してください。"
+        elif not _login_error_msg:
+            _login_error_msg = f"ログインに失敗しました: {str(exc).split(chr(10))[0]}"
         _session_state = "error"
-
-    except TimeoutError as exc:
-        # wait_for_login timed out — user did not complete login; show retry button
-        print(f"[login] ログインタイムアウト: {exc}")
-        _session_state = "invalid"
+    finally:
+        if _session_state == "logging_in":
+            print("[login] 警告: ログインスレッドが logging_in のまま終了 — invalid にリセット")
+            _logger.warning("[login] logging_in のまま終了 — invalid にリセット")
+            _session_state = "invalid"
 
     except Exception as exc:
         msg = str(exc)
@@ -3831,15 +4838,18 @@ def _clear_session() -> None:
             print(f"[session] クッキーファイル削除失敗: {exc}")
 
     # Delete the app-specific Chrome profile directory.
-    # Guard: the path must be inside ~/Library/Application Support/MIAInventory/
-    _app_support = os.path.join(
-        os.path.expanduser("~"), "Library", "Application Support", "MIAInventory"
-    )
+    # Guard: the path must be inside the app's Application Support folder.
+    # Accept both the current name (MIA Inventory) and the legacy name
+    # (MercariInventory) so cleanup works for users upgrading from old builds.
+    _lib = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    _allowed_roots = [
+        os.path.realpath(os.path.join(_lib, "MIA Inventory")),
+        os.path.realpath(os.path.join(_lib, "MercariInventory")),
+    ]
+    _profile_real = os.path.realpath(CHROME_PROFILE_DIR) if CHROME_PROFILE_DIR else ""
     if (CHROME_PROFILE_DIR
             and os.path.isdir(CHROME_PROFILE_DIR)
-            and os.path.realpath(CHROME_PROFILE_DIR).startswith(
-                os.path.realpath(_app_support)
-            )):
+            and any(_profile_real.startswith(r) for r in _allowed_roots)):
         import shutil
         try:
             shutil.rmtree(CHROME_PROFILE_DIR, ignore_errors=False)
@@ -3852,6 +4862,114 @@ def _clear_session() -> None:
     _session_last_login = ""
     _session_state = "invalid"
     print("[session] セッションデータを削除しました — ログアウト状態")
+
+
+# ---------------------------------------------------------------------------
+# Status reconciliation
+# ---------------------------------------------------------------------------
+
+def _reconcile_stale_active_listings(
+    selected_statuses: list,
+    scraped_urls_by_status: dict,
+) -> dict:
+    """Compare scraped 出品中 results against DB and fix stale active records.
+
+    Only runs when 出品中 was included in the sync. Never deletes records;
+    only updates status or marks unknown. Returns a summary dict.
+    """
+    _ACTIVE = "出品中"
+    result = {
+        "ran": False,
+        "db_active_before": 0,
+        "scraped_active": 0,
+        "stale_count": 0,
+        "updated_to_sold": 0,
+        "updated_to_trading": 0,
+        "updated_to_history": 0,
+        "marked_unknown": 0,
+        "stale_item_ids": [],
+    }
+
+    if _ACTIVE not in selected_statuses:
+        _logger.info("[reconcile] 出品中 が同期対象外のためスキップ")
+        return result
+
+    result["ran"] = True
+    scraped_active = scraped_urls_by_status.get(_ACTIVE, set())
+    result["scraped_active"] = len(scraped_active)
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+
+    # All DB records currently marked 出品中
+    cur.execute(
+        "SELECT item_url FROM mercari_products WHERE status = ?", (_ACTIVE,)
+    )
+    db_active_urls = {row[0] for row in cur.fetchall()}
+    result["db_active_before"] = len(db_active_urls)
+
+    stale_urls = db_active_urls - scraped_active
+    result["stale_count"] = len(stale_urls)
+
+    if not stale_urls:
+        conn.close()
+        _logger.info(
+            "[reconcile] 陳腐化レコードなし — DB出品中=%d, 取得出品中=%d",
+            result["db_active_before"], result["scraped_active"],
+        )
+        return result
+
+    _logger.info(
+        "[reconcile] 開始 — DB出品中=%d, 取得出品中=%d, 陳腐化候補=%d",
+        result["db_active_before"], result["scraped_active"], len(stale_urls),
+    )
+
+    # Build reverse-lookup sets from other scraped statuses
+    scraped_sold    = scraped_urls_by_status.get("売却済み", set())
+    scraped_trading = scraped_urls_by_status.get("取引中", set())
+    scraped_history = scraped_urls_by_status.get("販売履歴", set())
+
+    now = jst_now()
+    for url in stale_urls:
+        item_id = url.rstrip("/").split("/")[-1]
+        result["stale_item_ids"].append(item_id)
+
+        if url in scraped_sold:
+            new_status = "売却済み"
+            result["updated_to_sold"] += 1
+        elif url in scraped_trading:
+            new_status = "取引中"
+            result["updated_to_trading"] += 1
+        elif url in scraped_history:
+            new_status = "販売履歴"
+            result["updated_to_history"] += 1
+        else:
+            new_status = "状態不明"
+            result["marked_unknown"] += 1
+
+        cur.execute(
+            "UPDATE mercari_products SET status = ?, synced_at = ? WHERE item_url = ?",
+            (new_status, now, url),
+        )
+        _logger.info(
+            "[reconcile] %s → %s (item_id=%s)",
+            _ACTIVE, new_status, item_id,
+        )
+
+    conn.commit()
+    conn.close()
+
+    _logger.info(
+        "[reconcile] 完了 — 売却済み: %d, 取引中: %d, 販売履歴: %d, 状態不明: %d",
+        result["updated_to_sold"],
+        result["updated_to_trading"],
+        result["updated_to_history"],
+        result["marked_unknown"],
+    )
+    if result["stale_item_ids"]:
+        _logger.info("[reconcile] 対象 item_id: %s", ", ".join(result["stale_item_ids"]))
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3898,7 +5016,9 @@ def run_scraper(selected_statuses=None):
         pass
 
     phase1_start = time.time()
-    items, per_status_counts = load_all_listings(main_driver, selected_statuses)
+    items, per_status_counts, scraped_urls_by_status = load_all_listings(
+        main_driver, selected_statuses
+    )
     total_count = len(items)
 
     existing_map = fetch_existing_batch([item["url"] for item in items])
@@ -3982,6 +5102,13 @@ def run_scraper(selected_statuses=None):
         phase2_elapsed = time.time() - phase2_start
 
     # ------------------------------------------------------------------
+    # Reconciliation — fix stale 出品中 records
+    # ------------------------------------------------------------------
+    reconcile_result = _reconcile_stale_active_listings(
+        selected_statuses, scraped_urls_by_status
+    )
+
+    # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     total_inserted = direct_inserted + detail_inserted
@@ -3989,7 +5116,7 @@ def run_scraper(selected_statuses=None):
     total_skipped  = len(to_skip) + direct_skipped + detail_skipped
     total_elapsed  = time.time() - sync_start
 
-    # DB counts by status — confirms what is searchable after sync
+    # DB counts by status — reflects reconciled state
     _db_conn = sqlite3.connect(DB_NAME)
     _db_cur  = _db_conn.cursor()
     _db_cur.execute(
@@ -4014,6 +5141,19 @@ def run_scraper(selected_statuses=None):
     if to_fetch_detail:
         print(f"  Phase2（詳細）：  {phase2_elapsed:>6.1f} 秒")
     print(f"  合計時間：        {total_elapsed:>6.1f} 秒")
+    if reconcile_result.get("ran"):
+        print(f"\n  --- 整合性チェック ---")
+        print(f"  出品中（DB）：    {reconcile_result['db_active_before']:>4} 件")
+        print(f"  出品中（取得）：  {reconcile_result['scraped_active']:>4} 件")
+        print(f"  陳腐化検出：      {reconcile_result['stale_count']:>4} 件")
+        if reconcile_result["updated_to_sold"]:
+            print(f"    → 売却済みに更新: {reconcile_result['updated_to_sold']} 件")
+        if reconcile_result["updated_to_trading"]:
+            print(f"    → 取引中に更新:   {reconcile_result['updated_to_trading']} 件")
+        if reconcile_result["updated_to_history"]:
+            print(f"    → 販売履歴に更新: {reconcile_result['updated_to_history']} 件")
+        if reconcile_result["marked_unknown"]:
+            print(f"    → 状態不明に変更: {reconcile_result['marked_unknown']} 件")
     print(f"\n  --- DB ステータス別件数 ---")
     for _s, _c in db_counts_by_status.items():
         print(f"    {_s}: {_c}")
@@ -4021,16 +5161,17 @@ def run_scraper(selected_statuses=None):
     print(f"{'=' * 56}")
 
     _last_sync_summary = {
-        "start_jst":    start_jst,
-        "end_jst":      jst_now(),
-        "elapsed":      round(total_elapsed, 1),
-        "per_status":   per_status_counts,
-        "inserted":     total_inserted,
-        "updated":      total_updated,
-        "skipped":      total_skipped,
-        "total":        total_count,
-        "db_by_status": db_counts_by_status,
-        "db_total":     db_total,
+        "start_jst":       start_jst,
+        "end_jst":         jst_now(),
+        "elapsed":         round(total_elapsed, 1),
+        "per_status":      per_status_counts,
+        "inserted":        total_inserted,
+        "updated":         total_updated,
+        "skipped":         total_skipped,
+        "total":           total_count,
+        "db_by_status":    db_counts_by_status,
+        "db_total":        db_total,
+        "reconciliation":  reconcile_result,
     }
     # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
 
