@@ -50,31 +50,41 @@ _logger.addHandler(logging.NullHandler())
 _LOG_DIR: str = ""   # absolute path to logs/ dir; set by setup_app_logging()
 
 
-def setup_app_logging(logs_dir: str) -> None:
-    """Attach a RotatingFileHandler to the 'mia' logger.
+def setup_app_logging(logs_dir: str, launch_log_path: str = "") -> None:
+    """Attach file handlers to the 'mia' logger.
 
     Called once from main.py after the data directory is known.
-    The root logger already has handlers (set up in main._setup_logging);
-    this adds a second handler so mia.* events also appear in app-runtime.log.
+    Adds handlers for both the rotating aggregate log and the per-launch
+    session log so all mia.* events appear in both files.
     """
     global _LOG_DIR
     _LOG_DIR = logs_dir
     os.makedirs(logs_dir, exist_ok=True)
-    log_path = os.path.join(logs_dir, "app-runtime.log")
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    fh = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+
+    # Rotating aggregate log
+    fh_rotating = logging.handlers.RotatingFileHandler(
+        os.path.join(logs_dir, "app-runtime.log"),
+        maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    fh.setFormatter(fmt)
+    fh_rotating.setFormatter(fmt)
+    _logger.addHandler(fh_rotating)
+
+    # Per-launch session log (same file main.py opened for root logger)
+    if launch_log_path:
+        fh_launch = logging.FileHandler(launch_log_path, encoding="utf-8")
+        fh_launch.setFormatter(fmt)
+        _logger.addHandler(fh_launch)
 
     _logger.setLevel(logging.INFO)
-    _logger.addHandler(fh)
-    _logger.propagate = False   # root already writes to the same file
+    _logger.propagate = False   # root already writes to same files
     _logger.info("[setup] app logging initialised — log dir: %s", logs_dir)
+    if launch_log_path:
+        _logger.info("[setup] 起動ログ: %s", launch_log_path)
     _logger.info("[setup] app version: %s | OS: %s %s",
                  APP_VERSION, platform.system(), platform.release())
 
@@ -194,23 +204,28 @@ def _try_restore_session(driver) -> bool:
     profile cookies have expired but the JSON backup is still valid.
     """
     # Strategy 1: profile cookies (the normal case after first login)
+    _logger.info("[session] セッション確認 — プロファイル Cookie を試みます")
     driver.get("https://jp.mercari.com/mypage/listings")
     time.sleep(2)
     if "login" not in driver.current_url:
         print("[session] セッション有効（プロファイルのCookie）— ログイン不要")
+        _logger.info("[session] セッション有効 (Strategy 1: profile cookies)")
         _save_session_cookies(driver)
         return True
 
     # Strategy 2: inject from JSON backup file
+    _logger.info("[session] Strategy 1 失敗 — JSON Cookie で復元を試みます")
     if _inject_saved_cookies(driver):
         driver.get("https://jp.mercari.com/mypage/listings")
         time.sleep(2)
         if "login" not in driver.current_url:
             print("[session] セッション復元（JSON Cookie）— ログイン不要")
+            _logger.info("[session] セッション復元成功 (Strategy 2: JSON cookies)")
             _save_session_cookies(driver)
             return True
 
     print("[session] セッション無効 → ログインが必要です")
+    _logger.warning("[session] セッション無効 — ログインが必要です")
     return False
 
 
@@ -412,8 +427,13 @@ def _get_or_create_driver() -> "webdriver.Chrome":
             _kill_orphan_chromedriver()
 
         # _make_chrome_driver already calls _clear_profile_lock() internally
-        _logger.info("[driver] 新しい Chrome ドライバーを生成します")
+        _logger.info("[driver] ChromeDriver を初期化します")
         _singleton_driver = _make_chrome_driver(headless=False)
+        try:
+            _logger.info("[driver] ChromeDriver 初期化完了 — session_id=%s",
+                         _singleton_driver.session_id)
+        except Exception:
+            _logger.info("[driver] ChromeDriver 初期化完了")
         return _singleton_driver
 
 
@@ -1786,23 +1806,26 @@ def sync():
     }
 
     def _bg_sync():
+        import traceback as _tb
         global _sync_running, _sync_progress, _sync_stop_requested
         _sync_stop_requested = False   # clear any leftover stop flag from previous run
         _logger.info("[sync] 同期開始 — 対象ステータス: %s", selected)
+        _sync_start_ts = time.time()
         try:
             run_scraper(selected_statuses=selected)
             if _check_plan() == "free":
                 _record_sync_date()
-            _logger.info("[sync] 同期完了")
+            elapsed = round(time.time() - _sync_start_ts, 1)
+            _logger.info("[sync] 同期完了 — 所要時間: %.1f 秒", elapsed)
         except _SyncStopped:
             print("[sync] 強制停止されました")
-            _logger.info("[sync] 強制停止されました")
+            _logger.info("[sync] ユーザーにより強制停止されました")
             _sync_progress["stopped"] = True
         except Exception as exc:
-            import traceback
             print("[sync] 同期エラー:")
-            traceback.print_exc()
-            _logger.error("[sync] 同期エラー: %s\n%s", exc, traceback.format_exc())
+            _tb.print_exc()
+            # Full traceback goes to log only — never shown raw in UI
+            _logger.error("[sync] 同期エラー: %s\n%s", exc, _tb.format_exc())
             _sync_progress["error"] = str(exc).split("\n")[0][:200]
         finally:
             _sync_running = False
@@ -2004,6 +2027,7 @@ def login_use():
     global _session_state
     if _session_state == "found_session":
         _session_state = "valid"
+        _logger.info("[login] ユーザーが既存セッションを使用することを選択")
     return redirect("/")
 
 
@@ -2035,6 +2059,7 @@ def login_clear():
     global _session_state
     if _session_state == "clearing":
         return redirect("/login")
+    _logger.info("[login] セッションクリアを開始します (state=%s)", _session_state)
     _session_state = "clearing"
     threading.Thread(target=_clear_session, daemon=True, name="session-clear").start()
     return redirect("/login")
@@ -2100,7 +2125,7 @@ def open_url():
 
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
-    _logger.info("[shutdown] シャットダウンリクエスト受信 — 0.8 秒後に終了")
+    _logger.info("[shutdown] シャットダウンリクエスト受信 — アプリを終了します")
     threading.Thread(
         target=lambda: (time.sleep(0.8), os._exit(0)),
         daemon=True,
@@ -3641,10 +3666,16 @@ def load_listings_for_status(driver, status_label, pagination_timeout=6):
 
 
 def load_all_listings(driver, selected_statuses):
-    """Load items for every selected status page, deduplicating by URL."""
+    """Load items for every selected status page, deduplicating by URL.
+
+    Returns (all_items, counts, scraped_urls_by_status).
+    scraped_urls_by_status maps each status to the set of item URLs scraped
+    for that status — used by reconciliation to detect stale DB records.
+    """
     all_items = []
     seen_urls = set()
     counts = {}
+    scraped_urls_by_status: dict = {}
 
     _sync_progress["total_steps"] = len(selected_statuses)
 
@@ -3661,6 +3692,7 @@ def load_all_listings(driver, selected_statuses):
         seen_urls.update(i["url"] for i in new_items)
         all_items.extend(new_items)
         counts[status] = len(new_items)
+        scraped_urls_by_status[status] = {i["url"] for i in new_items}
 
         _sync_progress["fetched"] = len(all_items)
 
@@ -3668,7 +3700,7 @@ def load_all_listings(driver, selected_statuses):
     for s in selected_statuses:
         print(f"  {s}: {counts.get(s, 0)}")
     print(f"  合計: {len(all_items)} 件")
-    return all_items, counts
+    return all_items, counts, scraped_urls_by_status
 
 
 # ---------------------------------------------------------------------------
@@ -4430,6 +4462,114 @@ def _clear_session() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Status reconciliation
+# ---------------------------------------------------------------------------
+
+def _reconcile_stale_active_listings(
+    selected_statuses: list,
+    scraped_urls_by_status: dict,
+) -> dict:
+    """Compare scraped 出品中 results against DB and fix stale active records.
+
+    Only runs when 出品中 was included in the sync. Never deletes records;
+    only updates status or marks unknown. Returns a summary dict.
+    """
+    _ACTIVE = "出品中"
+    result = {
+        "ran": False,
+        "db_active_before": 0,
+        "scraped_active": 0,
+        "stale_count": 0,
+        "updated_to_sold": 0,
+        "updated_to_trading": 0,
+        "updated_to_history": 0,
+        "marked_unknown": 0,
+        "stale_item_ids": [],
+    }
+
+    if _ACTIVE not in selected_statuses:
+        _logger.info("[reconcile] 出品中 が同期対象外のためスキップ")
+        return result
+
+    result["ran"] = True
+    scraped_active = scraped_urls_by_status.get(_ACTIVE, set())
+    result["scraped_active"] = len(scraped_active)
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+
+    # All DB records currently marked 出品中
+    cur.execute(
+        "SELECT item_url FROM mercari_products WHERE status = ?", (_ACTIVE,)
+    )
+    db_active_urls = {row[0] for row in cur.fetchall()}
+    result["db_active_before"] = len(db_active_urls)
+
+    stale_urls = db_active_urls - scraped_active
+    result["stale_count"] = len(stale_urls)
+
+    if not stale_urls:
+        conn.close()
+        _logger.info(
+            "[reconcile] 陳腐化レコードなし — DB出品中=%d, 取得出品中=%d",
+            result["db_active_before"], result["scraped_active"],
+        )
+        return result
+
+    _logger.info(
+        "[reconcile] 開始 — DB出品中=%d, 取得出品中=%d, 陳腐化候補=%d",
+        result["db_active_before"], result["scraped_active"], len(stale_urls),
+    )
+
+    # Build reverse-lookup sets from other scraped statuses
+    scraped_sold    = scraped_urls_by_status.get("売却済み", set())
+    scraped_trading = scraped_urls_by_status.get("取引中", set())
+    scraped_history = scraped_urls_by_status.get("販売履歴", set())
+
+    now = jst_now()
+    for url in stale_urls:
+        item_id = url.rstrip("/").split("/")[-1]
+        result["stale_item_ids"].append(item_id)
+
+        if url in scraped_sold:
+            new_status = "売却済み"
+            result["updated_to_sold"] += 1
+        elif url in scraped_trading:
+            new_status = "取引中"
+            result["updated_to_trading"] += 1
+        elif url in scraped_history:
+            new_status = "販売履歴"
+            result["updated_to_history"] += 1
+        else:
+            new_status = "状態不明"
+            result["marked_unknown"] += 1
+
+        cur.execute(
+            "UPDATE mercari_products SET status = ?, synced_at = ? WHERE item_url = ?",
+            (new_status, now, url),
+        )
+        _logger.info(
+            "[reconcile] %s → %s (item_id=%s)",
+            _ACTIVE, new_status, item_id,
+        )
+
+    conn.commit()
+    conn.close()
+
+    _logger.info(
+        "[reconcile] 完了 — 売却済み: %d, 取引中: %d, 販売履歴: %d, 状態不明: %d",
+        result["updated_to_sold"],
+        result["updated_to_trading"],
+        result["updated_to_history"],
+        result["marked_unknown"],
+    )
+    if result["stale_item_ids"]:
+        _logger.info("[reconcile] 対象 item_id: %s", ", ".join(result["stale_item_ids"]))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
 
@@ -4473,7 +4613,9 @@ def run_scraper(selected_statuses=None):
         pass
 
     phase1_start = time.time()
-    items, per_status_counts = load_all_listings(main_driver, selected_statuses)
+    items, per_status_counts, scraped_urls_by_status = load_all_listings(
+        main_driver, selected_statuses
+    )
     total_count = len(items)
 
     existing_map = fetch_existing_batch([item["url"] for item in items])
@@ -4557,6 +4699,13 @@ def run_scraper(selected_statuses=None):
         phase2_elapsed = time.time() - phase2_start
 
     # ------------------------------------------------------------------
+    # Reconciliation — fix stale 出品中 records
+    # ------------------------------------------------------------------
+    reconcile_result = _reconcile_stale_active_listings(
+        selected_statuses, scraped_urls_by_status
+    )
+
+    # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
     total_inserted = direct_inserted + detail_inserted
@@ -4564,7 +4713,7 @@ def run_scraper(selected_statuses=None):
     total_skipped  = len(to_skip) + direct_skipped + detail_skipped
     total_elapsed  = time.time() - sync_start
 
-    # DB counts by status — confirms what is searchable after sync
+    # DB counts by status — reflects reconciled state
     _db_conn = sqlite3.connect(DB_NAME)
     _db_cur  = _db_conn.cursor()
     _db_cur.execute(
@@ -4589,6 +4738,19 @@ def run_scraper(selected_statuses=None):
     if to_fetch_detail:
         print(f"  Phase2（詳細）：  {phase2_elapsed:>6.1f} 秒")
     print(f"  合計時間：        {total_elapsed:>6.1f} 秒")
+    if reconcile_result.get("ran"):
+        print(f"\n  --- 整合性チェック ---")
+        print(f"  出品中（DB）：    {reconcile_result['db_active_before']:>4} 件")
+        print(f"  出品中（取得）：  {reconcile_result['scraped_active']:>4} 件")
+        print(f"  陳腐化検出：      {reconcile_result['stale_count']:>4} 件")
+        if reconcile_result["updated_to_sold"]:
+            print(f"    → 売却済みに更新: {reconcile_result['updated_to_sold']} 件")
+        if reconcile_result["updated_to_trading"]:
+            print(f"    → 取引中に更新:   {reconcile_result['updated_to_trading']} 件")
+        if reconcile_result["updated_to_history"]:
+            print(f"    → 販売履歴に更新: {reconcile_result['updated_to_history']} 件")
+        if reconcile_result["marked_unknown"]:
+            print(f"    → 状態不明に変更: {reconcile_result['marked_unknown']} 件")
     print(f"\n  --- DB ステータス別件数 ---")
     for _s, _c in db_counts_by_status.items():
         print(f"    {_s}: {_c}")
@@ -4596,16 +4758,17 @@ def run_scraper(selected_statuses=None):
     print(f"{'=' * 56}")
 
     _last_sync_summary = {
-        "start_jst":    start_jst,
-        "end_jst":      jst_now(),
-        "elapsed":      round(total_elapsed, 1),
-        "per_status":   per_status_counts,
-        "inserted":     total_inserted,
-        "updated":      total_updated,
-        "skipped":      total_skipped,
-        "total":        total_count,
-        "db_by_status": db_counts_by_status,
-        "db_total":     db_total,
+        "start_jst":       start_jst,
+        "end_jst":         jst_now(),
+        "elapsed":         round(total_elapsed, 1),
+        "per_status":      per_status_counts,
+        "inserted":        total_inserted,
+        "updated":         total_updated,
+        "skipped":         total_skipped,
+        "total":           total_count,
+        "db_by_status":    db_counts_by_status,
+        "db_total":        db_total,
+        "reconciliation":  reconcile_result,
     }
     # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
 

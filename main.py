@@ -8,6 +8,7 @@ errors and status are surfaced via macOS dialogs and notifications.
 import logging
 import logging.handlers
 import os
+import platform
 import signal
 import socket
 import subprocess
@@ -15,6 +16,7 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime
 
 PORT = 5050
 _APP_NAME = "MIA Inventory"
@@ -25,37 +27,47 @@ _APP_NAME_LEGACY = "MercariInventory"   # old bundle name — migration source o
 # Logging
 # ---------------------------------------------------------------------------
 
-def _setup_logging(data_dir: str) -> str:
-    """Configure root logger with a rotating file handler.
+def _setup_logging(data_dir: str) -> tuple:
+    """Configure root logger with two file handlers.
 
-    Returns the logs directory path so callers can pass it to sub-modules.
+    1. logs/app-runtime.log — rotating aggregate log (preserved across launches)
+    2. logs/YYYYMMDD_HHMMSS.log — per-launch session log for troubleshooting
+
+    Returns (logs_dir, launch_log_path).
     """
     logs_dir = os.path.join(data_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
-    log_path = os.path.join(logs_dir, "app-runtime.log")
 
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_path,
-        maxBytes=5 * 1024 * 1024,   # 5 MB
+    # 1. Rotating aggregate log — backward-compatible
+    rotating_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(logs_dir, "app-runtime.log"),
+        maxBytes=5 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
     )
-    file_handler.setFormatter(fmt)
+    rotating_handler.setFormatter(fmt)
+
+    # 2. Per-launch session log — one file per app start
+    launch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    launch_log_path = os.path.join(logs_dir, f"{launch_ts}.log")
+    launch_handler = logging.FileHandler(launch_log_path, encoding="utf-8")
+    launch_handler.setFormatter(fmt)
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(fmt)
 
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
+    root.addHandler(rotating_handler)
+    root.addHandler(launch_handler)
     root.addHandler(stream_handler)
 
-    return logs_dir
+    return logs_dir, launch_log_path
 
 
 def _log(msg: str) -> None:
@@ -218,12 +230,25 @@ def _migrate_app_support_dir(data_dir: str) -> None:
 
 def main() -> None:
     data_dir = get_data_dir()
-    logs_dir = _setup_logging(data_dir)
+    logs_dir, launch_log_path = _setup_logging(data_dir)
+
+    # Resolve app version (set by build_mac.sh via _version.py injection)
+    try:
+        from _version import APP_VERSION  # noqa: PLC0415
+    except ImportError:
+        APP_VERSION = "dev"
+
+    db_path = os.path.join(data_dir, "products.db")
 
     _log("=" * 54)
-    _log("  MIA Inventory App")
+    _log("  MIA Inventory App — 起動")
+    _log(f"  バージョン:   {APP_VERSION}")
+    _log(f"  OS:           {platform.system()} {platform.release()} ({platform.machine()})")
+    _log(f"  Python:       {platform.python_version()}")
     _log(f"  データ保存先: {data_dir}")
+    _log(f"  DB パス:      {db_path}")
     _log(f"  ログ保存先:   {logs_dir}")
+    _log(f"  起動ログ:     {launch_log_path}")
     _log(f"  URL:          http://0.0.0.0:{PORT}")
     _log("=" * 54)
 
@@ -242,7 +267,7 @@ def main() -> None:
     _ms.COOKIE_FILE        = os.path.join(data_dir, "mercari_session.json")
     _ms.CHROME_PROFILE_DIR = os.path.join(data_dir, "chrome-profile")
     _ms.LICENSE_FILE       = os.path.join(data_dir, "license.json")
-    _ms.setup_app_logging(logs_dir)   # hand logs dir to Flask/sync module
+    _ms.setup_app_logging(logs_dir, launch_log_path)   # hand dirs to Flask/sync module
     flask_app    = _ms.app
     init_db      = _ms.init_db
     init_license = _ms.init_license
@@ -292,7 +317,7 @@ def main() -> None:
     deadline = time.time() + 10
     while not is_port_in_use(PORT):
         if time.time() > deadline:
-            msg = "Flask サーバーが 10 秒以内に起動しませんでした。\napp-runtime.log を確認してください。"
+            msg = "Flask サーバーが 10 秒以内に起動しませんでした。\nlogs/ フォルダ内のログファイルを確認してください。"
             _log("[startup] ERROR: Flask did not start within 10 seconds")
             _show_dialog("起動エラー", msg)
             sys.exit(1)
