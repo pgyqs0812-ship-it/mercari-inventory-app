@@ -27,16 +27,30 @@ _APP_NAME_LEGACY = "MercariInventory"   # old bundle name — migration source o
 # Logging
 # ---------------------------------------------------------------------------
 
+class _LevelRangeFilter(logging.Filter):
+    """Pass only log records whose levelno is in [min_level, max_level]."""
+
+    def __init__(self, min_level: int, max_level: int = logging.CRITICAL) -> None:
+        super().__init__()
+        self._min = min_level
+        self._max = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        return self._min <= record.levelno <= self._max
+
+
 def _setup_logging(data_dir: str) -> tuple:
-    """Configure root logger with two file handlers.
+    """Configure root logger with file handlers.
 
-    1. logs/app-runtime.log — rotating aggregate log (preserved across launches)
-    2. logs/YYYYMMDD_HHMMSS.log — per-launch session log for troubleshooting
+    Creates per-launch logs under ~/Documents/MIAInventory/logs/:
+      - app-runtime.log             rotating aggregate log (all levels)
+      - YYYYMMDD_HHMMSS.log         full per-launch session log
+      - YYYYMMDD_HHMMSS_information.log  INFO events only
+      - YYYYMMDD_HHMMSS_warning.log      WARNING events only
+      - YYYYMMDD_HHMMSS_error.log        ERROR/CRITICAL events
 
-    Logs go to ~/Documents/MIAInventory/logs/ for easy user access.
     Returns (logs_dir, launch_log_path).
     """
-    # Use Documents so users can find logs without navigating Library.
     logs_dir = os.path.join(os.path.expanduser("~"), "Documents", "MIAInventory", "logs")
     os.makedirs(logs_dir, exist_ok=True)
 
@@ -45,7 +59,7 @@ def _setup_logging(data_dir: str) -> tuple:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # 1. Rotating aggregate log — backward-compatible
+    # 1. Rotating aggregate log
     rotating_handler = logging.handlers.RotatingFileHandler(
         os.path.join(logs_dir, "app-runtime.log"),
         maxBytes=5 * 1024 * 1024,
@@ -54,11 +68,31 @@ def _setup_logging(data_dir: str) -> tuple:
     )
     rotating_handler.setFormatter(fmt)
 
-    # 2. Per-launch session log — one file per app start
+    # 2. Per-launch full session log
     launch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     launch_log_path = os.path.join(logs_dir, f"{launch_ts}.log")
     launch_handler = logging.FileHandler(launch_log_path, encoding="utf-8")
     launch_handler.setFormatter(fmt)
+
+    # 3. Per-launch categorized logs (information / warning / error)
+    info_path = os.path.join(logs_dir, f"{launch_ts}_information.log")
+    warn_path = os.path.join(logs_dir, f"{launch_ts}_warning.log")
+    err_path  = os.path.join(logs_dir, f"{launch_ts}_error.log")
+
+    for _path in (info_path, warn_path, err_path):
+        open(_path, "a", encoding="utf-8").close()  # pre-create files
+
+    info_handler = logging.FileHandler(info_path, encoding="utf-8")
+    info_handler.setFormatter(fmt)
+    info_handler.addFilter(_LevelRangeFilter(logging.INFO, logging.INFO))
+
+    warn_handler = logging.FileHandler(warn_path, encoding="utf-8")
+    warn_handler.setFormatter(fmt)
+    warn_handler.addFilter(_LevelRangeFilter(logging.WARNING, logging.WARNING))
+
+    err_handler = logging.FileHandler(err_path, encoding="utf-8")
+    err_handler.setFormatter(fmt)
+    err_handler.addFilter(_LevelRangeFilter(logging.ERROR))
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(fmt)
@@ -67,6 +101,9 @@ def _setup_logging(data_dir: str) -> tuple:
     root.setLevel(logging.INFO)
     root.addHandler(rotating_handler)
     root.addHandler(launch_handler)
+    root.addHandler(info_handler)
+    root.addHandler(warn_handler)
+    root.addHandler(err_handler)
     root.addHandler(stream_handler)
 
     return logs_dir, launch_log_path
@@ -241,6 +278,10 @@ def main() -> None:
         APP_VERSION = "dev"
 
     db_path = os.path.join(data_dir, "products.db")
+    launch_ts = os.path.splitext(os.path.basename(launch_log_path))[0]
+    info_log_path = os.path.join(logs_dir, f"{launch_ts}_information.log")
+    warn_log_path = os.path.join(logs_dir, f"{launch_ts}_warning.log")
+    err_log_path  = os.path.join(logs_dir, f"{launch_ts}_error.log")
 
     _log("=" * 54)
     _log("  MIA Inventory App — 起動")
@@ -251,6 +292,9 @@ def main() -> None:
     _log(f"  DB パス:      {db_path}")
     _log(f"  ログ保存先:   {logs_dir}")
     _log(f"  起動ログ:     {launch_log_path}")
+    _log(f"  情報ログ:     {info_log_path}")
+    _log(f"  警告ログ:     {warn_log_path}")
+    _log(f"  エラーログ:   {err_log_path}")
     _log(f"  URL:          http://0.0.0.0:{PORT}")
     _log("=" * 54)
 

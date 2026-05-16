@@ -47,17 +47,32 @@ except ImportError:
 _logger = logging.getLogger("mia")
 _logger.addHandler(logging.NullHandler())
 
-_LOG_DIR: str = ""   # absolute path to logs/ dir; set by setup_app_logging()
+_LOG_DIR:      str = ""  # absolute path to logs/ dir; set by setup_app_logging()
+_INFO_LOG_PATH: str = ""  # per-launch YYYYMMDD_HHMMSS_information.log
+_WARN_LOG_PATH: str = ""  # per-launch YYYYMMDD_HHMMSS_warning.log
+_ERR_LOG_PATH:  str = ""  # per-launch YYYYMMDD_HHMMSS_error.log
+
+
+class _LevelRangeFilter(logging.Filter):
+    """Pass only log records whose levelno is in [min_level, max_level]."""
+
+    def __init__(self, min_level: int, max_level: int = logging.CRITICAL) -> None:
+        super().__init__()
+        self._min = min_level
+        self._max = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        return self._min <= record.levelno <= self._max
 
 
 def setup_app_logging(logs_dir: str, launch_log_path: str = "") -> None:
     """Attach file handlers to the 'mia' logger.
 
     Called once from main.py after the data directory is known.
-    Adds handlers for both the rotating aggregate log and the per-launch
-    session log so all mia.* events appear in both files.
+    Creates the rotating aggregate log, per-launch session log, and three
+    categorized logs (information / warning / error) for each app launch.
     """
-    global _LOG_DIR
+    global _LOG_DIR, _INFO_LOG_PATH, _WARN_LOG_PATH, _ERR_LOG_PATH
     _LOG_DIR = logs_dir
     os.makedirs(logs_dir, exist_ok=True)
 
@@ -80,11 +95,41 @@ def setup_app_logging(logs_dir: str, launch_log_path: str = "") -> None:
         fh_launch.setFormatter(fmt)
         _logger.addHandler(fh_launch)
 
+    # Per-launch categorized logs — derived from the session log timestamp
+    if launch_log_path:
+        ts = os.path.splitext(os.path.basename(launch_log_path))[0]
+        _INFO_LOG_PATH = os.path.join(logs_dir, f"{ts}_information.log")
+        _WARN_LOG_PATH = os.path.join(logs_dir, f"{ts}_warning.log")
+        _ERR_LOG_PATH  = os.path.join(logs_dir, f"{ts}_error.log")
+
+        # Pre-create the files so they exist even on warning/error-free runs
+        for _path in (_INFO_LOG_PATH, _WARN_LOG_PATH, _ERR_LOG_PATH):
+            open(_path, "a", encoding="utf-8").close()
+
+        fh_info = logging.FileHandler(_INFO_LOG_PATH, encoding="utf-8")
+        fh_info.setFormatter(fmt)
+        fh_info.addFilter(_LevelRangeFilter(logging.INFO, logging.INFO))
+        _logger.addHandler(fh_info)
+
+        fh_warn = logging.FileHandler(_WARN_LOG_PATH, encoding="utf-8")
+        fh_warn.setFormatter(fmt)
+        fh_warn.addFilter(_LevelRangeFilter(logging.WARNING, logging.WARNING))
+        _logger.addHandler(fh_warn)
+
+        fh_err = logging.FileHandler(_ERR_LOG_PATH, encoding="utf-8")
+        fh_err.setFormatter(fmt)
+        fh_err.addFilter(_LevelRangeFilter(logging.ERROR))
+        _logger.addHandler(fh_err)
+
     _logger.setLevel(logging.INFO)
     _logger.propagate = False   # root already writes to same files
     _logger.info("[setup] app logging initialised — log dir: %s", logs_dir)
     if launch_log_path:
         _logger.info("[setup] 起動ログ: %s", launch_log_path)
+    if _INFO_LOG_PATH:
+        _logger.info("[setup] 情報ログ: %s", _INFO_LOG_PATH)
+        _logger.info("[setup] 警告ログ: %s", _WARN_LOG_PATH)
+        _logger.info("[setup] エラーログ: %s", _ERR_LOG_PATH)
     _logger.info("[setup] app version: %s | OS: %s %s",
                  APP_VERSION, platform.system(), platform.release())
 
@@ -1832,6 +1877,7 @@ def home():
 def sync():
     global _sync_running, _sync_progress
     if _sync_running:
+        _logger.warning("[sync] 同期が既に実行中 — 重複リクエストをブロックしました")
         return redirect("/?error=sync_running")
 
     # Free-plan daily sync limit
@@ -3007,13 +3053,29 @@ def settings_page():
       </div>
     </div>"""
 
+    _diag_log_dir = _LOG_DIR or app_data_dir + "/logs"
+    _info_log_label = os.path.basename(_INFO_LOG_PATH) if _INFO_LOG_PATH else "—"
+    _warn_log_label = os.path.basename(_WARN_LOG_PATH) if _WARN_LOG_PATH else "—"
+    _err_log_label  = os.path.basename(_ERR_LOG_PATH)  if _ERR_LOG_PATH  else "—"
     diag_card = f"""
     <div class="card">
       <div class="card-header"><span class="card-title">診断・サポート</span></div>
       <div class="card-body">
         <div class="settings-row">
           <span class="settings-label">ログ保存先</span>
-          <span class="settings-path">{html_module.escape(_LOG_DIR or app_data_dir + "/logs")}</span>
+          <span class="settings-path">{html_module.escape(_diag_log_dir)}</span>
+        </div>
+        <div class="settings-row" style="margin-top:8px">
+          <span class="settings-label" style="color:var(--muted);font-size:12px">情報ログ</span>
+          <span class="settings-path" style="font-size:12px">{html_module.escape(_info_log_label)}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label" style="color:var(--muted);font-size:12px">警告ログ</span>
+          <span class="settings-path" style="font-size:12px">{html_module.escape(_warn_log_label)}</span>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label" style="color:var(--muted);font-size:12px">エラーログ</span>
+          <span class="settings-path" style="font-size:12px">{html_module.escape(_err_log_label)}</span>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:16px">
           <form method="POST" action="/support/open-logs">
@@ -3162,9 +3224,17 @@ def support_export_logs():
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # Include all rotated log files
+        # Include all rotated aggregate log files
         for log_path in sorted(glob.glob(os.path.join(logs_dir, "app-runtime.log*"))):
             zf.write(log_path, os.path.basename(log_path))
+
+        # Include all per-launch log files (session + categorized)
+        for pattern in ("????????_??????.log",
+                        "????????_??????_information.log",
+                        "????????_??????_warning.log",
+                        "????????_??????_error.log"):
+            for log_path in sorted(glob.glob(os.path.join(logs_dir, pattern)))[-10:]:
+                zf.write(log_path, os.path.basename(log_path))
 
         # Include plain-text diagnostic summary
         import platform as _pl
@@ -4659,9 +4729,13 @@ def run_scraper(selected_statuses=None):
         main_driver, selected_statuses
     )
     total_count = len(items)
+    _logger.info("[sync] 一覧取得完了 — 合計 %d 件 (ステータス別: %s)",
+                 total_count, per_status_counts)
 
     existing_map = fetch_existing_batch([item["url"] for item in items])
     to_skip, to_save_direct, to_fetch_detail = classify_items(items, existing_map)
+    _logger.info("[sync] 分類 — スキップ: %d, 直接保存: %d, 詳細取得: %d",
+                 len(to_skip), len(to_save_direct), len(to_fetch_detail))
 
     print(f"  跳过（未変化）：{len(to_skip)} 件 | "
           f"列表页直接保存：{len(to_save_direct)} 件 | "
@@ -4706,6 +4780,8 @@ def run_scraper(selected_statuses=None):
 
     if to_fetch_detail:
         phase2_start = time.time()
+        _logger.info("[sync] 詳細取得開始 — %d 件 (%d 並列 worker)",
+                     len(to_fetch_detail), MAX_WORKERS)
         print(f"\n初始化 {MAX_WORKERS} 个并行 worker...")
         pool = build_driver_pool(MAX_WORKERS, seed_cookies)
 
@@ -4722,6 +4798,7 @@ def run_scraper(selected_statuses=None):
         for r in results:
             if r["error"]:
                 detail_errors += 1
+                _logger.warning("[sync] 詳細取得失敗: %s", r["error"])
                 print(f"  [ERROR] {r['url']}: {r['error']}")
                 continue
             result = save_or_update_product(
@@ -4795,6 +4872,17 @@ def run_scraper(selected_statuses=None):
         print(f"    {_s}: {_c}")
     print(f"    合計: {db_total}")
     print(f"{'=' * 56}")
+
+    _logger.info(
+        "[sync] サマリー — 検出: %d, 新規: %d, 更新: %d, スキップ: %d, 失敗: %d, 所要時間: %.1f 秒",
+        total_count, total_inserted, total_updated, total_skipped, detail_errors, total_elapsed,
+    )
+    if detail_errors:
+        _logger.warning("[sync] %d 件の詳細取得が失敗しました — 次回同期時に再試行されます", detail_errors)
+    if reconcile_result.get("ran") and reconcile_result.get("total_stale", 0):
+        _logger.info("[sync] スナップショット整合化 — %d 件を状態不明に変更",
+                     reconcile_result["total_stale"])
+    _logger.info("[sync] DB合計: %d 件 (ステータス別: %s)", db_total, db_counts_by_status)
 
     _last_sync_summary = {
         "start_jst":       start_jst,
