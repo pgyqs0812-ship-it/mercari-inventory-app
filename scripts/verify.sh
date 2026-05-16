@@ -54,6 +54,19 @@ run_check_grep() {
     fi
 }
 
+run_info_grep() {
+    local label="$1"
+    local pattern="$2"
+    shift 2
+    local output
+    output=$("$@" 2>&1) || true
+    if echo "${output}" | grep -q "${pattern}"; then
+        printf "  ℹ  %s\n" "${label}"
+    else
+        printf "  ℹ  %s — (not matched; Gatekeeper is authoritative)\n" "${label}"
+    fi
+}
+
 echo ""
 echo "━━━ Verification Report ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -72,7 +85,7 @@ if [[ -n "${APP_BUNDLE}" && -d "${APP_BUNDLE}" ]]; then
         "runtime" \
         codesign -dv "${APP_BUNDLE}"
 
-    run_check_grep \
+    run_info_grep \
         "codesign: Developer ID Application identity" \
         "Developer ID Application" \
         codesign -dv "${APP_BUNDLE}"
@@ -97,7 +110,7 @@ if [[ -n "${DMG_PATH}" && -f "${DMG_PATH}" ]]; then
         "codesign: valid signature (DMG)" \
         codesign --verify "${DMG_PATH}"
 
-    run_check_grep \
+    run_info_grep \
         "codesign: Developer ID Application identity (DMG)" \
         "Developer ID Application" \
         codesign -dv "${DMG_PATH}"
