@@ -4465,18 +4465,47 @@ def _clear_session() -> None:
 # Status reconciliation
 # ---------------------------------------------------------------------------
 
+# Winning priority when the same item_id exists under multiple statuses.
+# Higher number = higher priority.
+_STATUS_PRIORITY: dict = {
+    "販売履歴": 5,
+    "売却済み": 4,
+    "取引中":   3,
+    "公開停止中": 2,
+    "出品中":   1,
+    "状態不明": 0,
+}
+
+
+def _item_id_from_url(url: str) -> str:
+    """Extract the Mercari item ID (e.g. 'm123456789') from any URL form."""
+    return url.rstrip("/").split("/")[-1]
+
+
 def _reconcile_stale_active_listings(
     selected_statuses: list,
     scraped_urls_by_status: dict,
 ) -> dict:
-    """Compare scraped 出品中 results against DB and fix stale active records.
+    """Fix stale 出品中 DB records in two phases.
 
-    Only runs when 出品中 was included in the sync. Never deletes records;
-    only updates status or marks unknown. Returns a summary dict.
+    Phase 1 — DB-level conflict scan (runs always):
+        Find records where the SAME Mercari item_id appears under different
+        statuses (e.g. trailing-slash URL variants create two rows).
+        Apply status priority: 販売履歴/売却済み > 取引中 > 公開停止中 > 出品中.
+        Never deletes rows; updates the lower-priority row's status.
+
+    Phase 2 — Scraped vs DB stale detection (only when 出品中 was synced):
+        Compare DB 出品中 item_ids against scraped 出品中 item_ids.
+        For missing items: look up their item_id in other scraped sets and
+        update accordingly, or mark 状態不明.
+        Uses item_id (not exact URL string) so trailing-slash variants match.
+
+    Returns a summary dict.
     """
     _ACTIVE = "出品中"
     result = {
         "ran": False,
+        "db_conflicts_fixed": 0,
         "db_active_before": 0,
         "scraped_active": 0,
         "stale_count": 0,
@@ -4487,69 +4516,110 @@ def _reconcile_stale_active_listings(
         "stale_item_ids": [],
     }
 
-    if _ACTIVE not in selected_statuses:
-        _logger.info("[reconcile] 出品中 が同期対象外のためスキップ")
-        return result
-
-    result["ran"] = True
-    scraped_active = scraped_urls_by_status.get(_ACTIVE, set())
-    result["scraped_active"] = len(scraped_active)
-
+    now = jst_now()
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
 
-    # All DB records currently marked 出品中
-    cur.execute(
-        "SELECT item_url FROM mercari_products WHERE status = ?", (_ACTIVE,)
-    )
-    db_active_urls = {row[0] for row in cur.fetchall()}
-    result["db_active_before"] = len(db_active_urls)
+    # ── Phase 1: DB-level conflict resolution ────────────────────────────────
+    # Find item_ids that exist under multiple different statuses in the DB.
+    # This catches cases where URL trailing-slash variants created duplicate rows.
+    cur.execute("SELECT id, item_url, status FROM mercari_products")
+    all_rows = cur.fetchall()
 
-    stale_urls = db_active_urls - scraped_active
-    result["stale_count"] = len(stale_urls)
+    # Group by item_id → list of (row_id, url, status)
+    by_item_id: dict = {}
+    for row_id, url, status in all_rows:
+        iid = _item_id_from_url(url)
+        by_item_id.setdefault(iid, []).append((row_id, url, status))
 
-    if not stale_urls:
+    for item_id, rows in by_item_id.items():
+        if len(rows) <= 1:
+            continue
+        statuses_present = {r[2] for r in rows}
+        if len(statuses_present) <= 1:
+            continue  # All rows have the same status — nothing to reconcile
+
+        winning = max(statuses_present, key=lambda s: _STATUS_PRIORITY.get(s, -1))
+        for row_id, url, status in rows:
+            if status == winning:
+                continue
+            cur.execute(
+                "UPDATE mercari_products SET status = ?, synced_at = ? WHERE id = ?",
+                (winning, now, row_id),
+            )
+            _logger.info(
+                "[reconcile] DB競合解消 item_id=%s url=%s: %s → %s",
+                item_id, url, status, winning,
+            )
+            result["db_conflicts_fixed"] += 1
+
+    if result["db_conflicts_fixed"]:
+        conn.commit()
+        _logger.info("[reconcile] Phase1: %d 件の DB 競合を解消しました",
+                     result["db_conflicts_fixed"])
+    else:
+        _logger.info("[reconcile] Phase1: DB 競合なし")
+
+    # ── Phase 2: Scraped vs DB stale detection ───────────────────────────────
+    if _ACTIVE not in selected_statuses:
         conn.close()
-        _logger.info(
-            "[reconcile] 陳腐化レコードなし — DB出品中=%d, 取得出品中=%d",
-            result["db_active_before"], result["scraped_active"],
-        )
+        _logger.info("[reconcile] Phase2 スキップ (出品中 が同期対象外)")
         return result
 
-    _logger.info(
-        "[reconcile] 開始 — DB出品中=%d, 取得出品中=%d, 陳腐化候補=%d",
-        result["db_active_before"], result["scraped_active"], len(stale_urls),
+    result["ran"] = True
+
+    # Build item_id → highest-priority status map from ALL scraped sets.
+    # This allows a single item_id to match its correct destination status.
+    scraped_id_to_status: dict = {}
+    for status, urls in scraped_urls_by_status.items():
+        for url in urls:
+            iid = _item_id_from_url(url)
+            existing = scraped_id_to_status.get(iid)
+            if existing is None or (
+                _STATUS_PRIORITY.get(status, -1) > _STATUS_PRIORITY.get(existing, -1)
+            ):
+                scraped_id_to_status[iid] = status
+
+    scraped_active_ids = {
+        _item_id_from_url(u) for u in scraped_urls_by_status.get(_ACTIVE, set())
+    }
+    result["scraped_active"] = len(scraped_active_ids)
+
+    # Re-read 出品中 records after Phase 1 may have changed some
+    cur.execute(
+        "SELECT id, item_url FROM mercari_products WHERE status = ?", (_ACTIVE,)
     )
+    db_active_rows = cur.fetchall()
+    result["db_active_before"] = len(db_active_rows)
 
-    # Build reverse-lookup sets from other scraped statuses
-    scraped_sold    = scraped_urls_by_status.get("売却済み", set())
-    scraped_trading = scraped_urls_by_status.get("取引中", set())
-    scraped_history = scraped_urls_by_status.get("販売履歴", set())
+    for row_id, url in db_active_rows:
+        item_id = _item_id_from_url(url)
+        if item_id in scraped_active_ids:
+            continue  # Still 出品中 in the latest scrape — no change
 
-    now = jst_now()
-    for url in stale_urls:
-        item_id = url.rstrip("/").split("/")[-1]
-        result["stale_item_ids"].append(item_id)
-
-        if url in scraped_sold:
-            new_status = "売却済み"
-            result["updated_to_sold"] += 1
-        elif url in scraped_trading:
-            new_status = "取引中"
-            result["updated_to_trading"] += 1
-        elif url in scraped_history:
-            new_status = "販売履歴"
-            result["updated_to_history"] += 1
+        # Item is missing from scraped 出品中 → determine correct status
+        scraped_status = scraped_id_to_status.get(item_id)
+        if scraped_status and scraped_status != _ACTIVE:
+            new_status = scraped_status
+            if new_status == "売却済み":
+                result["updated_to_sold"] += 1
+            elif new_status == "取引中":
+                result["updated_to_trading"] += 1
+            elif new_status == "販売履歴":
+                result["updated_to_history"] += 1
         else:
             new_status = "状態不明"
             result["marked_unknown"] += 1
 
+        result["stale_count"] += 1
+        result["stale_item_ids"].append(item_id)
+
         cur.execute(
-            "UPDATE mercari_products SET status = ?, synced_at = ? WHERE item_url = ?",
-            (new_status, now, url),
+            "UPDATE mercari_products SET status = ?, synced_at = ? WHERE id = ?",
+            (new_status, now, row_id),
         )
         _logger.info(
-            "[reconcile] %s → %s (item_id=%s)",
+            "[reconcile] Phase2: %s → %s (item_id=%s)",
             _ACTIVE, new_status, item_id,
         )
 
@@ -4557,14 +4627,13 @@ def _reconcile_stale_active_listings(
     conn.close()
 
     _logger.info(
-        "[reconcile] 完了 — 売却済み: %d, 取引中: %d, 販売履歴: %d, 状態不明: %d",
-        result["updated_to_sold"],
-        result["updated_to_trading"],
-        result["updated_to_history"],
-        result["marked_unknown"],
+        "[reconcile] Phase2 完了 — 売却済み: %d, 取引中: %d, 販売履歴: %d, 状態不明: %d, 陳腐化合計: %d",
+        result["updated_to_sold"], result["updated_to_trading"],
+        result["updated_to_history"], result["marked_unknown"],
+        result["stale_count"],
     )
     if result["stale_item_ids"]:
-        _logger.info("[reconcile] 対象 item_id: %s", ", ".join(result["stale_item_ids"]))
+        _logger.info("[reconcile] 陳腐化 item_ids: %s", ", ".join(result["stale_item_ids"]))
 
     return result
 
@@ -4738,19 +4807,22 @@ def run_scraper(selected_statuses=None):
     if to_fetch_detail:
         print(f"  Phase2（詳細）：  {phase2_elapsed:>6.1f} 秒")
     print(f"  合計時間：        {total_elapsed:>6.1f} 秒")
-    if reconcile_result.get("ran"):
+    if reconcile_result.get("db_conflicts_fixed") or reconcile_result.get("ran"):
         print(f"\n  --- 整合性チェック ---")
-        print(f"  出品中（DB）：    {reconcile_result['db_active_before']:>4} 件")
-        print(f"  出品中（取得）：  {reconcile_result['scraped_active']:>4} 件")
-        print(f"  陳腐化検出：      {reconcile_result['stale_count']:>4} 件")
-        if reconcile_result["updated_to_sold"]:
-            print(f"    → 売却済みに更新: {reconcile_result['updated_to_sold']} 件")
-        if reconcile_result["updated_to_trading"]:
-            print(f"    → 取引中に更新:   {reconcile_result['updated_to_trading']} 件")
-        if reconcile_result["updated_to_history"]:
-            print(f"    → 販売履歴に更新: {reconcile_result['updated_to_history']} 件")
-        if reconcile_result["marked_unknown"]:
-            print(f"    → 状態不明に変更: {reconcile_result['marked_unknown']} 件")
+        if reconcile_result.get("db_conflicts_fixed"):
+            print(f"  DB競合解消（Phase1）: {reconcile_result['db_conflicts_fixed']} 件")
+        if reconcile_result.get("ran"):
+            print(f"  出品中（DB）：    {reconcile_result['db_active_before']:>4} 件")
+            print(f"  出品中（取得）：  {reconcile_result['scraped_active']:>4} 件")
+            print(f"  陳腐化検出：      {reconcile_result['stale_count']:>4} 件")
+            if reconcile_result["updated_to_sold"]:
+                print(f"    → 売却済みに更新: {reconcile_result['updated_to_sold']} 件")
+            if reconcile_result["updated_to_trading"]:
+                print(f"    → 取引中に更新:   {reconcile_result['updated_to_trading']} 件")
+            if reconcile_result["updated_to_history"]:
+                print(f"    → 販売履歴に更新: {reconcile_result['updated_to_history']} 件")
+            if reconcile_result["marked_unknown"]:
+                print(f"    → 状態不明に変更: {reconcile_result['marked_unknown']} 件")
     print(f"\n  --- DB ステータス別件数 ---")
     for _s, _c in db_counts_by_status.items():
         print(f"    {_s}: {_c}")

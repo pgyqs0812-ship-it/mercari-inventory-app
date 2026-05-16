@@ -33,9 +33,11 @@ def _setup_logging(data_dir: str) -> tuple:
     1. logs/app-runtime.log — rotating aggregate log (preserved across launches)
     2. logs/YYYYMMDD_HHMMSS.log — per-launch session log for troubleshooting
 
+    Logs go to ~/Documents/MIAInventory/logs/ for easy user access.
     Returns (logs_dir, launch_log_path).
     """
-    logs_dir = os.path.join(data_dir, "logs")
+    # Use Documents so users can find logs without navigating Library.
+    logs_dir = os.path.join(os.path.expanduser("~"), "Documents", "MIAInventory", "logs")
     os.makedirs(logs_dir, exist_ok=True)
 
     fmt = logging.Formatter(
