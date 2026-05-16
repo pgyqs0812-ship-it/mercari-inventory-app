@@ -4789,25 +4789,6 @@ def _do_login(force_relogin: bool = False) -> None:
             _logger.warning("[login] logging_in のまま終了 — invalid にリセット")
             _session_state = "invalid"
 
-    except Exception as exc:
-        msg = str(exc)
-        print(f"[login] ログイン失敗: {msg}")
-        # Distinguish browser-launch failures from other errors
-        if any(k in msg for k in ("Chrome", "chromedriver", "selenium", "WebDriver",
-                                   "session not created", "cannot find", "Timeout")):
-            _login_error_msg = f"ブラウザの起動に失敗しました: {msg}"
-            _session_state = "error"
-        else:
-            _session_state = "invalid"
-
-    finally:
-        # Safety net: if we exit without setting a terminal state (e.g. an
-        # unhandled exception escaped all except clauses above, or the thread
-        # was interrupted), reset to "invalid" so the login button reappears.
-        if _session_state == "logging_in":
-            print("[login] 警告: ログインスレッドが logging_in のまま終了 — invalid にリセット")
-            _session_state = "invalid"
-
 
 def _clear_session() -> None:
     """Delete all stored session data and reset to logged-out state.

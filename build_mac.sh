@@ -95,12 +95,6 @@ if [ ! -f "${ENTRY}" ]; then
     exit 1
 fi
 
-# ── Version file (single source of truth for app UI) ─────────────────────────
-# Generates _version.py so mercari_sync.py can display the version at runtime.
-# PyInstaller bundles this file; it is gitignored (build artifact).
-echo "__version__ = '${VERSION}'" > _version.py
-echo "✓ _version.py: ${VERSION}"
-
 # ── Clean previous build ──────────────────────────────────────────────────────
 echo "Cleaning previous build artifacts..."
 rm -rf build/ dist/ "${APP_NAME}.spec"
