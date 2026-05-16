@@ -152,9 +152,12 @@ _JST = timezone(timedelta(hours=9))
 # Statuses with larger listing counts that need a longer pagination timeout
 _LONG_TIMEOUT_STATUSES = {"売却済み", "販売履歴"}
 
-# Statuses treated as current state (full snapshot per sync).
+# Statuses whose DB rows are fully replaced on each sync (atomic overwrite).
 # 販売履歴 is intentionally excluded — it is historical/append-only.
-_SNAPSHOT_STATUSES = {"出品中", "公開停止中", "取引中", "売却済み"}
+# 公開停止中 is included defensively; it is normally stored as status='出品中'
+# with visibility_status='stopped', but may appear as its own status value
+# depending on the scraper path, so we delete both to stay clean.
+_OVERWRITE_STATUSES = {"出品中", "公開停止中", "取引中", "売却済み"}
 
 # Populated at the end of each sync run; read by home() to show the popup
 _last_sync_summary: dict = {}
@@ -3852,7 +3855,7 @@ def fetch_existing_batch(urls):
     cursor = conn.cursor()
     placeholders = ",".join("?" * len(urls))
     cursor.execute(
-        f"SELECT item_url, title, price, created_at, status, visibility_status "
+        f"SELECT item_url, title, price, created_at, status, visibility_status, raw_text "
         f"FROM mercari_products WHERE item_url IN ({placeholders})",
         urls,
     )
@@ -3863,6 +3866,7 @@ def fetch_existing_batch(urls):
             "created_at": row[3],
             "status": row[4] or "",
             "visibility_status": row[5] or "",
+            "raw_text": row[6] or "",
         }
         for row in cursor.fetchall()
     }
@@ -4593,92 +4597,115 @@ def _clear_session() -> None:
 # Snapshot stale cleanup (KAN-74)
 # ---------------------------------------------------------------------------
 
-def _snapshot_stale_cleanup(
-    selected_statuses: list,
-    scraped_urls_by_status: dict,
-) -> dict:
-    """After a full scrape of each selected status, mark stale DB records.
-
-    For every status in selected_statuses that belongs to _SNAPSHOT_STATUSES
-    (出品中, 公開停止中, 取引中, 売却済み):
-      Any DB record with that status whose canonical URL was NOT found in the
-      corresponding scraped set is now stale — Mercari no longer lists it there.
-      Mark it 状態不明 so it is excluded from active counts.
-
-    販売履歴 is intentionally excluded (historical / append-only).
-    Never deletes records.  Returns a summary dict for the sync log.
-    """
-    result = {
-        "ran": False,
-        "stale_by_status": {},
-        "total_stale": 0,
-    }
-
-    # Only statuses that are both selected AND snapshot-managed
-    cleanup_statuses = [s for s in selected_statuses if s in _SNAPSHOT_STATUSES]
-    if not cleanup_statuses:
-        _logger.info("[snapshot] スキップ — スナップショット対象ステータスなし")
-        return result
-
-    result["ran"] = True
-    now = jst_now()
+def _get_db_counts_by_status() -> dict:
+    """Return {status: count} for all rows in mercari_products."""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-
-    _logger.info("[snapshot] スナップショット整合化 開始 — 対象ステータス: %s", cleanup_statuses)
-
-    for status in cleanup_statuses:
-        scraped = scraped_urls_by_status.get(status, set())
-        # scraped set already holds canonical URLs (normalized in load_all_listings)
-
-        # Count DB records with this status before cleanup
-        cur.execute(
-            "SELECT COUNT(*) FROM mercari_products WHERE status = ?", (status,)
-        )
-        db_count_before = cur.fetchone()[0]
-
-        if not scraped:
-            # Scraped nothing for this status — skip rather than wiping entire set,
-            # which could happen if the scrape was empty due to a network error.
-            _logger.warning(
-                "[snapshot] %s: 取得件数0 — ネットワークエラーの可能性があるためスキップ", status
-            )
-            result["stale_by_status"][status] = {"skipped": True, "reason": "empty_scrape"}
-            continue
-
-        # Find DB rows for this status whose URL is NOT in the scraped set
-        cur.execute(
-            "SELECT id, item_url FROM mercari_products WHERE status = ?", (status,)
-        )
-        stale_rows = [(row_id, url) for row_id, url in cur.fetchall()
-                      if url not in scraped]
-
-        if stale_rows:
-            stale_ids = [r[0] for r in stale_rows]
-            placeholders = ",".join("?" * len(stale_ids))
-            cur.execute(
-                f"UPDATE mercari_products SET status = '状態不明', synced_at = ? "
-                f"WHERE id IN ({placeholders})",
-                [now] + stale_ids,
-            )
-            for _, url in stale_rows:
-                _logger.info("[snapshot] 陳腐化: %s %s → 状態不明", status, url)
-
-        result["stale_by_status"][status] = {
-            "db_before": db_count_before,
-            "scraped":   len(scraped),
-            "stale":     len(stale_rows),
-        }
-        result["total_stale"] += len(stale_rows)
-        _logger.info(
-            "[snapshot] %s: DB=%d, 取得=%d, 陳腐化=%d → 状態不明に変更",
-            status, db_count_before, len(scraped), len(stale_rows),
-        )
-
-    conn.commit()
+    cur.execute(
+        "SELECT status, COUNT(*) FROM mercari_products GROUP BY status ORDER BY COUNT(*) DESC"
+    )
+    result = dict(cur.fetchall())
     conn.close()
-    _logger.info("[snapshot] 整合化 完了 — 合計陳腐化: %d 件", result["total_stale"])
     return result
+
+
+def _atomic_snapshot_swap(staging: dict, overwrite_statuses: list) -> dict:
+    """Atomically replace DB rows for overwrite_statuses with staging data.
+
+    Within a single SQLite transaction:
+      1. Record the pre-delete count for each status.
+      2. DELETE all rows whose status is in overwrite_statuses.
+      3. INSERT every staging row whose status is in overwrite_statuses.
+
+    If the transaction fails the DB is rolled back and the exception re-raised
+    — existing data is never partially overwritten.
+
+    Returns {"deleted_by_status": {status: int}, "inserted": int}.
+    """
+    result: dict = {"deleted_by_status": {}, "inserted": 0}
+    if not overwrite_statuses:
+        return result
+
+    overwrite_set = set(overwrite_statuses)
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        for status in overwrite_statuses:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM mercari_products WHERE status = ?", (status,)
+            ).fetchone()
+            old_count = row[0] if row else 0
+            conn.execute("DELETE FROM mercari_products WHERE status = ?", (status,))
+            result["deleted_by_status"][status] = old_count
+            _logger.info("[snapshot] 削除: %s — %d 件", status, old_count)
+
+        inserted = 0
+        for row in staging.values():
+            if row["status"] not in overwrite_set:
+                continue
+            conn.execute(
+                """INSERT OR REPLACE INTO mercari_products
+                   (item_url, title, price, status, created_at, raw_text, synced_at, visibility_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (row["url"], row["title"], row["price"], row["status"],
+                 row["created_at"], row["raw_text"], row["synced_at"], row["visibility_status"]),
+            )
+            inserted += 1
+
+        conn.execute("COMMIT")
+        result["inserted"] = inserted
+        _logger.info("[snapshot] 挿入完了: %d 件", inserted)
+
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        _logger.error("[snapshot] 上書きトランザクション失敗 — ROLLBACK: %s", exc)
+        raise
+    finally:
+        conn.close()
+
+    return result
+
+
+def _append_historical(staging: dict) -> int:
+    """INSERT OR IGNORE 販売履歴 items from staging.
+
+    Historical records are never deleted.  Only newly-scraped items that do
+    not already exist in the DB are inserted.  Returns new-insert count.
+    """
+    hist_rows = [row for row in staging.values() if row["status"] == "販売履歴"]
+    if not hist_rows:
+        return 0
+
+    conn = sqlite3.connect(DB_NAME)
+    inserted = 0
+    try:
+        conn.execute("BEGIN")
+        for row in hist_rows:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO mercari_products
+                   (item_url, title, price, status, created_at, raw_text, synced_at, visibility_status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (row["url"], row["title"], row["price"], row["status"],
+                 row["created_at"], row["raw_text"], row["synced_at"], row["visibility_status"]),
+            )
+            inserted += cur.rowcount
+        conn.execute("COMMIT")
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        _logger.error("[snapshot] 販売履歴 追記失敗: %s", exc)
+        raise
+    finally:
+        conn.close()
+
+    _logger.info("[snapshot] 販売履歴 追記: %d 件 (新規)", inserted)
+    return inserted
 
 
 # ---------------------------------------------------------------------------
@@ -4686,216 +4713,233 @@ def _snapshot_stale_cleanup(
 # ---------------------------------------------------------------------------
 
 def run_scraper(selected_statuses=None):
+    """Full snapshot sync: scrape → stage in memory → atomic DB overwrite.
+
+    For each selected status in _OVERWRITE_STATUSES:
+      - All scraped items are collected into an in-memory staging dict first.
+      - Only after ALL scraping succeeds, a single SQLite transaction deletes
+        the old rows and inserts the new snapshot.  If scraping or the
+        transaction fails, the existing DB is left completely unchanged.
+
+    販売履歴 is append-only: new items are INSERT OR IGNOREd, nothing is deleted.
+    """
     global _last_sync_summary, _session_state
 
     if selected_statuses is None:
         selected_statuses = list(STATUSES)
 
-    start_jst = jst_now()
+    overwrite_selected  = [s for s in selected_statuses if s in _OVERWRITE_STATUSES]
+    historical_selected = [s for s in selected_statuses if s == "販売履歴"]
+
+    start_jst  = jst_now()
     sync_start = time.time()
 
-    # ------------------------------------------------------------------
-    # Phase 1: session check, collect all listings
-    # The singleton Chrome stays alive after sync for product-link opening.
-    # ------------------------------------------------------------------
+    # ── Pre-sync state ─────────────────────────────────────────────────
+    old_counts = _get_db_counts_by_status()
+    _logger.info("[snapshot] 同期開始 — 対象ステータス: %s", selected_statuses)
+    _logger.info("[snapshot] 同期前 DB件数: %s",
+                 {s: old_counts.get(s, 0) for s in selected_statuses})
+
+    # ── Session validation ─────────────────────────────────────────────
     if _session_state != "valid":
-        raise RuntimeError(
-            "セッションが無効です。ログイン画面からログインし直してください。"
-        )
+        raise RuntimeError("セッションが無効です。ログイン画面からログインし直してください。")
 
     main_driver = _get_or_create_driver()
-
-    # Re-verify session is still live (cookies may have expired since login check)
     if not _try_restore_session(main_driver):
         _session_state = "invalid"
-        raise RuntimeError(
-            "Mercari セッションが切れました。ログイン画面から再度ログインしてください。"
-        )
+        raise RuntimeError("Mercari セッションが切れました。ログイン画面から再度ログインしてください。")
 
-    # Move Chrome off-screen so it doesn't stay in the foreground.
-    # Do NOT minimize — a minimized window collapses the viewport to ~0,
-    # which prevents Intersection Observer from firing and breaks lazy-loading
-    # on card-based pages (出品中, 取引中, 売却済み).  We first maximize to
-    # ensure a valid viewport (un-minimizes if user collapsed it manually),
-    # then move the window off the visible screen area.
+    # Move Chrome off-screen (maximized to keep full viewport for lazy-loading)
     try:
         main_driver.maximize_window()
         main_driver.set_window_position(-3000, 0)
     except Exception:
         pass
 
+    # ── Phase 1: scrape all listing pages ─────────────────────────────
     phase1_start = time.time()
-    items, per_status_counts, scraped_urls_by_status = load_all_listings(
-        main_driver, selected_statuses
-    )
-    total_count = len(items)
-    _logger.info("[sync] 一覧取得完了 — 合計 %d 件 (ステータス別: %s)",
+    items, per_status_counts, _ = load_all_listings(main_driver, selected_statuses)
+    total_count   = len(items)
+    phase1_elapsed = time.time() - phase1_start
+    _logger.info("[snapshot] 一覧取得完了 — 合計 %d 件 (ステータス別: %s)",
                  total_count, per_status_counts)
 
+    # ── Phase 2: classify and stage into memory ────────────────────────
     existing_map = fetch_existing_batch([item["url"] for item in items])
     to_skip, to_save_direct, to_fetch_detail = classify_items(items, existing_map)
-    _logger.info("[sync] 分類 — スキップ: %d, 直接保存: %d, 詳細取得: %d",
+    _logger.info("[snapshot] 分類 — スキップ: %d, 直接保存: %d, 詳細取得: %d",
                  len(to_skip), len(to_save_direct), len(to_fetch_detail))
 
-    print(f"  跳过（未変化）：{len(to_skip)} 件 | "
-          f"列表页直接保存：{len(to_save_direct)} 件 | "
-          f"需打开详情页：{len(to_fetch_detail)} 件")
+    now = jst_now()
 
-    seed_cookies = main_driver.get_cookies()
-    # Do NOT quit main_driver — it is the singleton and stays alive for
-    # product-link opening between syncs.
-
-    phase1_elapsed = time.time() - phase1_start
-
-    # Build lookup maps for all items
+    # Lookup maps needed for detail-fetch results
     visibility_status_map = {item["url"]: item.get("visibility_status", "") for item in items}
     created_at_map        = {item["url"]: item["created_at"] for item in items}
     status_map            = {item["url"]: item.get("status", "") for item in items}
 
+    staging: dict = {}  # canonical_url → {url, title, price, status, ...}
+
+    # Unchanged items: copy their existing DB data so nothing is lost in the swap
     for item in to_skip:
-        touch_synced_at(item["url"])
+        ex = existing_map[item["url"]]
+        staging[item["url"]] = {
+            "url":               item["url"],
+            "title":             ex["title"],
+            "price":             ex["price"],
+            "status":            item.get("status") or ex["status"],
+            "created_at":        ex["created_at"],
+            "raw_text":          ex.get("raw_text", ""),
+            "visibility_status": item.get("visibility_status") or ex["visibility_status"],
+            "synced_at":         now,
+        }
 
-    direct_inserted = direct_updated = direct_skipped = 0
+    # Items with enough data from the listing page
     for item in to_save_direct:
-        r = save_or_update_product(
-            item["url"], item["title"], item["price"],
-            item.get("status", ""), item["created_at"], item["raw_text"],
-            item.get("visibility_status", ""),
-        )
-        if r == "inserted":
-            direct_inserted += 1
-        elif r == "updated":
-            direct_updated += 1
-        else:
-            direct_skipped += 1
+        staging[item["url"]] = {
+            "url":               item["url"],
+            "title":             item["title"],
+            "price":             item.get("price", ""),
+            "status":            item.get("status", ""),
+            "created_at":        item["created_at"],
+            "raw_text":          item.get("raw_text", ""),
+            "visibility_status": item.get("visibility_status", ""),
+            "synced_at":         now,
+        }
 
-    # ------------------------------------------------------------------
-    # Phase 2: parallel detail fetches
-    # ------------------------------------------------------------------
+    # ── Phase 2b: parallel detail page fetches ─────────────────────────
     if _sync_stop_requested:
         raise _SyncStopped()
 
-    detail_inserted = detail_updated = detail_skipped = detail_errors = 0
+    detail_errors  = 0
     phase2_elapsed = 0.0
 
     if to_fetch_detail:
         phase2_start = time.time()
-        _logger.info("[sync] 詳細取得開始 — %d 件 (%d 並列 worker)",
+        _logger.info("[snapshot] 詳細取得開始 — %d 件 (%d 並列 worker)",
                      len(to_fetch_detail), MAX_WORKERS)
-        print(f"\n初始化 {MAX_WORKERS} 个并行 worker...")
-        pool = build_driver_pool(MAX_WORKERS, seed_cookies)
-
+        seed_cookies    = main_driver.get_cookies()
+        pool            = build_driver_pool(MAX_WORKERS, seed_cookies)
         fetch_item_detail = make_pool_fetcher(pool)
-        urls_to_fetch = [item["url"] for item in to_fetch_detail]
+        urls_to_fetch   = [item["url"] for item in to_fetch_detail]
 
-        print(f"开始并行抓取 {len(urls_to_fetch)} 个详情页（{MAX_WORKERS} workers）...")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            results = list(executor.map(fetch_item_detail, urls_to_fetch))
+            detail_results = list(executor.map(fetch_item_detail, urls_to_fetch))
 
         while not pool.empty():
             pool.get().quit()
 
-        for r in results:
-            if r["error"]:
-                detail_errors += 1
-                _logger.warning("[sync] 詳細取得失敗: %s", r["error"])
-                print(f"  [ERROR] {r['url']}: {r['error']}")
-                continue
-            result = save_or_update_product(
-                r["url"], r["title"], r["price"],
-                status_map[r["url"]], created_at_map[r["url"]], r["raw_text"],
-                visibility_status_map.get(r["url"], ""),
-            )
-            if result == "inserted":
-                detail_inserted += 1
-                print(f"  新増：{r['title']} / {r['price']}")
-            elif result == "updated":
-                detail_updated += 1
-                print(f"  更新：{r['title']} / {r['price']}")
+        for r in detail_results:
+            if not r["error"]:
+                staging[r["url"]] = {
+                    "url":               r["url"],
+                    "title":             r["title"],
+                    "price":             r["price"],
+                    "status":            status_map[r["url"]],
+                    "created_at":        created_at_map[r["url"]],
+                    "raw_text":          r["raw_text"],
+                    "visibility_status": visibility_status_map.get(r["url"], ""),
+                    "synced_at":         now,
+                }
             else:
-                detail_skipped += 1
+                detail_errors += 1
+                _logger.warning("[snapshot] 詳細取得失敗 (フォールバック使用): %s", r["error"])
+                # Fall back to existing DB data; if none, use listing-page data
+                ex   = existing_map.get(r["url"])
+                orig = next((i for i in to_fetch_detail if i["url"] == r["url"]), None)
+                if ex and is_valid_title(ex.get("title", "")):
+                    staging[r["url"]] = {
+                        "url":               r["url"],
+                        "title":             ex["title"],
+                        "price":             ex["price"],
+                        "status":            status_map.get(r["url"], ex["status"]),
+                        "created_at":        ex["created_at"],
+                        "raw_text":          ex.get("raw_text", ""),
+                        "visibility_status": visibility_status_map.get(r["url"],
+                                                                        ex["visibility_status"]),
+                        "synced_at":         now,
+                    }
+                elif orig:
+                    staging[r["url"]] = {
+                        "url":               r["url"],
+                        "title":             orig.get("title", ""),
+                        "price":             orig.get("price", ""),
+                        "status":            status_map.get(r["url"], ""),
+                        "created_at":        orig["created_at"],
+                        "raw_text":          "",
+                        "visibility_status": visibility_status_map.get(r["url"], ""),
+                        "synced_at":         now,
+                    }
 
         phase2_elapsed = time.time() - phase2_start
 
-    # ------------------------------------------------------------------
-    # Snapshot stale cleanup — mark DB records not found in this scrape
-    # ------------------------------------------------------------------
-    reconcile_result = _snapshot_stale_cleanup(
-        selected_statuses, scraped_urls_by_status
-    )
+    if _sync_stop_requested:
+        raise _SyncStopped()
 
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
-    total_inserted = direct_inserted + detail_inserted
-    total_updated  = direct_updated  + detail_updated
-    total_skipped  = len(to_skip) + direct_skipped + detail_skipped
-    total_elapsed  = time.time() - sync_start
+    # ── Phase 3: atomic DB overwrite ──────────────────────────────────
+    # This is the only point where the DB is modified.  If anything above
+    # raised an exception the DB was never touched.
+    _logger.info("[snapshot] スクレイプ完了 — 上書きトランザクション開始")
+    _logger.info("[snapshot] 上書き対象: %s", overwrite_selected)
+    _logger.info("[snapshot] 削除前件数: %s",
+                 {s: old_counts.get(s, 0) for s in overwrite_selected})
 
-    # DB counts by status — reflects reconciled state
-    _db_conn = sqlite3.connect(DB_NAME)
-    _db_cur  = _db_conn.cursor()
-    _db_cur.execute(
-        "SELECT status, COUNT(*) FROM mercari_products GROUP BY status ORDER BY COUNT(*) DESC"
-    )
-    db_counts_by_status = dict(_db_cur.fetchall())
-    _db_cur.execute("SELECT COUNT(*) FROM mercari_products")
-    db_total = _db_cur.fetchone()[0]
-    _db_conn.close()
+    swap_result   = _atomic_snapshot_swap(staging, overwrite_selected)
+    hist_inserted = _append_historical(staging) if historical_selected else 0
+
+    # ── Post-swap DB state ─────────────────────────────────────────────
+    post_counts = _get_db_counts_by_status()
+    db_total    = sum(post_counts.values())
+    total_elapsed = time.time() - sync_start
+
+    _logger.info("[snapshot] 上書き完了 — 削除: %s, 挿入: %d 件",
+                 swap_result["deleted_by_status"], swap_result["inserted"])
+    _logger.info("[snapshot] 同期後 DB件数: %s",
+                 {s: post_counts.get(s, 0) for s in selected_statuses})
 
     print(f"\n{'=' * 56}")
-    print(f"  同期完了")
-    print(f"  検出合計：        {total_count:>4} 件")
-    print(f"  新増：            {total_inserted:>4} 件")
-    print(f"  更新：            {total_updated:>4} 件")
-    print(f"  スキップ：        {total_skipped:>4} 件")
-    print(f"  詳細取得：        {len(to_fetch_detail):>4} 件"
-          f"  ({MAX_WORKERS} 並列 worker)")
+    print(f"  スナップショット同期完了")
+    print(f"  取得合計：        {total_count:>4} 件")
+    print(f"  詳細取得：        {len(to_fetch_detail):>4} 件  ({MAX_WORKERS} 並列 worker)")
     if detail_errors:
         print(f"  取得失敗：        {detail_errors:>4} 件")
     print(f"  Phase1（一覧）：  {phase1_elapsed:>6.1f} 秒")
     if to_fetch_detail:
         print(f"  Phase2（詳細）：  {phase2_elapsed:>6.1f} 秒")
     print(f"  合計時間：        {total_elapsed:>6.1f} 秒")
-    if reconcile_result.get("ran"):
-        total_stale = reconcile_result.get("total_stale", 0)
-        print(f"\n  --- スナップショット整合化 ---")
-        for st, info in reconcile_result.get("stale_by_status", {}).items():
-            if info.get("skipped"):
-                print(f"  {st}: スキップ（取得件数0）")
-            else:
-                print(f"  {st}: DB={info['db_before']}, 取得={info['scraped']}, 陳腐化={info['stale']}")
-        if total_stale:
-            print(f"  合計 状態不明に変更: {total_stale} 件")
+    print(f"\n  --- 上書き結果 ---")
+    for status, deleted in swap_result["deleted_by_status"].items():
+        new_c = post_counts.get(status, 0)
+        print(f"  {status}: 削除={deleted} → 挿入後={new_c}")
+    if hist_inserted:
+        print(f"  販売履歴 新規追記: {hist_inserted} 件")
     print(f"\n  --- DB ステータス別件数 ---")
-    for _s, _c in db_counts_by_status.items():
+    for _s, _c in post_counts.items():
         print(f"    {_s}: {_c}")
     print(f"    合計: {db_total}")
     print(f"{'=' * 56}")
 
     _logger.info(
-        "[sync] サマリー — 検出: %d, 新規: %d, 更新: %d, スキップ: %d, 失敗: %d, 所要時間: %.1f 秒",
-        total_count, total_inserted, total_updated, total_skipped, detail_errors, total_elapsed,
+        "[snapshot] サマリー — 取得: %d, 上書き挿入: %d, 詳細失敗: %d, 所要時間: %.1f 秒",
+        total_count, swap_result["inserted"], detail_errors, total_elapsed,
     )
     if detail_errors:
-        _logger.warning("[sync] %d 件の詳細取得が失敗しました — 次回同期時に再試行されます", detail_errors)
-    if reconcile_result.get("ran") and reconcile_result.get("total_stale", 0):
-        _logger.info("[sync] スナップショット整合化 — %d 件を状態不明に変更",
-                     reconcile_result["total_stale"])
-    _logger.info("[sync] DB合計: %d 件 (ステータス別: %s)", db_total, db_counts_by_status)
+        _logger.warning("[snapshot] %d 件の詳細取得が失敗しました (フォールバックデータを使用)",
+                        detail_errors)
+    _logger.info("[snapshot] DB合計: %d 件 (ステータス別: %s)", db_total, post_counts)
 
     _last_sync_summary = {
-        "start_jst":       start_jst,
-        "end_jst":         jst_now(),
-        "elapsed":         round(total_elapsed, 1),
-        "per_status":      per_status_counts,
-        "inserted":        total_inserted,
-        "updated":         total_updated,
-        "skipped":         total_skipped,
-        "total":           total_count,
-        "db_by_status":    db_counts_by_status,
-        "db_total":        db_total,
-        "reconciliation":  reconcile_result,
+        "start_jst":    start_jst,
+        "end_jst":      jst_now(),
+        "elapsed":      round(total_elapsed, 1),
+        "per_status":   per_status_counts,
+        "inserted":     swap_result["inserted"],
+        "updated":      0,
+        "skipped":      len(to_skip),
+        "total":        total_count,
+        "db_by_status": post_counts,
+        "db_total":     db_total,
+        "snapshot_swap": swap_result,
+        "hist_inserted": hist_inserted,
     }
     # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
 
