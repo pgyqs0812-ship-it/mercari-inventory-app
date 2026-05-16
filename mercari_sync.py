@@ -157,7 +157,7 @@ _LONG_TIMEOUT_STATUSES = {"売却済み", "販売履歴"}
 # 公開停止中 is included defensively; it is normally stored as status='出品中'
 # with visibility_status='stopped', but may appear as its own status value
 # depending on the scraper path, so we delete both to stay clean.
-_OVERWRITE_STATUSES = {"出品中", "公開停止中", "取引中", "売却済み"}
+_OVERWRITE_STATUSES = {"出品中", "公開停止中", "取引中", "売却済み", "販売履歴"}
 
 # Populated at the end of each sync run; read by home() to show the popup
 _last_sync_summary: dict = {}
@@ -2119,17 +2119,47 @@ def home():
             f"<tr><td>DB: {html_module.escape(st)}</td><td>{cnt} 件</td></tr>"
             for st, cnt in s.get("db_by_status", {}).items()
         )
+        count_mismatch   = s.get("count_mismatch", False)
+        staged_total     = s.get("staged_total", s.get("total", 0))
+        db_synced_total  = sum(s.get("db_by_status", {}).values())
+        stale_sample     = s.get("stale_urls", [])
+
+        mismatch_block = ""
+        if count_mismatch:
+            stale_html = ""
+            if stale_sample:
+                stale_items = "".join(
+                    f"<li style='font-size:11px;word-break:break-all'>"
+                    f"{html_module.escape(u)}</li>"
+                    for u in stale_sample[:5]
+                )
+                more = f"<li style='font-size:11px;color:#6b7280'>… 他 {len(stale_sample)-5} 件</li>" if len(stale_sample) > 5 else ""
+                stale_html = f"<ul style='margin:6px 0 0 0;padding-left:16px'>{stale_items}{more}</ul>"
+            mismatch_block = (
+                f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;'
+                f'padding:10px 14px;margin:10px 0;color:#991b1b;font-size:13px">'
+                f'<strong>⚠ 件数不一致</strong><br>'
+                f'検出合計: {staged_total} 件 ／ DB同期後: {db_synced_total} 件<br>'
+                f'詳細はエラーログを確認してください。'
+                f'{stale_html}</div>'
+            )
+
+        match_indicator = (
+            '<tr style="color:#166534;font-weight:600">'
+            f'<td>✓ 検出合計 = DB合計</td><td>{staged_total} 件</td></tr>'
+        ) if not count_mismatch else ""
+
         summary_modal = f"""
         <div class="modal-overlay" id="summary-modal">
           <div class="modal-box">
             <h2>同期完了</h2>
+            {mismatch_block}
             <table class="modal-table">
               <tr><td>開始時刻</td><td>{html_module.escape(s.get('start_jst',''))}</td></tr>
               <tr><td>終了時刻</td><td>{html_module.escape(s.get('end_jst',''))}</td></tr>
               <tr><td>所要時間</td><td>{s.get('elapsed', 0)} 秒</td></tr>
-              <tr><td>検出合計</td><td>{s.get('total', 0)} 件</td></tr>
+              <tr><td>検出合計</td><td>{staged_total} 件</td></tr>
               <tr><td>新増</td><td>{s.get('inserted', 0)} 件</td></tr>
-              <tr><td>更新</td><td>{s.get('updated', 0)} 件</td></tr>
               <tr><td>スキップ</td><td>{s.get('skipped', 0)} 件</td></tr>
               {fetched_rows}
               <tr><td colspan="2"
@@ -2137,6 +2167,7 @@ def home():
                 DB合計</td></tr>
               {db_rows}
               <tr><td>DB合計</td><td>{s.get('db_total', '–')} 件</td></tr>
+              {match_indicator}
             </table>
             <button class="modal-close"
                     onclick="document.getElementById('summary-modal').remove()">
@@ -2540,10 +2571,32 @@ def open_url():
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
     _logger.info("[shutdown] シャットダウンリクエスト受信 — アプリを終了します")
-    threading.Thread(
-        target=lambda: (time.sleep(0.8), os._exit(0)),
-        daemon=True,
-    ).start()
+
+    def _do_shutdown():
+        time.sleep(0.4)  # allow HTTP response to reach the browser
+        global _sync_running, _sync_stop_requested
+        # Stop any running sync before tearing down the driver
+        if _sync_running:
+            _logger.info("[shutdown] 同期中 — 強制停止してから終了します")
+            _sync_stop_requested = True
+            # Give the sync thread up to 4 s to notice the stop flag
+            deadline = time.time() + 4.0
+            while _sync_running and time.time() < deadline:
+                time.sleep(0.1)
+            if _sync_running:
+                _logger.warning("[shutdown] 同期スレッドが停止しませんでした — 強制終了します")
+        # Explicitly shut down Chrome/ChromeDriver before exiting
+        # (os._exit bypasses atexit handlers so we call this directly)
+        try:
+            _logger.info("[shutdown] クローラー Chrome を終了します")
+            _shutdown_chrome()
+            _logger.info("[shutdown] クローラー Chrome 終了完了")
+        except Exception as exc:
+            _logger.error("[shutdown] Chrome 終了エラー: %s", exc)
+        _logger.info("[shutdown] アプリを終了します")
+        os._exit(0)
+
+    threading.Thread(target=_do_shutdown, daemon=True, name="shutdown-bg").start()
     return Response("ok", status=200, headers={"Content-Type": "text/plain"})
 
 
@@ -4950,6 +5003,22 @@ def _get_db_counts_by_status() -> dict:
     return result
 
 
+def _find_stale_urls(staging: dict, selected_statuses: list) -> list:
+    """Return item_urls in DB (for selected_statuses) that are absent from staging."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        placeholders = ",".join("?" * len(selected_statuses))
+        rows = conn.execute(
+            f"SELECT item_url FROM mercari_products WHERE status IN ({placeholders})",
+            selected_statuses,
+        ).fetchall()
+        conn.close()
+        staging_urls = set(staging.keys())
+        return [r[0] for r in rows if r[0] not in staging_urls]
+    except Exception:
+        return []
+
+
 def _atomic_snapshot_swap(staging: dict, overwrite_statuses: list) -> dict:
     """Atomically replace DB rows for overwrite_statuses with staging data.
 
@@ -5056,21 +5125,18 @@ def _append_historical(staging: dict) -> int:
 def run_scraper(selected_statuses=None):
     """Full snapshot sync: scrape → stage in memory → atomic DB overwrite.
 
-    For each selected status in _OVERWRITE_STATUSES:
-      - All scraped items are collected into an in-memory staging dict first.
-      - Only after ALL scraping succeeds, a single SQLite transaction deletes
-        the old rows and inserts the new snapshot.  If scraping or the
-        transaction fails, the existing DB is left completely unchanged.
-
-    販売履歴 is append-only: new items are INSERT OR IGNOREd, nothing is deleted.
+    All selected statuses (including 販売履歴) are subject to the same
+    delete-then-insert atomic swap.  After a successful sync the DB rows for
+    every selected status are an *exact* mirror of what was scraped — no stale
+    records remain.  If scraping or the transaction fails, the existing DB is
+    left completely unchanged.
     """
     global _last_sync_summary, _session_state
 
     if selected_statuses is None:
         selected_statuses = list(STATUSES)
 
-    overwrite_selected  = [s for s in selected_statuses if s in _OVERWRITE_STATUSES]
-    historical_selected = [s for s in selected_statuses if s == "販売履歴"]
+    overwrite_selected = [s for s in selected_statuses if s in _OVERWRITE_STATUSES]
 
     start_jst  = jst_now()
     sync_start = time.time()
@@ -5225,17 +5291,29 @@ def run_scraper(selected_statuses=None):
                  {s: old_counts.get(s, 0) for s in overwrite_selected})
 
     swap_result   = _atomic_snapshot_swap(staging, overwrite_selected)
-    hist_inserted = _append_historical(staging) if historical_selected else 0
 
     # ── Post-swap DB state ─────────────────────────────────────────────
-    post_counts = _get_db_counts_by_status()
-    db_total    = sum(post_counts.values())
-    total_elapsed = time.time() - sync_start
+    post_counts     = _get_db_counts_by_status()
+    db_total        = sum(post_counts.values())
+    staged_total    = len(staging)
+    db_synced_total = sum(post_counts.get(s, 0) for s in selected_statuses)
+    count_mismatch  = (db_synced_total != staged_total)
+    stale_urls: list = []
+    total_elapsed   = time.time() - sync_start
 
     _logger.info("[snapshot] 上書き完了 — 削除: %s, 挿入: %d 件",
                  swap_result["deleted_by_status"], swap_result["inserted"])
     _logger.info("[snapshot] 同期後 DB件数: %s",
                  {s: post_counts.get(s, 0) for s in selected_statuses})
+
+    if count_mismatch:
+        stale_urls = _find_stale_urls(staging, selected_statuses)
+        _logger.error(
+            "[snapshot] ⚠ 件数不一致 — 取得: %d 件, DB同期後: %d 件 (差: %+d)\n"
+            "  余剰URL (%d 件): %s",
+            staged_total, db_synced_total, db_synced_total - staged_total,
+            len(stale_urls), stale_urls[:10],
+        )
 
     print(f"\n{'=' * 56}")
     print(f"  スナップショット同期完了")
@@ -5251,12 +5329,12 @@ def run_scraper(selected_statuses=None):
     for status, deleted in swap_result["deleted_by_status"].items():
         new_c = post_counts.get(status, 0)
         print(f"  {status}: 削除={deleted} → 挿入後={new_c}")
-    if hist_inserted:
-        print(f"  販売履歴 新規追記: {hist_inserted} 件")
     print(f"\n  --- DB ステータス別件数 ---")
     for _s, _c in post_counts.items():
         print(f"    {_s}: {_c}")
     print(f"    合計: {db_total}")
+    if count_mismatch:
+        print(f"\n  ⚠ 件数不一致: 取得={staged_total}, DB同期={db_synced_total}")
     print(f"{'=' * 56}")
 
     _logger.info(
@@ -5267,20 +5345,25 @@ def run_scraper(selected_statuses=None):
         _logger.warning("[snapshot] %d 件の詳細取得が失敗しました (フォールバックデータを使用)",
                         detail_errors)
     _logger.info("[snapshot] DB合計: %d 件 (ステータス別: %s)", db_total, post_counts)
+    if count_mismatch:
+        _logger.error("[snapshot] 件数不一致 — 取得 %d 件 ≠ DB同期後 %d 件",
+                      staged_total, db_synced_total)
 
     _last_sync_summary = {
-        "start_jst":    start_jst,
-        "end_jst":      jst_now(),
-        "elapsed":      round(total_elapsed, 1),
-        "per_status":   per_status_counts,
-        "inserted":     swap_result["inserted"],
-        "updated":      0,
-        "skipped":      len(to_skip),
-        "total":        total_count,
-        "db_by_status": post_counts,
-        "db_total":     db_total,
-        "snapshot_swap": swap_result,
-        "hist_inserted": hist_inserted,
+        "start_jst":      start_jst,
+        "end_jst":        jst_now(),
+        "elapsed":        round(total_elapsed, 1),
+        "per_status":     per_status_counts,
+        "inserted":       swap_result["inserted"],
+        "updated":        0,
+        "skipped":        len(to_skip),
+        "total":          total_count,
+        "db_by_status":   post_counts,
+        "db_total":       db_total,
+        "snapshot_swap":  swap_result,
+        "count_mismatch": count_mismatch,
+        "staged_total":   staged_total,
+        "stale_urls":     stale_urls[:20],
     }
     # Do NOT call webbrowser.open here — the sync() route already redirects to /?summary=1
 
