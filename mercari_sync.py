@@ -1232,6 +1232,68 @@ a.kpi-card-link:hover .kpi-card { transform: translateY(-2px);
 .settings-value { font-size: 14px; color: var(--text); text-align: right; }
 .settings-path  { font-size: 12px; color: var(--muted); font-family: monospace;
                   word-break: break-all; text-align: right; max-width: 480px; }
+/* 3-row KPI grid */
+.kpi-grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+@media (max-width: 860px) { .kpi-grid-3 { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 560px) { .kpi-grid-3 { grid-template-columns: 1fr; } }
+.kpi-sync-row { margin-top: 0; }
+.kpi-sync-card {
+  background: #f8fafc; border-radius: 12px; padding: 14px 22px;
+  box-shadow: var(--shadow-md); border: 1px solid var(--border);
+  display: flex; align-items: center; gap: 14px; }
+.kpi-sync-icon { font-size: 20px; flex-shrink: 0; }
+.kpi-sync-texts { display: flex; flex-direction: column; gap: 2px; }
+.kpi-sync-label { font-size: 11px; font-weight: 600; color: var(--muted);
+                  text-transform: uppercase; letter-spacing: .04em; }
+.kpi-sync-value { font-size: 14px; font-weight: 600; color: var(--text); }
+/* Sync lock modal */
+#sync-lock-modal {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  z-index: 9000; align-items: center; justify-content: center; }
+#sync-lock-modal.visible { display: flex; }
+.sync-lock-box {
+  background: #fff; border-radius: 14px; padding: 32px 28px;
+  max-width: 390px; width: 90%; box-shadow: 0 8px 40px rgba(0,0,0,.3);
+  text-align: center; }
+.sync-lock-icon { font-size: 2.8rem; margin-bottom: 12px; }
+.sync-lock-title { font-size: 16px; font-weight: 700; margin-bottom: 10px; color: var(--text); }
+.sync-lock-body { font-size: 14px; color: var(--muted); line-height: 1.8; margin-bottom: 22px; }
+/* Sync running banner on non-dashboard pages */
+.sync-running-banner {
+  background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px;
+  padding: 10px 16px; font-size: 13px; color: #1d4ed8; margin-bottom: 4px;
+  display: flex; align-items: center; gap: 8px; }
+/* Visually disabled state during sync */
+.sync-locked-el { opacity: .38 !important; pointer-events: none !important;
+                  cursor: not-allowed !important; user-select: none !important; }
+/* Table controls bar */
+.table-controls {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.rows-per-page { display: flex; align-items: center; gap: 8px;
+                 font-size: 13px; color: var(--muted); }
+.rows-per-page select {
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+  font-size: 13px; background: #fff; cursor: pointer; }
+.rows-per-page select:focus { outline: none; border-color: var(--primary); }
+.in-result-search { display: flex; align-items: center; gap: 6px; }
+.in-result-search input {
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+  font-size: 13px; width: 200px; outline: none; transition: border-color .15s; }
+.in-result-search input:focus { border-color: var(--primary); }
+/* Pagination bar */
+.pagination-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px; border-top: 1px solid var(--border);
+  flex-wrap: wrap; gap: 8px; font-size: 13px; color: var(--muted); }
+.pagination-btns { display: flex; align-items: center; gap: 4px; }
+.page-btn {
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: #fff; font-size: 13px; cursor: pointer; transition: background .12s, color .12s; }
+.page-btn:hover:not(:disabled) { background: #f3f4f6; }
+.page-btn:disabled { opacity: .4; cursor: not-allowed; }
+.page-btn.current { background: var(--primary); color: #fff; border-color: var(--primary);
+                    cursor: default; }
 """
 
 # JS that keeps the sticky table header just below the sticky search card.
@@ -1349,6 +1411,238 @@ document.addEventListener('click', function(e) {
     var btn = form.querySelector('button[type="submit"]');
     if (btn) { btn.disabled = true; btn.textContent = '同期中...'; }
   });
+})();
+"""
+
+# Comprehensive sync lock JS — injected on all pages when _sync_running is True.
+# Intercepts ALL interactive elements except #btn-force-stop and elements inside
+# #sync-card. Shows a modal popup; records each block via /api/log-blocked.
+_SYNC_LOCK_JS = """
+(function() {
+  var modal = document.getElementById('sync-lock-modal');
+  function showLock(reason) {
+    if (modal) modal.classList.add('visible');
+    fetch('/api/log-blocked', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reason: reason || 'unknown'})
+    }).catch(function(){});
+  }
+  function isExempt(el) {
+    if (!el) return false;
+    if (el.id === 'btn-force-stop') return true;
+    var p = el;
+    while (p) {
+      if (p.id === 'sync-card' || p.id === 'sync-lock-modal') return true;
+      p = p.parentElement;
+    }
+    return false;
+  }
+  // Intercept clicks in capture phase to block before default
+  document.addEventListener('click', function(e) {
+    var el = e.target;
+    // walk up to find the interactive element
+    var target = el.closest('a, button, [data-sortable], select, label');
+    if (!target || isExempt(target)) return;
+    var tag = target.tagName.toLowerCase();
+    if (tag === 'a' || tag === 'button') {
+      e.preventDefault(); e.stopImmediatePropagation();
+      var label = (target.textContent || target.href || '').trim().slice(0, 50);
+      showLock(tag + ': ' + label);
+    }
+  }, true);
+  // Intercept form submissions
+  document.addEventListener('submit', function(e) {
+    var form = e.target;
+    if (isExempt(form)) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    showLock('form submit: ' + (form.action || ''));
+  }, true);
+  // Apply visual disabled state
+  document.querySelectorAll(
+    '.nav-item a, .btn, button, select, input[type="text"], input[type="number"], ' +
+    'input[type="checkbox"], input[type="radio"], [data-sortable]'
+  ).forEach(function(el) {
+    if (!isExempt(el)) el.classList.add('sync-locked-el');
+  });
+  // Dismiss modal on OK
+  var okBtn = document.getElementById('sync-lock-ok');
+  if (okBtn) okBtn.addEventListener('click', function() {
+    if (modal) modal.classList.remove('visible');
+  });
+})();
+"""
+
+# Table features JS: sort + pagination + in-result search for products table.
+# Replaces _SORT_JS on the products page only.
+_TABLE_FEATURES_JS = """
+(function() {
+  var _allRows = [];
+  var _sortCol = -1;
+  var _sortAsc  = true;
+  var _curPage  = 1;
+  var _perPage  = 30;
+
+  var tbody      = document.querySelector('#results-table tbody');
+  var badge      = document.getElementById('result-count-badge');
+  var pagBar     = document.getElementById('pagination-bar');
+  var rowsSel    = document.getElementById('rows-per-page-select');
+  var searchInp  = document.getElementById('in-result-search-input');
+
+  if (!tbody) return;
+
+  // Capture all data rows (skip empty-state row with 1 td)
+  _allRows = Array.prototype.slice.call(tbody.querySelectorAll('tr')).filter(function(r) {
+    return r.querySelectorAll('td').length > 1;
+  });
+
+  function rowText(row) {
+    var cells = row.querySelectorAll('td');
+    var parts = [];
+    for (var i = 1; i <= 5; i++) {
+      if (cells[i]) parts.push(cells[i].textContent.trim());
+    }
+    var lnk = row.querySelector('[data-url]');
+    if (lnk) parts.push(lnk.getAttribute('data-url'));
+    return parts.join(' ').toLowerCase();
+  }
+
+  function getFiltered() {
+    var q = searchInp ? searchInp.value.trim().toLowerCase() : '';
+    if (!q) return _allRows.slice();
+    return _allRows.filter(function(r) { return rowText(r).indexOf(q) !== -1; });
+  }
+
+  function sorted(rows) {
+    if (_sortCol < 0) return rows;
+    return rows.slice().sort(function(a, b) {
+      var ac = a.querySelectorAll('td')[_sortCol];
+      var bc = b.querySelectorAll('td')[_sortCol];
+      if (!ac || !bc) return 0;
+      var av = (ac.getAttribute('data-sort') || ac.textContent).trim();
+      var bv = (bc.getAttribute('data-sort') || bc.textContent).trim();
+      var an = parseFloat(av.replace(/[¥,]/g, ''));
+      var bn = parseFloat(bv.replace(/[¥,]/g, ''));
+      var cmp = (!isNaN(an) && !isNaN(bn)) ? (an - bn) : av.localeCompare(bv, 'ja');
+      return _sortAsc ? cmp : -cmp;
+    });
+  }
+
+  function updateView() {
+    var filtered = getFiltered();
+    var rows     = sorted(filtered);
+    var total    = rows.length;
+    var per      = (_perPage === 0) ? total : _perPage;
+    var pages    = (per > 0) ? Math.max(1, Math.ceil(total / per)) : 1;
+    if (_curPage > pages) _curPage = pages;
+    if (_curPage < 1)     _curPage = 1;
+    var start = (_curPage - 1) * per;
+    var end   = (per === 0) ? total : Math.min(start + per, total);
+    var vis   = rows.slice(start, end);
+
+    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+    if (vis.length === 0) {
+      var empty = document.createElement('tr');
+      empty.innerHTML = '<td colspan="7" style="text-align:center;padding:32px;color:#6b7280">'
+        + '<div style="font-size:2rem;margin-bottom:8px">🔍</div>'
+        + '<div>該当する商品がありません</div></td>';
+      tbody.appendChild(empty);
+    } else {
+      vis.forEach(function(r) { tbody.appendChild(r); });
+      // renumber # column
+      vis.forEach(function(r, idx) {
+        var first = r.querySelector('td');
+        if (first) first.textContent = start + idx + 1;
+      });
+    }
+
+    if (badge) badge.textContent = total + ' 件';
+
+    // Pagination bar
+    if (!pagBar) return;
+    if (total === 0) { pagBar.innerHTML = ''; return; }
+    var from = start + 1, to = Math.min(end, total);
+    var info = '<span>' + total + ' 件中 ' + from + '〜' + to + ' 件を表示</span>';
+    var btns = '';
+    var maxWin = 5;
+    var sp = Math.max(1, _curPage - 2);
+    var ep = Math.min(pages, sp + maxWin - 1);
+    if (ep - sp < maxWin - 1) sp = Math.max(1, ep - maxWin + 1);
+    if (sp > 1) btns += '<button class="page-btn" data-p="1">1</button>';
+    if (sp > 2) btns += '<span style="padding:0 2px">…</span>';
+    for (var p = sp; p <= ep; p++) {
+      btns += '<button class="page-btn' + (p === _curPage ? ' current' : '') + '" data-p="' + p + '">' + p + '</button>';
+    }
+    if (ep < pages - 1) btns += '<span style="padding:0 2px">…</span>';
+    if (ep < pages) btns += '<button class="page-btn" data-p="' + pages + '">' + pages + '</button>';
+
+    pagBar.innerHTML = info
+      + '<div class="pagination-btns">'
+      + '<button class="page-btn" id="pg-prev"' + (_curPage <= 1 ? ' disabled' : '') + '>‹ 前へ</button>'
+      + btns
+      + '<button class="page-btn" id="pg-next"' + (_curPage >= pages ? ' disabled' : '') + '>次へ ›</button>'
+      + '</div>';
+
+    pagBar.querySelectorAll('.page-btn[data-p]').forEach(function(b) {
+      b.addEventListener('click', function() { _curPage = parseInt(b.getAttribute('data-p'), 10); updateView(); });
+    });
+    var prev = document.getElementById('pg-prev');
+    var next = document.getElementById('pg-next');
+    if (prev) prev.addEventListener('click', function() { if (_curPage > 1) { _curPage--; updateView(); } });
+    if (next) next.addEventListener('click', function() { if (_curPage < pages) { _curPage++; updateView(); } });
+  }
+
+  // Sort headers
+  document.querySelectorAll('thead th[data-sortable]').forEach(function(th) {
+    var icon = document.createElement('span');
+    icon.className = 'sort-icon'; icon.textContent = ' ⇅';
+    th.appendChild(icon); th.style.cursor = 'pointer';
+    th.addEventListener('click', function() {
+      var col = parseInt(th.getAttribute('data-col'), 10);
+      _sortAsc = (_sortCol === col) ? !_sortAsc : true;
+      _sortCol = col;
+      document.querySelectorAll('thead th[data-sortable] .sort-icon').forEach(function(ic) {
+        ic.textContent = ' ⇅'; ic.style.color = '#d1d5db';
+      });
+      icon.textContent = _sortAsc ? ' ▲' : ' ▼'; icon.style.color = 'var(--primary)';
+      _curPage = 1; updateView();
+    });
+  });
+
+  // Rows-per-page
+  if (rowsSel) {
+    rowsSel.addEventListener('change', function() {
+      var v = rowsSel.value;
+      if (v === 'all') {
+        var fc = getFiltered().length;
+        if (fc > 1000) {
+          if (!confirm(fc + ' 件を全件表示します。\\nページが重くなる可能性があります。続行しますか？')) {
+            rowsSel.value = (_perPage === 0) ? 'all' : String(_perPage);
+            return;
+          }
+        }
+        _perPage = 0;
+      } else {
+        _perPage = parseInt(v, 10);
+      }
+      _curPage = 1; updateView();
+    });
+  }
+
+  // In-result search
+  if (searchInp) {
+    searchInp.addEventListener('input', function() { _curPage = 1; updateView(); });
+  }
+
+  // Open-link handler
+  document.addEventListener('click', function(e) {
+    var lnk = e.target.closest('.open-link');
+    if (!lnk) return;
+    e.preventDefault();
+    fetch('/open?url=' + encodeURIComponent(lnk.getAttribute('data-url'))).catch(function(){});
+  });
+
+  updateView();
 })();
 """
 
@@ -1601,20 +1895,24 @@ def _page_shell(title: str, active: str, content: str,
     stats = _get_kpi_stats()
     sub_html = f'<p>{html_module.escape(subtitle)}</p>' if subtitle else ""
 
-    # Inject sidebar nav-lock when a sync is in progress so users cannot
-    # navigate away mid-sync from any page (not just the main sync page).
-    sync_lock_js = ""
+    # When sync is running: inject modal HTML + comprehensive lock JS on all pages.
     if _sync_running:
-        sync_lock_js = """
-(function() {
-  document.querySelectorAll('.nav-item a').forEach(function(a) {
-    a.addEventListener('click', function(e) {
-      e.preventDefault();
-      alert('同期中です。完了するまでお待ちください。');
-    });
-  });
-})();
-"""
+        sync_lock_modal = """
+<div id="sync-lock-modal">
+  <div class="sync-lock-box">
+    <div class="sync-lock-icon">⏳</div>
+    <div class="sync-lock-title">同期中です</div>
+    <div class="sync-lock-body">他の操作は実行できません。<br><br>
+      確認や停止が必要な場合は、<br>「強制停止」ボタンを使用してください。</div>
+    <button id="sync-lock-ok"
+      style="padding:8px 24px;border:none;background:var(--primary);color:#fff;
+             border-radius:8px;cursor:pointer;font-size:14px;font-weight:600">OK</button>
+  </div>
+</div>"""
+        sync_lock_js = _SYNC_LOCK_JS
+    else:
+        sync_lock_modal = ""
+        sync_lock_js = ""
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -1643,6 +1941,7 @@ def _page_shell(title: str, active: str, content: str,
     </div>
   </div>
 </div>
+{sync_lock_modal}
 <script>
 {_SHUTDOWN_JS}
 {sync_lock_js}
@@ -1686,48 +1985,53 @@ def home():
 
     stats = _get_kpi_stats()
 
-    # ── KPI cards ─────────────────────────────────────────────────────────
+    # ── KPI cards — 3-row layout ───────────────────────────────────────────
     kpi_html = f"""
-    <div class="kpi-grid">
-      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=all">
-        <div class="kpi-card">
-          <div class="kpi-value">{stats['total']}</div>
-          <div class="kpi-label">総商品数</div>
-        </div>
-      </a>
-      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=listed">
-        <div class="kpi-card">
-          <div class="kpi-value green">{stats['active']}</div>
-          <div class="kpi-label" title="公開停止中を含む">出品中</div>
-        </div>
-      </a>
-      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=stopped">
-        <div class="kpi-card">
-          <div class="kpi-value" style="color:#ea580c">{stats['stopped']}</div>
-          <div class="kpi-label">公開停止中</div>
-        </div>
-      </a>
-      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=trading">
-        <div class="kpi-card">
-          <div class="kpi-value amber">{stats['trading']}</div>
-          <div class="kpi-label">取引中</div>
-        </div>
-      </a>
-      <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=sold">
-        <div class="kpi-card">
-          <div class="kpi-value blue">{stats['sold']}</div>
-          <div class="kpi-label">売却済み</div>
-        </div>
-      </a>
-      <div class="kpi-card">
-        <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
-        <div class="kpi-label">推定売上合計</div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="kpi-grid-3">
+        <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=all">
+          <div class="kpi-card">
+            <div class="kpi-value">{stats['total']}</div>
+            <div class="kpi-label">総商品数</div>
+          </div>
+        </a>
+        <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=listed">
+          <div class="kpi-card">
+            <div class="kpi-value green">{stats['active']}</div>
+            <div class="kpi-label" title="公開停止中を含む">出品中</div>
+          </div>
+        </a>
+        <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=stopped">
+          <div class="kpi-card">
+            <div class="kpi-value" style="color:#ea580c">{stats['stopped']}</div>
+            <div class="kpi-label">公開停止中</div>
+          </div>
+        </a>
       </div>
-      <div class="kpi-card">
-        <div class="kpi-value" style="font-size:14px;letter-spacing:0">
-          {html_module.escape(stats['last_sync'])}
+      <div class="kpi-grid-3">
+        <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=trading">
+          <div class="kpi-card">
+            <div class="kpi-value amber">{stats['trading']}</div>
+            <div class="kpi-label">取引中</div>
+          </div>
+        </a>
+        <a class="kpi-card-link" href="/products?searched=1&amp;status_filter=sold">
+          <div class="kpi-card">
+            <div class="kpi-value blue">{stats['sold']}</div>
+            <div class="kpi-label">売却済み</div>
+          </div>
+        </a>
+        <div class="kpi-card">
+          <div class="kpi-value red" style="font-size:20px">¥{stats['total_sales']:,}</div>
+          <div class="kpi-label">推定売上合計</div>
         </div>
-        <div class="kpi-label">最終同期</div>
+      </div>
+      <div class="kpi-sync-card">
+        <div class="kpi-sync-icon">🕐</div>
+        <div class="kpi-sync-texts">
+          <div class="kpi-sync-label">最終同期</div>
+          <div class="kpi-sync-value">{html_module.escape(stats['last_sync'])}</div>
+        </div>
       </div>
     </div>"""
 
@@ -1938,6 +2242,18 @@ def sync():
 def sync_status():
     from flask import jsonify
     return jsonify(_sync_progress)
+
+
+@app.route("/api/log-blocked", methods=["POST"])
+def api_log_blocked():
+    """Record a UI operation that was blocked by the sync lock into the warning log."""
+    try:
+        data = request.get_json(silent=True) or {}
+        reason = str(data.get("reason", "unknown"))[:200]
+        _logger.warning("[sync-lock] ブロック: %s", reason)
+    except Exception:
+        pass
+    return Response("ok", status=200, headers={"Content-Type": "text/plain"})
 
 
 @app.route("/sync/stop", methods=["POST"])
@@ -2233,6 +2549,10 @@ def shutdown():
 
 @app.route("/export/csv")
 def export_csv():
+    if _sync_running:
+        _logger.warning("[export] blocked during sync (route=csv)")
+        return Response('{"error":"同期中はエクスポートできません"}', status=409,
+                        mimetype="application/json")
     if not _can_export():
         _logger.warning("[export] blocked — non-paid plan attempted export (plan=%s, route=csv)",
                         _check_plan())
@@ -2264,6 +2584,10 @@ def export_csv():
 
 @app.route("/export/xlsx")
 def export_xlsx():
+    if _sync_running:
+        _logger.warning("[export] blocked during sync (route=xlsx)")
+        return Response('{"error":"同期中はエクスポートできません"}', status=409,
+                        mimetype="application/json")
     if not _can_export():
         _logger.warning("[export] blocked — non-paid plan attempted export (plan=%s, route=xlsx)",
                         _check_plan())
@@ -2483,18 +2807,18 @@ def products_page():
       </div>
     </div>"""
 
+    # Sync-lock banner for non-dashboard pages during sync
+    sync_banner = (
+        '<div class="sync-running-banner">⏳ 同期中です。同期完了までこのページの操作はロックされています。'
+        '強制停止はメインダッシュボードから操作してください。</div>'
+    ) if _sync_running else ""
+
     if not searched:
         results_html = ""
         export_js = ""
     else:
         rows_html = _build_result_rows(products)
         disabled  = "disabled" if count == 0 else ""
-        empty_row = (
-            '<tr><td colspan="7"><div class="empty-state">'
-            '<div class="es-icon">🔍</div>'
-            '<p>該当する商品が見つかりませんでした</p>'
-            '</div></td></tr>'
-        ) if count == 0 else ""
         can_exp = _can_export()
         if can_exp:
             export_btns = f"""
@@ -2521,13 +2845,29 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
         <div class="card">
           <div class="card-header">
             <span class="card-title">検索結果
-              <span class="count-badge">{count} 件</span>
+              <span id="result-count-badge" class="count-badge">{count} 件</span>
             </span>
             <div class="export-row">{export_btns}
             </div>
           </div>
           <div class="card-body" style="padding:0">
-            <table>
+            <div class="table-controls">
+              <div class="rows-per-page">
+                <label for="rows-per-page-select">表示件数</label>
+                <select id="rows-per-page-select">
+                  <option value="10">10</option>
+                  <option value="30" selected>30</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                  <option value="all">全件</option>
+                </select>
+              </div>
+              <div class="in-result-search">
+                <input type="text" id="in-result-search-input"
+                       placeholder="この結果内を検索" autocomplete="off">
+              </div>
+            </div>
+            <table id="results-table">
               <thead>
                 <tr>
                   <th style="width:40px">#</th>
@@ -2539,8 +2879,9 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
                   <th style="width:72px;text-align:center">リンク</th>
                 </tr>
               </thead>
-              <tbody>{rows_html}{empty_row}</tbody>
+              <tbody>{rows_html}</tbody>
             </table>
+            <div class="pagination-bar" id="pagination-bar"></div>
           </div>
         </div>"""
 
@@ -2584,8 +2925,8 @@ if (xlsx_el && !xlsx_el.hasAttribute('disabled'))
     </div>
   </div>
 </div>"""
-    content  = search_card + "\n" + active_chip + "\n" + results_html + export_modal
-    extra_js = f"{_STICKY_JS}\n{_SORT_JS}\n{_OPEN_LINK_JS}\n{export_js}"
+    content  = sync_banner + "\n" + search_card + "\n" + active_chip + "\n" + results_html + export_modal
+    extra_js = f"{_STICKY_JS}\n{_TABLE_FEATURES_JS}\n{export_js}"
     return _page_shell("商品管理", "products", content, extra_js,
                        subtitle="商品の検索・エクスポート")
 
@@ -2858,7 +3199,7 @@ def ai_page():
     ]
 
     content = "\n".join(sections)
-    return _page_shell("AI 分析", "ai", content, _SORT_JS,
+    return _page_shell("AI 分析", "ai", content, f"{_SORT_JS}\n{_OPEN_LINK_JS}",
                        subtitle="商品データに基づく改善提案")
 
 
