@@ -1040,8 +1040,8 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px; display: flex;
                border-radius: 20px; padding: 2px 10px; font-size: 12px;
                font-weight: 600; margin-left: 8px; }
 table { width: 100%; border-collapse: separate; border-spacing: 0; }
-/* Sticky search/filter card */
-#search-card { position: sticky; top: 8px; z-index: 10; }
+/* Sticky search/filter card — JS sets top to sit flush below .page-header */
+#search-card { position: sticky; top: 0; z-index: 10; }
 /* Sticky table header — JS sets correct top offset to sit below #search-card */
 thead th { background: #f9fafb; color: var(--muted); font-size: 12px;
            font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
@@ -1124,7 +1124,8 @@ thead th[data-sortable]:hover .sort-icon { color: var(--primary); }
                 display: flex; flex-direction: column; }
 .page-header { background: #111827; color: #fff; padding: 18px 32px;
                display: flex; justify-content: space-between; align-items: center;
-               flex-shrink: 0; }
+               flex-shrink: 0;
+               position: sticky; top: 0; z-index: 100; }
 .page-header h1 { font-size: 18px; font-weight: 700; }
 .page-header p  { font-size: 12px; color: #9ca3af; margin-top: 2px; }
 .page-header-actions { display: flex; gap: 10px; align-items: center; }
@@ -1296,23 +1297,33 @@ a.kpi-card-link:hover .kpi-card { transform: translateY(-2px);
                     cursor: default; }
 """
 
-# JS that keeps the sticky table header just below the sticky search card.
+# JS that keeps the sticky search card and table header below the sticky page header.
 # Runs once on load and on every resize so narrow-screen wrapping is handled.
 _STICKY_JS = """
 (function() {
-  var SEARCH_TOP = 8;
-  function updateStickyOffset() {
-    var sc = document.getElementById('search-card');
+  function updateStickyOffsets() {
+    var ph  = document.querySelector('.page-header');
+    var sc  = document.getElementById('search-card');
     var ths = document.querySelectorAll('thead th');
-    if (!sc || !ths.length) return;
-    var offset = sc.offsetHeight + SEARCH_TOP;
-    for (var i = 0; i < ths.length; i++) { ths[i].style.top = offset + 'px'; }
+    var headerH = ph ? ph.offsetHeight : 0;
+
+    // Search card: stick flush below the page header
+    if (sc) { sc.style.top = headerH + 'px'; }
+
+    // Table header: stick below search card (or page header if no search card)
+    if (ths.length) {
+      var scH    = (sc && sc.offsetHeight) ? sc.offsetHeight : 0;
+      var offset = headerH + scH;
+      for (var i = 0; i < ths.length; i++) { ths[i].style.top = offset + 'px'; }
+    }
   }
-  updateStickyOffset();
-  window.addEventListener('resize', updateStickyOffset);
+  updateStickyOffsets();
+  window.addEventListener('resize', updateStickyOffsets);
   if (window.ResizeObserver) {
+    var ph = document.querySelector('.page-header');
     var sc = document.getElementById('search-card');
-    if (sc) { new ResizeObserver(updateStickyOffset).observe(sc); }
+    if (ph) new ResizeObserver(updateStickyOffsets).observe(ph);
+    if (sc) new ResizeObserver(updateStickyOffsets).observe(sc);
   }
 })();
 """
@@ -3119,7 +3130,7 @@ def sales_page():
     </div>"""
 
     content  = f"{filter_html}\n{kpi_html}\n{chart_card}\n{table_card}"
-    extra_js = f"var _PIE_DATA = {pie_data};\n{_SALES_PIE_JS}\n{_SORT_JS}"
+    extra_js = f"var _PIE_DATA = {pie_data};\n{_SALES_PIE_JS}\n{_SORT_JS}\n{_STICKY_JS}"
     return _page_shell("売上分析", "sales", content, extra_js,
                        subtitle="売却済み商品の実績")
 
@@ -3252,7 +3263,7 @@ def ai_page():
     ]
 
     content = "\n".join(sections)
-    return _page_shell("AI 分析", "ai", content, f"{_SORT_JS}\n{_OPEN_LINK_JS}",
+    return _page_shell("AI 分析", "ai", content, f"{_SORT_JS}\n{_OPEN_LINK_JS}\n{_STICKY_JS}",
                        subtitle="商品データに基づく改善提案")
 
 
