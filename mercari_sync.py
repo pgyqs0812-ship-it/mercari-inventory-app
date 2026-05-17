@@ -1896,7 +1896,12 @@ def _sidebar(active: str) -> str:
     return f"""<nav class="sidebar">
   <div class="sidebar-logo">Mercari 在庫管理<small>ダッシュボード</small></div>
   <div class="sidebar-nav"><ul>{items}</ul></div>
-  <div class="sidebar-footer">{html_module.escape(APP_VERSION)}</div>
+  <div class="sidebar-footer">
+    {html_module.escape(APP_VERSION)}<br>
+    <span style="font-size:10px;line-height:1.5;color:#4b5563;display:block;margin-top:4px">
+      本アプリはMercari公式アプリではありません。
+    </span>
+  </div>
 </nav>"""
 
 
@@ -1917,7 +1922,7 @@ def _page_shell(title: str, active: str, content: str,
       確認や停止が必要な場合は、<br>「強制停止」ボタンを使用してください。</div>
     <button id="sync-lock-ok"
       style="padding:8px 24px;border:none;background:var(--primary);color:#fff;
-             border-radius:8px;cursor:pointer;font-size:14px;font-weight:600">OK</button>
+             border-radius:8px;cursor:pointer;font-size:14px;font-weight:600">了解</button>
   </div>
 </div>"""
         sync_lock_js = _SYNC_LOCK_JS
@@ -2434,6 +2439,9 @@ def login_page():
       {body_content}
     </div>
   </div>
+  <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:16px;line-height:1.6;padding:0 16px">
+    本アプリはMercari公式アプリではありません。Mercari社による認可・提携・保証を受けた製品ではありません。
+  </p>
 </main>
 <script>{poll_js}</script>
 </body>
@@ -3453,9 +3461,11 @@ def settings_page():
         </div>
         <div class="settings-row">
           <span class="settings-label">免責事項</span>
-          <span class="settings-value" style="font-size:12px;color:var(--muted);text-align:right;max-width:400px">
-            本ツールは Mercari 販売者向けの独立した在庫管理ツールです。
-            Mercari 株式会社との公式な提携・認定関係はありません。
+          <span class="settings-value" style="font-size:12px;color:var(--muted);text-align:right;max-width:420px;line-height:1.7">
+            本アプリはMercari公式アプリではありません。<br>
+            Mercari社による認可・提携・保証を受けた製品ではありません。<br>
+            本アプリはSeleniumを用いてブラウザを自動操作します。<br>
+            ご自身のアカウントで操作を行うものであり、Mercariの利用規約の範囲内でご使用ください。
           </span>
         </div>
       </div>
@@ -3603,8 +3613,11 @@ def support_open_logs():
     os.makedirs(logs_dir, exist_ok=True)
     try:
         import subprocess as _sp
-        _sp.Popen(["open", logs_dir])
-        _logger.info("[support] ログフォルダを Finder で開きました: %s", logs_dir)
+        if platform.system() == "Windows":
+            _sp.Popen(["explorer", logs_dir])
+        else:
+            _sp.Popen(["open", logs_dir])
+        _logger.info("[support] ログフォルダを開きました: %s", logs_dir)
     except Exception as exc:
         _logger.error("[support] ログフォルダを開けませんでした: %s", exc)
     return redirect("/settings")
@@ -3892,22 +3905,40 @@ def _clear_profile_lock() -> None:
 
     # ── Kill Chrome processes using our profile ───────────────────────────────
     try:
-        import subprocess as _sp
-        result = _sp.run(
-            ["pgrep", "-f", CHROME_PROFILE_DIR],
-            capture_output=True, text=True, timeout=3,
-        )
-        pids = [p.strip() for p in result.stdout.splitlines() if p.strip()]
-        if pids:
-            _logger.warning("[profile] プロファイル使用中の Chrome プロセス: PID=%s — 強制終了", pids)
-            for pid in pids:
-                try:
-                    _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
-                except Exception:
-                    pass
+        import psutil as _psutil  # noqa: PLC0415
+        killed = []
+        for proc in _psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                cmdline = " ".join(proc.info.get("cmdline") or [])
+                if CHROME_PROFILE_DIR in cmdline:
+                    proc.kill()
+                    killed.append(proc.info["pid"])
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                pass
+        if killed:
+            _logger.warning("[profile] プロファイル使用中の Chrome プロセスを強制終了: PID=%s", killed)
             time.sleep(0.8)
         else:
             _logger.info("[profile] 使用中の Chrome プロセスなし")
+    except ImportError:
+        # psutil not available — fall back to pgrep/kill on Unix
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["pgrep", "-f", CHROME_PROFILE_DIR],
+                capture_output=True, text=True, timeout=3,
+            )
+            pids = [p.strip() for p in result.stdout.splitlines() if p.strip()]
+            if pids:
+                _logger.warning("[profile] プロファイル使用中の Chrome プロセス: PID=%s — 強制終了", pids)
+                for pid in pids:
+                    try:
+                        _sp.run(["kill", "-9", pid], capture_output=True, timeout=3)
+                    except Exception:
+                        pass
+                time.sleep(0.8)
+        except Exception as exc:
+            _logger.warning("[profile] Chrome プロセス検索エラー: %s", exc)
     except Exception as exc:
         _logger.warning("[profile] Chrome プロセス検索エラー: %s", exc)
 

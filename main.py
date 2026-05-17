@@ -114,30 +114,35 @@ def _log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# macOS UI helpers (dialogs + notifications via osascript)
+# UI helpers (dialogs + notifications) — macOS and Windows
 # ---------------------------------------------------------------------------
 
 def _show_dialog(title: str, message: str) -> None:
-    """Show a blocking macOS alert dialog. Works in windowed (no-terminal) mode."""
+    """Show a blocking alert dialog. Works in windowed (no-terminal) mode."""
     try:
-        script = (
-            f'display alert {_osa_quote(title)} '
-            f'message {_osa_quote(message)} '
-            f'as critical buttons {{"OK"}} default button "OK"'
-        )
-        subprocess.run(["osascript", "-e", script], timeout=30)
+        if platform.system() == "Darwin":
+            script = (
+                f'display alert {_osa_quote(title)} '
+                f'message {_osa_quote(message)} '
+                f'as critical buttons {{"OK"}} default button "OK"'
+            )
+            subprocess.run(["osascript", "-e", script], timeout=30)
+        elif platform.system() == "Windows":
+            import ctypes  # noqa: PLC0415
+            ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)  # MB_ICONERROR
     except Exception:
         pass  # fall back silently — error is also in app-runtime.log
 
 
 def _notify(message: str) -> None:
-    """Show a transient macOS notification banner."""
+    """Show a transient notification banner (macOS only; silently skipped on Windows)."""
     try:
-        script = (
-            f'display notification {_osa_quote(message)} '
-            f'with title {_osa_quote(_APP_NAME)}'
-        )
-        subprocess.run(["osascript", "-e", script], timeout=5)
+        if platform.system() == "Darwin":
+            script = (
+                f'display notification {_osa_quote(message)} '
+                f'with title {_osa_quote(_APP_NAME)}'
+            )
+            subprocess.run(["osascript", "-e", script], timeout=5)
     except Exception:
         pass
 
@@ -155,14 +160,17 @@ def get_data_dir() -> str:
     """
     Return the directory where user data (products.db, .env) should live.
 
-    PyInstaller frozen binary  → ~/Library/Application Support/MIA Inventory/
-                                 Survives app updates (new dist.zip extracts never
-                                 touch this path).
-    Normal Python script       → project root.
+    macOS  frozen → ~/Library/Application Support/MIA Inventory/
+    Windows frozen → %APPDATA%/MIA Inventory/
+    Dev (script)   → project root.
     """
     if getattr(sys, "frozen", False):
-        app_support = os.path.expanduser("~/Library/Application Support")
-        data_dir = os.path.join(app_support, _APP_NAME)
+        if platform.system() == "Windows":
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+            data_dir = os.path.join(base, _APP_NAME)
+        else:
+            app_support = os.path.expanduser("~/Library/Application Support")
+            data_dir = os.path.join(app_support, _APP_NAME)
         os.makedirs(data_dir, exist_ok=True)
         return data_dir
     return os.path.dirname(os.path.abspath(__file__))
@@ -182,8 +190,14 @@ def is_port_in_use(port: int) -> bool:
 # ---------------------------------------------------------------------------
 
 _CHROME_CANDIDATES = [
+    # macOS
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+    # Windows — system-wide install
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    # Windows — per-user install (%LOCALAPPDATA%)
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Google\Chrome\Application\chrome.exe"),
 ]
 
 
@@ -227,7 +241,9 @@ def _migrate_db_if_needed(data_dir: str) -> None:
 def _migrate_app_support_dir(data_dir: str) -> None:
     """One-time: move all user data from the legacy MercariInventory app-support
     dir to the new MIA Inventory dir so existing users keep their DB, Chrome
-    profile, and license after the bundle rename."""
+    profile, and license after the bundle rename. macOS only."""
+    if platform.system() != "Darwin":
+        return
     import shutil  # noqa: PLC0415
 
     app_support = os.path.expanduser("~/Library/Application Support")
